@@ -83,36 +83,56 @@ export async function uploadToArweave(
  * This is the Phase 1 preferred upload method — stores all content metadata,
  * encrypted payload, and Lit key bundle in a single permanent document.
  *
- * @param bundle  - Complete AmsetsBundle object to upload
- * @param wallet  - Full useWallet() result from @solana/wallet-adapter-react
+ * @param bundle      - Complete AmsetsBundle object to upload
+ * @param wallet      - Full useWallet() result from @solana/wallet-adapter-react
+ * @param onProgress  - Optional callback for intermediate status messages shown in the UI
  */
 export async function uploadBundleToArweave(
   bundle: AmsetsBundle,
-  wallet: any
+  wallet: any,
+  onProgress?: (msg: string) => void
 ): Promise<ArweaveUploadResult> {
+  const report = (msg: string) => onProgress?.(msg);
+
   // Dynamic import — avoids SSR issues and keeps bundle lean
+  report("Connecting to Irys node…");
   const { WebUploader } = await import("@irys/web-upload");
   const { WebSolana }   = await import("@irys/web-upload-solana");
 
   // Pass the full useWallet() object — Irys uses publicKey + signTransaction internally
   const irys = await WebUploader(WebSolana).withProvider(wallet);
 
+  report("Serialising bundle…");
   const json  = JSON.stringify(bundle);
   const uint8 = new TextEncoder().encode(json);
+  const sizeMb = (uint8.byteLength / 1_048_576).toFixed(2);
 
   // Check balance and fund if needed.
   // On Solana devnet, a finalized tx takes 30-60 s — wait before uploading.
   // On mainnet Irys uses lazy funding so this step is usually a no-op.
   try {
+    report(`Checking Irys node balance (bundle: ${sizeMb} MB)…`);
     const price   = await irys.getPrice(uint8.byteLength);
     const balance = await irys.getLoadedBalance();
     if (balance.lt(price)) {
       const fundAmount = price.multipliedBy(1.2).integerValue();
+      report("Funding Irys node — sending SOL transaction…");
       await irys.fund(fundAmount);
-      await new Promise((resolve) => setTimeout(resolve, 45_000));
+
+      // Devnet needs ~45 s for the funding tx to reach "finalized".
+      // Show a countdown so the user knows the UI is not frozen.
+      const WAIT_SECS = 50;
+      for (let remaining = WAIT_SECS; remaining > 0; remaining -= 5) {
+        report(`Waiting for funding confirmation… ${remaining}s`);
+        await new Promise((resolve) => setTimeout(resolve, 5_000));
+      }
+      report("Funding confirmed — starting upload…");
+    } else {
+      report(`Balance sufficient — uploading ${sizeMb} MB bundle…`);
     }
   } catch {
     // Balance check is non-fatal — let upload attempt and surface any real error
+    report(`Uploading ${sizeMb} MB bundle (balance check skipped)…`);
   }
 
   const tags = [
@@ -125,6 +145,7 @@ export async function uploadBundleToArweave(
     { name: "AMSETS-Access",     value: bundle.access.access_mint },
   ];
 
+  report("Uploading to Arweave…");
   const receipt = await irys.upload(Buffer.from(uint8), { tags });
 
   return {

@@ -201,10 +201,15 @@ export function UploadSteps() {
 
     try {
       // ── Step 1: Encrypt file + build AmsetsBundle + upload to Arweave ────
-      steps[0] = { ...steps[0], status: "running" };
+      steps[0] = { ...steps[0], status: "running", detail: "Generating encryption key…" };
       setPublishSteps([...steps]);
 
       const key    = await generateSymmetricKey();
+
+      const fileSizeMb = (data.file.size / 1_048_576).toFixed(2);
+      steps[0] = { ...steps[0], detail: `Encrypting file (${fileSizeMb} MB) with AES-256-GCM…` };
+      setPublishSteps([...steps]);
+
       const buffer = await data.file.arrayBuffer();
       const { ciphertext, iv } = await encryptFile(key, buffer);
       const packed = packEncrypted(iv, ciphertext);
@@ -218,6 +223,8 @@ export function UploadSteps() {
       if (solanaWallet) {
         // ── Lit Protocol encryption (non-fatal) ────────────────────────────
         // Run separately so a Lit timeout does NOT prevent Arweave upload.
+        steps[0] = { ...steps[0], detail: "Encrypting access key via Lit Protocol…" };
+        setPublishSteps([...steps]);
         try {
           litBundle = await encryptKeyForContent(key, placeholderMint);
         } catch (litErr: any) {
@@ -225,6 +232,8 @@ export function UploadSteps() {
           // Lit failure is non-fatal: content uploads to Arweave without a
           // decryption key. Only the author can view until Lit is re-connected.
           console.warn("[Lit] Encryption failed (non-fatal):", litMsg);
+          steps[0] = { ...steps[0], detail: "Lit encryption skipped (will retry on view) — uploading to Arweave…" };
+          setPublishSteps([...steps]);
         }
 
         // ── Arweave upload (independent of Lit result) ─────────────────────
@@ -245,23 +254,29 @@ export function UploadSteps() {
             accessMint:      placeholderMint,
           });
 
+          // onProgress wires intermediate messages into the step detail live
+          const onArweaveProgress = (msg: string) => {
+            steps[0] = { ...steps[0], status: "running", detail: msg };
+            setPublishSteps([...steps]);
+          };
+
           // Pass full walletContext — @irys/web-upload-solana expects WalletContextState
-          const arResult = await uploadBundleToArweave(bundle, solanaWallet);
+          const arResult = await uploadBundleToArweave(bundle, solanaWallet, onArweaveProgress);
           storageUri = arResult.uri;
 
           steps[0] = {
             ...steps[0],
-            status: litBundle ? "done" : "done",
+            status: "done",
             detail: litBundle
-              ? `Bundle: ${arResult.txId.slice(0, 12)}… (${(arResult.size / 1024).toFixed(1)} KB)`
-              : `Bundle: ${arResult.txId.slice(0, 12)}… (Lit encryption skipped — content viewable by author only until re-encrypted)`,
+              ? `ar://${arResult.txId.slice(0, 12)}… (${(arResult.size / 1024).toFixed(1)} KB)`
+              : `ar://${arResult.txId.slice(0, 12)}… (Lit skipped — author-only view until re-encrypted)`,
           };
         } catch (arErr: any) {
           const errMsg: string = arErr?.message ?? arErr?.toString() ?? "Unknown Arweave error";
           steps[0] = {
             ...steps[0],
             status: "error",
-            detail: `Arweave upload failed: ${errMsg.slice(0, 100)}${errMsg.length > 100 ? "…" : ""}`,
+            detail: `Arweave upload failed: ${errMsg.slice(0, 120)}${errMsg.length > 120 ? "…" : ""}`,
           };
           storageUri = `ar://pending_${contentHash!.slice(0, 8)}`;
         }

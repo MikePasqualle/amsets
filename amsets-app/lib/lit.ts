@@ -234,7 +234,13 @@ export function buildAuthSig(
 // ─── Encoding helpers ─────────────────────────────────────────────────────────
 
 function uint8ArrayToBase64(bytes: Uint8Array): string {
-  return btoa(String.fromCharCode(...bytes));
+  // Chunk-safe: avoids "Maximum call stack size exceeded" for large arrays.
+  const CHUNK = 8192;
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(binary);
 }
 
 function base64ToUint8Array(base64: string): Uint8Array {
