@@ -43,6 +43,29 @@ export const AMSETS_PROGRAM_ID = new PublicKey(
   process.env.NEXT_PUBLIC_PROGRAM_ID ?? "B2gRbiHAfn7sZo8Kyecoc8xbkMzbgA7f7oJvBVjJxatG"
 );
 
+// ─── Transaction helpers ──────────────────────────────────────────────────────
+
+/**
+ * Sends a transaction and waits for confirmation using the block-height strategy.
+ * This avoids indefinite spinning: if the block height passes `lastValidBlockHeight`
+ * without confirmation the promise rejects with a clear timeout error.
+ */
+async function sendAndConfirm(
+  tx: Transaction,
+  sendTransaction: (tx: Transaction, conn: Connection) => Promise<string>,
+  connection: Connection
+): Promise<string> {
+  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
+  tx.recentBlockhash = blockhash;
+
+  const signature = await sendTransaction(tx, connection);
+  await connection.confirmTransaction(
+    { signature, blockhash, lastValidBlockHeight },
+    "confirmed"
+  );
+  return signature;
+}
+
 // ─── Instruction discriminators ───────────────────────────────────────────────
 
 const REGISTER_DISCRIMINATOR = new Uint8Array([
@@ -364,13 +387,9 @@ export async function publishOnChain(
   });
 
   const tx = new Transaction().add(ix);
-  const { blockhash } = await connection.getLatestBlockhash();
-  tx.recentBlockhash = blockhash;
   tx.feePayer = authorPublicKey;
 
-  const signature = await sendTransaction(tx, connection);
-  await connection.confirmTransaction(signature, "confirmed");
-
+  const signature = await sendAndConfirm(tx, sendTransaction, connection);
   return { signature, pdaAddress: pda.toBase58() };
 }
 
@@ -418,13 +437,9 @@ export async function purchaseAccess(
   });
 
   const tx = new Transaction().add(ix);
-  const { blockhash } = await connection.getLatestBlockhash();
-  tx.recentBlockhash = blockhash;
   tx.feePayer = buyerPublicKey;
 
-  const signature = await sendTransaction(tx, connection);
-  await connection.confirmTransaction(signature, "confirmed");
-
+  const signature = await sendAndConfirm(tx, sendTransaction, connection);
   return { signature, receiptPda: receiptPda.toBase58() };
 }
 
@@ -453,13 +468,9 @@ export async function setAccessMint(
   });
 
   const tx = new Transaction().add(ix);
-  const { blockhash } = await connection.getLatestBlockhash();
-  tx.recentBlockhash = blockhash;
   tx.feePayer = authorPublicKey;
 
-  const signature = await sendTransaction(tx, connection);
-  await connection.confirmTransaction(signature, "confirmed");
-  return signature;
+  return await sendAndConfirm(tx, sendTransaction, connection);
 }
 
 /**
@@ -496,12 +507,9 @@ export async function ensureFeeVaultFunded(
   });
 
   const tx = new Transaction().add(ix);
-  const { blockhash } = await connection.getLatestBlockhash();
-  tx.recentBlockhash = blockhash;
   tx.feePayer = payerPublicKey;
 
-  const sig = await sendTransaction(tx, connection);
-  await connection.confirmTransaction(sig, "confirmed");
+  await sendAndConfirm(tx, sendTransaction, connection);
 }
 
 // ─── SPL Token-2022 helpers ───────────────────────────────────────────────────
@@ -566,14 +574,10 @@ export async function createMintForContent(
     )
   );
 
-  const { blockhash } = await connection.getLatestBlockhash();
-  tx.recentBlockhash = blockhash;
   tx.feePayer = authorPublicKey;
   tx.partialSign(mintKeypair);
 
-  const signature = await sendTransaction(tx, connection);
-  await connection.confirmTransaction(signature, "confirmed");
-
+  const signature = await sendAndConfirm(tx, sendTransaction, connection);
   return { mintKeypair, signature };
 }
 
@@ -612,13 +616,9 @@ export async function mintAuthorToken(
     )
   );
 
-  const { blockhash } = await connection.getLatestBlockhash();
-  tx.recentBlockhash = blockhash;
   tx.feePayer = authorPublicKey;
 
-  const signature = await sendTransaction(tx, connection);
-  await connection.confirmTransaction(signature, "confirmed");
-
+  const signature = await sendAndConfirm(tx, sendTransaction, connection);
   return { ata: ata.toBase58(), signature };
 }
 
@@ -652,12 +652,9 @@ export async function callMintAccessTokenCheckpoint(
   });
 
   const tx = new Transaction().add(ix);
-  const { blockhash } = await connection.getLatestBlockhash();
-  tx.recentBlockhash = blockhash;
   tx.feePayer = buyerPublicKey;
 
-  const signature = await sendTransaction(tx, connection);
-  await connection.confirmTransaction(signature, "confirmed");
+  const signature = await sendAndConfirm(tx, sendTransaction, connection);
   return signature;
 }
 
@@ -705,13 +702,9 @@ export async function mintBuyerAccessToken(
     )
   );
 
-  const { blockhash } = await connection.getLatestBlockhash();
-  tx.recentBlockhash = blockhash;
   tx.feePayer = authorPublicKey;
 
-  const signature = await sendTransaction(tx, connection);
-  await connection.confirmTransaction(signature, "confirmed");
-
+  const signature = await sendAndConfirm(tx, sendTransaction, connection);
   return { ata: ata.toBase58(), signature };
 }
 

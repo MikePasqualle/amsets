@@ -327,7 +327,15 @@ export function UploadSteps() {
           status: "error",
           detail: errMsg.slice(0, 200),
         };
-        // Don't abort — register as draft with pending URI so the content is saved
+        // Video upload failed — save as draft without going on-chain.
+        // A valid Livepeer playback ID is required before blockchain registration.
+        steps[1] = { ...steps[1], status: "skipped", detail: "Skipped — video upload failed" };
+        steps[2] = { ...steps[2], status: "skipped", detail: "Skipped — video upload failed" };
+        steps[3] = { ...steps[3], status: "skipped", detail: "Skipped — fix video upload first, then retry" };
+        steps[4] = { ...steps[4], status: "skipped", detail: "Skipped" };
+        setPublishSteps([...steps]);
+        setIsProcessing(false);
+        return;
       }
       setPublishSteps([...steps]);
 
