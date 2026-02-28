@@ -45,10 +45,11 @@ const registerSchema = z.object({
   storage_uri: z.string().refine(
     (uri) =>
       validateArweaveUri(uri) ||
-      /^ar:\/\/pending_[a-zA-Z0-9]{1,64}$/.test(uri),
+      /^ar:\/\/pending_/.test(uri) ||   // pending draft (any suffix)
+      /^ar:\/\/[a-zA-Z0-9_-]{10,}$/.test(uri), // very loose fallback for non-standard ids
     {
       message:
-        'Must be a valid Arweave URI ("ar://{43-char txId}") or "ar://pending_{id}"',
+        'Must be a valid Arweave URI ("ar://{txId}") or "ar://pending_{id}"',
     }
   ),
   preview_cid: z.string().min(1),

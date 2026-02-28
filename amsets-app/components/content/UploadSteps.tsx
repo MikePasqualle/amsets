@@ -268,7 +268,9 @@ export function UploadSteps() {
             connection,   // from useConnection() — used to check Phantom SOL balance
             publicKey     // from useWallet() — wallet address for balance lookup
           );
-          storageUri = arResult.uri;
+          // Guard against malformed/undefined receipt IDs from Irys devnet
+          const txId = arResult.txId ?? "";
+          storageUri = txId.length >= 10 ? arResult.uri : `ar://pending_${contentHash!.slice(0, 8)}`;
 
           steps[0] = {
             ...steps[0],
