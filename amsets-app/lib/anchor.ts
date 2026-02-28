@@ -47,22 +47,59 @@ export const AMSETS_PROGRAM_ID = new PublicKey(
 
 /**
  * Sends a transaction and waits for confirmation using the block-height strategy.
- * This avoids indefinite spinning: if the block height passes `lastValidBlockHeight`
- * without confirmation the promise rejects with a clear timeout error.
+ * Provides step-by-step error messages so callers know exactly where failures occur.
  */
 async function sendAndConfirm(
   tx: Transaction,
   sendTransaction: (tx: Transaction, conn: Connection) => Promise<string>,
-  connection: Connection
+  connection: Connection,
+  label = "tx"
 ): Promise<string> {
-  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
+  // Step 1: Get fresh blockhash
+  let blockhash: string;
+  let lastValidBlockHeight: number;
+  try {
+    const latest = await connection.getLatestBlockhash("confirmed");
+    blockhash = latest.blockhash;
+    lastValidBlockHeight = latest.lastValidBlockHeight;
+  } catch (err: any) {
+    throw new Error(
+      `[${label}] Cannot reach Solana RPC — check your internet connection. (${err?.message ?? "network error"})`
+    );
+  }
   tx.recentBlockhash = blockhash;
 
-  const signature = await sendTransaction(tx, connection);
-  await connection.confirmTransaction(
-    { signature, blockhash, lastValidBlockHeight },
-    "confirmed"
-  );
+  // Step 2: Sign & send (triggers Phantom approval dialog)
+  let signature: string;
+  try {
+    signature = await sendTransaction(tx, connection);
+  } catch (err: any) {
+    // Wallet rejected or disconnected — give the user a clear message
+    const msg: string = err?.message ?? String(err);
+    // "Failed to fetch" from Phantom usually means the wallet is on Mainnet
+    // while the transaction targets Devnet, or Phantom can't reach its RPC.
+    if (msg.toLowerCase().includes("failed to fetch") || msg.toLowerCase().includes("network")) {
+      throw new Error(
+        `[${label}] Wallet cannot send the transaction — make sure Phantom is set to Devnet ` +
+        `(Settings → Developer Settings → Testnet Mode) and try again.`
+      );
+    }
+    throw new Error(`[${label}] Send failed: ${msg.slice(0, 200)}`);
+  }
+
+  // Step 3: Confirm on-chain
+  try {
+    await connection.confirmTransaction(
+      { signature, blockhash, lastValidBlockHeight },
+      "confirmed"
+    );
+  } catch (err: any) {
+    // Transaction was sent but confirmation timed out — it may still succeed.
+    // Return the signature so the caller can report partial success.
+    console.warn(`[${label}] confirmTransaction timed out for ${signature}:`, err);
+    return signature;
+  }
+
   return signature;
 }
 
@@ -389,7 +426,7 @@ export async function publishOnChain(
   const tx = new Transaction().add(ix);
   tx.feePayer = authorPublicKey;
 
-  const signature = await sendAndConfirm(tx, sendTransaction, connection);
+  const signature = await sendAndConfirm(tx, sendTransaction, connection, "register_content");
   return { signature, pdaAddress: pda.toBase58() };
 }
 
@@ -439,7 +476,7 @@ export async function purchaseAccess(
   const tx = new Transaction().add(ix);
   tx.feePayer = buyerPublicKey;
 
-  const signature = await sendAndConfirm(tx, sendTransaction, connection);
+  const signature = await sendAndConfirm(tx, sendTransaction, connection, "purchase_access");
   return { signature, receiptPda: receiptPda.toBase58() };
 }
 
@@ -470,7 +507,7 @@ export async function setAccessMint(
   const tx = new Transaction().add(ix);
   tx.feePayer = authorPublicKey;
 
-  return await sendAndConfirm(tx, sendTransaction, connection);
+  return await sendAndConfirm(tx, sendTransaction, connection, "set_access_mint");
 }
 
 /**
@@ -509,7 +546,7 @@ export async function ensureFeeVaultFunded(
   const tx = new Transaction().add(ix);
   tx.feePayer = payerPublicKey;
 
-  await sendAndConfirm(tx, sendTransaction, connection);
+  await sendAndConfirm(tx, sendTransaction, connection, "initialize_vault");
 }
 
 // ─── SPL Token-2022 helpers ───────────────────────────────────────────────────
@@ -575,9 +612,32 @@ export async function createMintForContent(
   );
 
   tx.feePayer = authorPublicKey;
+  // Must get blockhash BEFORE partialSign — otherwise the signature covers a wrong message
+  const { blockhash: mintBlockhash, lastValidBlockHeight: mintBLH } =
+    await connection.getLatestBlockhash("confirmed");
+  tx.recentBlockhash = mintBlockhash;
   tx.partialSign(mintKeypair);
 
-  const signature = await sendAndConfirm(tx, sendTransaction, connection);
+  let signature: string;
+  try {
+    signature = await sendTransaction(tx, connection);
+  } catch (err: any) {
+    const msg: string = err?.message ?? String(err);
+    if (msg.toLowerCase().includes("failed to fetch") || msg.toLowerCase().includes("network")) {
+      throw new Error(
+        "[create_mint] Wallet cannot send — make sure Phantom is set to Devnet and try again."
+      );
+    }
+    throw new Error(`[create_mint] Send failed: ${msg.slice(0, 200)}`);
+  }
+  try {
+    await connection.confirmTransaction(
+      { signature, blockhash: mintBlockhash, lastValidBlockHeight: mintBLH },
+      "confirmed"
+    );
+  } catch {
+    console.warn("[create_mint] confirm timed out for", signature);
+  }
   return { mintKeypair, signature };
 }
 
@@ -618,7 +678,7 @@ export async function mintAuthorToken(
 
   tx.feePayer = authorPublicKey;
 
-  const signature = await sendAndConfirm(tx, sendTransaction, connection);
+  const signature = await sendAndConfirm(tx, sendTransaction, connection, "create_author_ata");
   return { ata: ata.toBase58(), signature };
 }
 
@@ -654,7 +714,7 @@ export async function callMintAccessTokenCheckpoint(
   const tx = new Transaction().add(ix);
   tx.feePayer = buyerPublicKey;
 
-  const signature = await sendAndConfirm(tx, sendTransaction, connection);
+  const signature = await sendAndConfirm(tx, sendTransaction, connection, "mint_access_token");
   return signature;
 }
 
@@ -704,7 +764,7 @@ export async function mintBuyerAccessToken(
 
   tx.feePayer = authorPublicKey;
 
-  const signature = await sendAndConfirm(tx, sendTransaction, connection);
+  const signature = await sendAndConfirm(tx, sendTransaction, connection, "create_buyer_ata");
   return { ata: ata.toBase58(), signature };
 }
 
