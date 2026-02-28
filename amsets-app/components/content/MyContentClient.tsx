@@ -7,6 +7,7 @@ import { useWallet, useConnection } from "@solana/wallet-adapter-react";
 import { NeonBadge } from "@/components/ui/NeonBadge";
 import { GlowButton } from "@/components/ui/GlowButton";
 import { useAuthModal } from "@/providers/AuthContext";
+import { useAuth } from "@/lib/useAuth";
 import { useSession } from "@/hooks/useSession";
 import { publishOnChain } from "@/lib/anchor";
 import { resolveIPFS } from "@/lib/storage";
@@ -42,39 +43,72 @@ const LICENSE_LABELS: Record<string, string> = {
  * Draft items show a "Publish On-Chain" button to deploy to Solana.
  */
 export function MyContentClient() {
-  const { isAuthenticated, walletAddress, token, mounted } = useSession();
+  const { isAuthenticated, walletAddress, mounted } = useSession();
   const { publicKey, connected, sendTransaction } = useWallet();
   const { connection } = useConnection();
+  const { loginWithWallet } = useAuth();
   const [items, setItems] = useState<ContentItem[]>([]);
   const [isLoading, setIsLoading] = useState(false);
+  const [fetchError, setFetchError] = useState<string | null>(null);
   const [deployingId, setDeployingId] = useState<string | null>(null);
   const [deployError, setDeployError] = useState<Record<string, string>>({});
   const { openAuth } = useAuthModal();
 
   // ─── Fetch author's content ──────────────────────────────────────────────
+  // Always reads token fresh from localStorage so an expired/missing JWT
+  // triggers re-authentication rather than silently showing empty state.
 
   const fetchContent = useCallback(async () => {
-    if (!walletAddress || !token) return;
+    if (!walletAddress) return;
+
+    // Read token fresh — the state value may lag behind localStorage
+    let activeToken = localStorage.getItem("amsets_token");
+
+    // If token is missing and we have a browser wallet, re-auth now
+    if (!activeToken && connected && publicKey) {
+      try {
+        await loginWithWallet("wallet_adapter");
+        activeToken = localStorage.getItem("amsets_token");
+      } catch {
+        // Re-auth failed — user will see the sign-in prompt
+      }
+    }
+
+    if (!activeToken) return;
+
     setIsLoading(true);
+    setFetchError(null);
     try {
       const res = await fetch(`${API_URL}/api/v1/content/by-author/${walletAddress}`, {
-        headers: { Authorization: `Bearer ${token}` },
+        headers: { Authorization: `Bearer ${activeToken}` },
       });
-      if (!res.ok) return;
+
+      if (res.status === 401) {
+        // Token expired — clear it so next visit triggers fresh auth
+        localStorage.removeItem("amsets_token");
+        window.dispatchEvent(new Event("amsets_session_changed"));
+        setFetchError("Session expired — please sign in again.");
+        return;
+      }
+      if (!res.ok) {
+        setFetchError(`Server error (${res.status}). Please try refreshing.`);
+        return;
+      }
+
       const data = await res.json();
       setItems(data.items ?? []);
     } catch {
-      // silently fail — user sees empty state
+      setFetchError("Network error. Please check your connection and refresh.");
     } finally {
       setIsLoading(false);
     }
-  }, [walletAddress, token]);
+  }, [walletAddress, connected, publicKey, loginWithWallet]);
 
   useEffect(() => {
-    if (walletAddress && token) {
+    if (walletAddress) {
       fetchContent();
     }
-  }, [walletAddress, token, fetchContent]);
+  }, [walletAddress, fetchContent]);
 
   // ─── Publish draft on-chain ───────────────────────────────────────────────
 
@@ -83,7 +117,8 @@ export function MyContentClient() {
       openAuth();
       return;
     }
-    if (!token) return;
+    const token = localStorage.getItem("amsets_token");
+    if (!token) { openAuth(); return; }
 
     setDeployingId(item.contentId);
     setDeployError((e) => ({ ...e, [item.contentId]: "" }));
@@ -152,6 +187,17 @@ export function MyContentClient() {
         {Array.from({ length: 3 }).map((_, i) => (
           <div key={i} className="card-surface animate-pulse aspect-[3/4] rounded-xl" />
         ))}
+      </div>
+    );
+  }
+
+  if (fetchError) {
+    return (
+      <div className="flex flex-col items-center gap-4 py-24 text-center border-2 border-dashed border-red-500/30 rounded-2xl">
+        <p className="text-red-400 text-lg">{fetchError}</p>
+        <GlowButton variant="primary" onClick={() => { openAuth(); fetchContent(); }}>
+          Sign In Again
+        </GlowButton>
       </div>
     );
   }

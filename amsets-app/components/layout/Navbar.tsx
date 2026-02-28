@@ -154,8 +154,19 @@ function ConnectButton({ onOpenAuth }: ConnectButtonProps) {
     if (hasAutoAuthed.current) return;
     hasAutoAuthed.current = true;
 
-    // If we already have a valid AMSETS token, skip re-auth
-    if (localStorage.getItem("amsets_token")) return;
+    // Skip re-auth only if the stored token is still valid (not expired)
+    const storedToken = localStorage.getItem("amsets_token");
+    if (storedToken) {
+      try {
+        const payload = JSON.parse(atob(storedToken.split(".")[1]));
+        const expiredAt = (payload.exp ?? 0) * 1000;
+        if (Date.now() < expiredAt) return; // token is still valid
+      } catch {
+        // Malformed token — clear it and re-auth
+      }
+      localStorage.removeItem("amsets_token");
+      window.dispatchEvent(new Event("amsets_session_changed"));
+    }
 
     // Brief delay to ensure the wallet connection is fully established before signing
     const timer = setTimeout(async () => {
