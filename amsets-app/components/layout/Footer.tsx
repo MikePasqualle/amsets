@@ -9,8 +9,7 @@ const PRODUCT_LINKS = [
 ];
 
 const RESOURCES_LINKS = [
-  { label: "Whitepaper",   href: "/whitepaper" },
-  { label: "Docs",         href: "/whitepaper" },
+  { label: "Whitepaper", href: "/whitepaper" },
 ];
 
 const COMMUNITY_LINKS = [

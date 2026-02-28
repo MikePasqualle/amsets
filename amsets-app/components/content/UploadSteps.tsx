@@ -3,7 +3,6 @@
 import { useRef, useState, useEffect } from "react";
 import { useGSAP } from "@gsap/react";
 import gsap from "gsap";
-import { useRouter } from "next/navigation";
 import { useWallet, useConnection } from "@solana/wallet-adapter-react";
 import { DragZone } from "./DragZone";
 import { GlowButton } from "@/components/ui/GlowButton";
@@ -95,9 +94,8 @@ export function UploadSteps() {
   const { connection } = useConnection();
   const { openAuth } = useAuthModal();
   const { loginWithWallet } = useAuth();
-  const router = useRouter();
 
-  // ─── Redirect to home if no session ────────────────────────────────────────
+  // ─── Session gate — no redirect, show inline connect prompt ────────────────
   // Checks BOTH Wallet Adapter (Phantom/Solflare) and Web3Auth (email/phone/social).
   // Web3Auth session lives in localStorage ("amsets_wallet" + "amsets_token").
   const [mounted, setMounted] = useState(false);
@@ -114,13 +112,8 @@ export function UploadSteps() {
     return () => window.removeEventListener("amsets_session_changed", syncSession);
   }, []);
 
-  useEffect(() => {
-    if (!mounted) return;
-    // Allow access if EITHER Wallet Adapter OR Web3Auth session is active
-    if (!connected && !hasWeb3AuthSession) {
-      router.push("/");
-    }
-  }, [mounted, connected, hasWeb3AuthSession, router]);
+  // Derived: is any session active right now?
+  const hasSession = connected || hasWeb3AuthSession;
 
   // ─── Step transitions ───────────────────────────────────────────────────────
 
@@ -492,6 +485,38 @@ export function UploadSteps() {
   };
 
   // ─── Render ─────────────────────────────────────────────────────────────────
+
+  // Show connect-wallet gate before the wizard mounts, and as an overlay when the
+  // wallet disconnects mid-flow (step 1-4). On step 5 (publishing) we don't
+  // interrupt — the publish action will fail gracefully with an error message.
+  if (!mounted) return null;
+
+  if (!hasSession) {
+    return (
+      <div className="flex flex-col items-center gap-6 py-24 text-center">
+        <div className="w-16 h-16 rounded-2xl bg-[#221533] border border-[#3D2F5A] flex items-center justify-center mb-2">
+          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#F7FF88" strokeWidth="1.5">
+            <rect x="2" y="7" width="20" height="14" rx="2" />
+            <path d="M16 11a1 1 0 0 1 0 2 1 1 0 0 1 0-2z" fill="#F7FF88" stroke="none" />
+            <path d="M6 7V5a6 6 0 0 1 12 0v2" />
+          </svg>
+        </div>
+        <div>
+          <p className="text-[#EDE8F5] text-lg font-semibold mb-1">
+            {step > 1 ? "Reconnect to continue publishing" : "Connect your wallet to publish"}
+          </p>
+          <p className="text-[#7A6E8E] text-sm max-w-xs mx-auto">
+            {step > 1
+              ? "Your progress is saved. Reconnect your wallet and you can pick up right where you left off."
+              : "Use email, phone, Google, or your Phantom / Solflare wallet to get started."}
+          </p>
+        </div>
+        <GlowButton variant="primary" size="md" onClick={openAuth}>
+          Connect Wallet
+        </GlowButton>
+      </div>
+    );
+  }
 
   return (
     <>
