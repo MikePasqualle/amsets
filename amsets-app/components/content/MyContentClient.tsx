@@ -60,9 +60,10 @@ export function MyContentClient() {
   const [items, setItems] = useState<ContentItem[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
-  const [deployingId,   setDeployingId]   = useState<string | null>(null);
-  const [deployStep,    setDeployStep]    = useState<Record<string, string>>({});
-  const [deployError,   setDeployError]   = useState<Record<string, string>>({});
+  const [deployingId,     setDeployingId]     = useState<string | null>(null);
+  const [creatingMintId,  setCreatingMintId]  = useState<string | null>(null);
+  const [deployStep,      setDeployStep]      = useState<Record<string, string>>({});
+  const [deployError,     setDeployError]     = useState<Record<string, string>>({});
   const { openAuth } = useAuthModal();
 
   // ─── Fetch author's content ──────────────────────────────────────────────
@@ -214,6 +215,35 @@ export function MyContentClient() {
     }
   };
 
+  // ─── Create mint for published content without one ────────────────────────
+
+  const handleCreateMint = async (item: ContentItem) => {
+    const storedToken = localStorage.getItem("amsets_token");
+    if (!storedToken) { openAuth(); return; }
+    const id = item.contentId;
+    setCreatingMintId(id);
+    try {
+      const res = await fetch(`${API_URL}/api/v1/content/${id}/create-mint`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${storedToken}` },
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
+      // Update local state immediately so the UI reflects the new mint
+      setItems((prev) =>
+        prev.map((c) =>
+          c.contentId === id
+            ? { ...c, mintAddress: data.mint_address }
+            : c
+        )
+      );
+    } catch (err: any) {
+      alert(`Failed to create mint: ${err?.message ?? "unknown error"}`);
+    } finally {
+      setCreatingMintId(null);
+    }
+  };
+
   // ─── Render ──────────────────────────────────────────────────────────────
 
   if (!mounted) return null;
@@ -310,6 +340,8 @@ export function MyContentClient() {
                 key={item.contentId}
                 item={item}
                 isDeploying={false}
+                onCreateMint={!item.mintAddress ? () => handleCreateMint(item) : undefined}
+                isCreatingMint={creatingMintId === item.contentId}
                 canDeploy={false}
                 openAuth={openAuth}
               />
@@ -326,7 +358,9 @@ export function MyContentClient() {
 interface ContentManageCardProps {
   item: ContentItem;
   onPublish?: () => void;
+  onCreateMint?: () => void;
   isDeploying: boolean;
+  isCreatingMint?: boolean;
   deployStep?: string;
   deployError?: string;
   canDeploy: boolean;
@@ -336,7 +370,9 @@ interface ContentManageCardProps {
 function ContentManageCard({
   item,
   onPublish,
+  onCreateMint,
   isDeploying,
+  isCreatingMint,
   deployStep,
   deployError,
   canDeploy,
@@ -395,12 +431,25 @@ function ContentManageCard({
 
         {/* Token supply info for active content */}
         {!isDraft && (
-          <div className="flex items-center justify-between text-xs text-[#7A6E8E]">
-            <span>{available} / {item.totalSupply ?? "?"} tokens available</span>
-            {hasMint ? (
-              <span className="text-green-400">✓ Mint active</span>
-            ) : (
-              <span className="text-amber-400">⚠ No mint yet</span>
+          <div className="flex flex-col gap-2">
+            <div className="flex items-center justify-between text-xs text-[#7A6E8E]">
+              <span>{available} / {item.totalSupply ?? "?"} tokens available</span>
+              {hasMint ? (
+                <span className="text-green-400">✓ Mint active</span>
+              ) : (
+                <span className="text-amber-400">⚠ No mint yet</span>
+              )}
+            </div>
+            {/* Create mint button for published content without a token mint */}
+            {!hasMint && onCreateMint && (
+              <GlowButton
+                variant="secondary"
+                size="sm"
+                isLoading={isCreatingMint}
+                onClick={onCreateMint}
+              >
+                {isCreatingMint ? "Creating mint…" : "Create Token Mint"}
+              </GlowButton>
             )}
           </div>
         )}

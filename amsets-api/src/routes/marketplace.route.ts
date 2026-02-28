@@ -210,16 +210,26 @@ async function enrichWithDbMetadata(
 
   if (draftIds.length > 0) {
     console.log(`[marketplace] Auto-syncing ${draftIds.length} on-chain records stuck in draft:`, draftIds);
-    // Update in background — don't block the response
-    db.update(content)
-      .set({ status: "active" })
-      .where(inArray(content.contentId, draftIds))
-      .execute()
-      .catch((err) => console.error("[marketplace] Auto-sync failed:", err));
+    // Build a map of onChainPda per contentId for the sync
+    const pdaMap = new Map(records.map((r) => [r.contentId.slice(0, 32), r.pdaAddress]));
+    // Update each in background with its actual PDA address
+    Promise.all(
+      draftIds.map((id) => {
+        const pda = pdaMap.get(id.slice(0, 32));
+        return db.update(content)
+          .set({ status: "active", ...(pda ? { onChainPda: pda } : {}) })
+          .where(eq(content.contentId, id))
+          .execute();
+      })
+    ).catch((err) => console.error("[marketplace] Auto-sync failed:", err));
     // Reflect immediately in our in-memory map so this response is correct
     draftIds.forEach((id) => {
       const row = dbMap.get(id.slice(0, 32));
-      if (row) row.status = "active";
+      if (row) {
+        row.status = "active";
+        const pda = pdaMap.get(id.slice(0, 32));
+        if (pda) row.onChainPda = pda;
+      }
     });
   }
 

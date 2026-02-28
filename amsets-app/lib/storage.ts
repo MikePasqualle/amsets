@@ -1,233 +1,52 @@
 /**
- * Client-side storage utilities for Arweave (via Irys) and IPFS (via Pinata).
+ * Client-side storage utilities.
  *
- * Preferred Upload Flow (Phase 1 — decentralized bundle):
- *   1. generateSymmetricKey()
- *   2. encryptFile(key, buffer) → { ciphertext, iv }
- *   3. packEncrypted(iv, ciphertext) → packed ArrayBuffer
- *   4. encryptKeyForContent(key, accessMint) → litBundle
- *   5. encodeBundle({ metadata, previewUri, encryptedBuffer, litBundle, accessMint })
- *   6. uploadBundleToArweave(bundle, wallet) → ar://{txId}
+ * Current mode (Livepeer):
+ *   Videos are uploaded to Livepeer Studio via TUS (handled in UploadSteps.tsx).
+ *   This file now only exposes uploadPreviewToIPFS for preview images.
  *
- * The bundle JSON embeds the encrypted file + Lit key — no backend storage needed.
- *
- * IMPORTANT: `wallet` must be the full result of useWallet() from
- * @solana/wallet-adapter-react — NOT wallet.adapter or window.solana.
- * The @irys/web-upload-solana package uses the full wallet context internally.
+ * Legacy Arweave/Irys upload functions are commented out below.
+ * To restore: uncomment the Arweave block and re-add imports.
  */
 
-import { packEncrypted, unpackEncrypted } from "./crypto";
-import type { AmsetsBundle } from "./arweave-bundle";
+// ── Arweave/Irys imports commented out ────────────────────────────────────────
+// import { packEncrypted, unpackEncrypted } from "./crypto";
+// import type { AmsetsBundle } from "./arweave-bundle";
+// ─────────────────────────────────────────────────────────────────────────────
 
-// ─── Irys (Arweave) upload ────────────────────────────────────────────────────
 
-export interface ArweaveUploadResult {
-  txId: string;
-  uri: string; // "ar://{txId}"
-  size: number;
-}
-
-/**
- * Upload encrypted file bytes to Arweave via Irys (browser-safe SDK).
- *
- * @param encryptedBuffer - Packed iv+ciphertext buffer
- * @param mimeType        - Original file MIME type (stored as tag)
- * @param title           - Content title (stored as tag)
- * @param wallet          - Full useWallet() result from @solana/wallet-adapter-react
- */
-export async function uploadToArweave(
-  encryptedBuffer: ArrayBuffer,
-  mimeType: string,
-  title: string,
-  wallet: any
-): Promise<ArweaveUploadResult> {
-  const { WebUploader } = await import("@irys/web-upload");
-  const { WebSolana }   = await import("@irys/web-upload-solana");
-
-  // Use the configured Solana RPC (Helius devnet) so Irys doesn't fall back to
-  // mainnet-beta (its default) which returns 403 for devnet blockhash requests.
-  const rpcUrl  = process.env.NEXT_PUBLIC_SOLANA_RPC_URL ?? "https://api.devnet.solana.com";
-  const isDevnet = (process.env.NEXT_PUBLIC_IRYS_NETWORK ?? "devnet") === "devnet";
-
-  const irysBuilder = WebUploader(WebSolana).withProvider(wallet).withRpc(rpcUrl);
-  const irys = await (isDevnet ? irysBuilder.devnet() : irysBuilder);
-
-  const uint8 = new Uint8Array(encryptedBuffer);
-
-  // Check balance and fund if needed (devnet requires confirmed balance)
-  try {
-    const price   = await irys.getPrice(uint8.byteLength);
-    const balance = await irys.getLoadedBalance();
-    if (balance.lt(price)) {
-      const fundAmount = price.multipliedBy(1.2).integerValue();
-      await irys.fund(fundAmount);
-      // Solana devnet needs ~30-60s for finalized status — wait before uploading
-      await new Promise((resolve) => setTimeout(resolve, 45_000));
-    }
-  } catch {
-    // Balance check is non-fatal
-  }
-
-  const tags = [
-    { name: "Content-Type",      value: "application/octet-stream" },
-    { name: "AMSETS-MIME-Type",  value: mimeType },
-    { name: "AMSETS-Title",      value: title },
-    { name: "AMSETS-Encrypted",  value: "AES-256-GCM" },
-  ];
-
-  const receipt = await irys.upload(Buffer.from(uint8), { tags });
-
-  return {
-    txId: receipt.id,
-    uri: `ar://${receipt.id}`,
-    size: uint8.byteLength,
-  };
-}
-
-const FAUCET_MSG = "Get free devnet SOL at https://faucet.solana.com";
-
-/**
- * Upload an AmsetsBundle JSON document to Arweave via Irys (browser-safe SDK).
- *
- * @param bundle          - Complete AmsetsBundle object to upload
- * @param wallet          - Full useWallet() result from @solana/wallet-adapter-react
- * @param onProgress      - Optional callback for live status messages in the UI
- * @param solanaConnection - Optional Connection used to pre-check Phantom wallet SOL balance
- * @param walletPublicKey  - Optional PublicKey for the SOL pre-flight check
- */
-export async function uploadBundleToArweave(
-  bundle: AmsetsBundle,
-  wallet: any,
-  onProgress?: (msg: string) => void,
-  solanaConnection?: any,
-  walletPublicKey?: any
-): Promise<ArweaveUploadResult> {
-  const report = (msg: string) => onProgress?.(msg);
-
-  // ── Pre-flight: check Phantom wallet SOL balance ──────────────────────────
-  // This catches the "402 Not enough balance" error BEFORE it happens,
-  // and shows a clear user-facing message with a faucet link.
-  if (solanaConnection && walletPublicKey) {
-    try {
-      report("Checking wallet SOL balance…");
-      const lamports = await solanaConnection.getBalance(walletPublicKey);
-      const sol = lamports / 1_000_000_000;
-      const MIN_SOL = 0.005; // 0.005 SOL covers funding + tx fees comfortably
-      if (sol < MIN_SOL) {
-        throw new Error(
-          `Your Phantom wallet only has ${sol.toFixed(6)} SOL — not enough to fund Irys. ` +
-          `You need at least ${MIN_SOL} SOL. ${FAUCET_MSG}`
-        );
-      }
-      report(`Wallet balance: ${sol.toFixed(4)} SOL ✓`);
-    } catch (err: any) {
-      // Re-throw our own balance error; ignore RPC errors (non-fatal)
-      if (err.message?.includes("faucet") || err.message?.includes("SOL")) throw err;
-    }
-  }
-
-  // ── Connect to Irys ───────────────────────────────────────────────────────
-  report("Connecting to Irys node…");
-  const { WebUploader } = await import("@irys/web-upload");
-  const { WebSolana }   = await import("@irys/web-upload-solana");
-
-  // IMPORTANT: always pass .withRpc() so Irys uses our configured Solana RPC
-  // instead of defaulting to mainnet-beta (which returns 403 on devnet requests).
-  const rpcUrl   = process.env.NEXT_PUBLIC_SOLANA_RPC_URL ?? "https://api.devnet.solana.com";
-  const isDevnet = (process.env.NEXT_PUBLIC_IRYS_NETWORK ?? "devnet") === "devnet";
-
-  const irysBuilder = WebUploader(WebSolana).withProvider(wallet).withRpc(rpcUrl);
-  const irys = await (isDevnet ? irysBuilder.devnet() : irysBuilder);
-
-  report("Serialising bundle…");
-  const json   = JSON.stringify(bundle);
-  const uint8  = new TextEncoder().encode(json);
-  const sizeMb = (uint8.byteLength / 1_048_576).toFixed(2);
-
-  // ── Balance check + fund ──────────────────────────────────────────────────
-  // Errors here are FATAL — we surface them to the user instead of swallowing.
-  report(`Checking Irys node balance (bundle: ${sizeMb} MB)…`);
-  let needsFunding = false;
-  try {
-    const price   = await irys.getPrice(uint8.byteLength);
-    const balance = await irys.getLoadedBalance();
-    needsFunding  = balance.lt(price);
-
-    if (needsFunding) {
-      const fundAmount = price.multipliedBy(1.3).integerValue(); // 30% buffer
-      const fundSol    = Number(fundAmount.toString()) / 1_000_000_000;
-      report(`Funding Irys node with ${fundSol.toFixed(6)} SOL — confirm in Phantom…`);
-
-      try {
-        await irys.fund(fundAmount);
-      } catch (fundErr: any) {
-        const raw = fundErr?.message ?? String(fundErr);
-        throw new Error(
-          `Irys funding failed: ${raw.slice(0, 120)}. ` +
-          `Make sure your Phantom wallet has SOL. ${FAUCET_MSG}`
-        );
-      }
-
-      // Devnet: wait for the funding tx to reach "finalized" status (~45 s).
-      // Show a countdown so the user knows the UI is not frozen.
-      const WAIT_SECS = 50;
-      for (let t = WAIT_SECS; t > 0; t -= 5) {
-        report(`Waiting for Irys funding confirmation… ${t}s`);
-        await new Promise((r) => setTimeout(r, 5_000));
-      }
-      report("Irys funding confirmed ✓");
-    } else {
-      report(`Irys balance sufficient ✓ — uploading ${sizeMb} MB…`);
-    }
-  } catch (err: any) {
-    // Only rethrow errors we intentionally created above
-    if (
-      err.message?.includes("funding failed") ||
-      err.message?.includes("faucet") ||
-      err.message?.includes("SOL")
-    ) {
-      throw err;
-    }
-    // Irys price/balance API error — non-fatal, attempt upload anyway
-    report(`Balance check skipped (${(err?.message ?? "").slice(0, 60)}) — attempting upload…`);
-  }
-
-  // ── Upload ────────────────────────────────────────────────────────────────
-  const tags = [
-    { name: "Content-Type",      value: "application/json" },
-    { name: "AMSETS-Bundle",     value: "1.0" },
-    { name: "AMSETS-Title",      value: bundle.metadata.title },
-    { name: "AMSETS-MIME-Type",  value: bundle.metadata.mime_type },
-    { name: "AMSETS-Hash",       value: bundle.metadata.content_hash },
-    { name: "AMSETS-Encrypted",  value: "AES-256-GCM+Lit" },
-    { name: "AMSETS-Access",     value: bundle.access.access_mint },
-  ];
-
-  report(`Uploading ${sizeMb} MB to Arweave…`);
-  const receipt = await irys.upload(Buffer.from(uint8), { tags });
-
-  return {
-    txId: receipt.id,
-    uri:  `ar://${receipt.id}`,
-    size: uint8.byteLength,
-  };
-}
-
-/**
- * Download and return the packed encrypted buffer from Arweave.
- */
-export async function downloadFromArweave(arweaveUri: string): Promise<ArrayBuffer> {
-  const txId = arweaveUri.replace("ar://", "");
-  const gateway = process.env.NEXT_PUBLIC_ARWEAVE_GATEWAY ?? "https://arweave.net";
-  const url = `${gateway}/${txId}`;
-
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`Failed to fetch from Arweave: ${response.status}`);
-  }
-
-  return response.arrayBuffer();
-}
+// ── ARWEAVE UPLOAD FUNCTIONS (commented out — replaced by Livepeer) ───────────
+//
+// export interface ArweaveUploadResult { txId: string; uri: string; size: number; }
+//
+// export async function uploadToArweave(
+//   encryptedBuffer: ArrayBuffer, mimeType: string, title: string, wallet: any
+// ): Promise<ArweaveUploadResult> {
+//   const { WebUploader } = await import("@irys/web-upload");
+//   const { WebSolana }   = await import("@irys/web-upload-solana");
+//   const rpcUrl  = process.env.NEXT_PUBLIC_SOLANA_RPC_URL ?? "https://api.devnet.solana.com";
+//   const isDevnet = (process.env.NEXT_PUBLIC_IRYS_NETWORK ?? "devnet") === "devnet";
+//   const irysBuilder = WebUploader(WebSolana).withProvider(wallet).withRpc(rpcUrl);
+//   const irys = await (isDevnet ? irysBuilder.devnet() : irysBuilder);
+//   // ... fund + upload ...
+// }
+//
+// export async function uploadBundleToArweave(
+//   bundle: AmsetsBundle, wallet: any, onProgress?: (msg: string) => void,
+//   solanaConnection?: any, walletPublicKey?: any
+// ): Promise<ArweaveUploadResult> {
+//   // Full Irys TUS upload with balance check + retry + wait flow
+//   // (see git history for full implementation)
+// }
+//
+// export async function downloadFromArweave(arweaveUri: string): Promise<ArrayBuffer> {
+//   const txId = arweaveUri.replace("ar://", "");
+//   const gateway = process.env.NEXT_PUBLIC_ARWEAVE_GATEWAY ?? "https://arweave.net";
+//   const res = await fetch(`${gateway}/${txId}`);
+//   if (!res.ok) throw new Error(`Arweave fetch failed: ${res.status}`);
+//   return res.arrayBuffer();
+// }
+// ─────────────────────────────────────────────────────────────────────────────
 
 // ─── IPFS preview upload ──────────────────────────────────────────────────────
 
@@ -285,4 +104,4 @@ export function resolveIPFS(uri: string): string {
   return `${gateway}/ipfs/${cid}`;
 }
 
-export { unpackEncrypted };
+// export { unpackEncrypted }; // Arweave legacy — not needed for Livepeer mode

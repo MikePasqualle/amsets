@@ -8,15 +8,14 @@ import { DragZone } from "./DragZone";
 import { GlowButton } from "@/components/ui/GlowButton";
 import { NeonBadge } from "@/components/ui/NeonBadge";
 import { useAuthModal } from "@/providers/AuthContext";
-import {
-  computeSHA256,
-  generateSymmetricKey,
-  encryptFile,
-  packEncrypted,
-} from "@/lib/crypto";
-import { encryptKeyForContent } from "@/lib/lit";
-import { encodeBundle, type AmsetsBundleMetadata } from "@/lib/arweave-bundle";
-import { uploadBundleToArweave, uploadPreviewToIPFS } from "@/lib/storage";
+import { computeSHA256 } from "@/lib/crypto";
+// ── Arweave / Lit imports commented out — replaced by Livepeer ──────────────
+// import { generateSymmetricKey, encryptFile, packEncrypted } from "@/lib/crypto";
+// import { encryptKeyForContent } from "@/lib/lit";
+// import { encodeBundle, type AmsetsBundleMetadata } from "@/lib/arweave-bundle";
+// import { uploadBundleToArweave } from "@/lib/storage";
+import { uploadPreviewToIPFS } from "@/lib/storage";
+import * as tus from "tus-js-client";
 import {
   publishOnChain,
   createMintForContent,
@@ -89,11 +88,10 @@ export function UploadSteps() {
   const [deployMode, setDeployMode] = useState<"auto" | "draft">("auto");
   const contentRef = useRef<HTMLDivElement | null>(null);
 
-  // Capture the full WalletContextState — Irys @irys/web-upload-solana needs
-  // the entire context object (publicKey + signTransaction + sendTransaction),
-  // NOT wallet.adapter or window.solana.
+  // WalletContextState — used for Solana on-chain transactions (publishOnChain, setAccessMint).
+  // Irys/Arweave code is commented out — wallet signing for uploads no longer needed.
   const walletContext = useWallet();
-  const { publicKey, connected, sendTransaction, wallet } = walletContext;
+  const { publicKey, connected, sendTransaction } = walletContext;
   const { connection } = useConnection();
   const { openAuth } = useAuthModal();
   const { loginWithWallet } = useAuth();
@@ -168,7 +166,7 @@ export function UploadSteps() {
     setIsProcessing(true);
 
     const steps: PublishStep[] = [
-      { label: "Encrypting file + building Arweave bundle", status: "pending" },
+      { label: "Uploading video to Livepeer",               status: "pending" },
       { label: "Uploading preview to IPFS",                 status: "pending" },
       { label: "Registering content in backend",            status: "pending" },
       { label: "Registering on Solana blockchain",          status: "pending" },
@@ -179,9 +177,6 @@ export function UploadSteps() {
 
     let token = typeof window !== "undefined" ? localStorage.getItem("amsets_token") : null;
 
-    // If Wallet Adapter is connected but no JWT yet, authenticate now.
-    // This handles the edge case where the user connected Phantom but the
-    // auto-auth in Navbar didn't complete before they started publishing.
     if (!token && connected && publicKey) {
       try {
         await loginWithWallet("wallet_adapter");
@@ -191,109 +186,92 @@ export function UploadSteps() {
       }
     }
 
-    // For Arweave upload, pass the full WalletContextState (walletContext) to Irys.
-    // @irys/web-upload-solana reads publicKey + signTransaction + sendTransaction
-    // from the WalletContextState directly — do NOT use wallet.adapter or window.solana.
-    // Only Wallet Adapter wallets (Phantom, Solflare, etc.) work with Irys in the browser.
-    // Web3Auth (email/phone) users will skip Arweave and save as draft instead.
-    const solanaWallet = connected ? walletContext : null;
+    // ── Arweave / Lit upload block commented out — replaced by Livepeer ───────
+    // Previously: encrypt file with AES-256-GCM → encrypt key via Lit Protocol
+    // → build AmsetsBundle JSON → upload to Arweave via Irys TUS.
+    // Keep this block for reference; restore by uncommenting if Arweave is needed.
+    //
+    // const key    = await generateSymmetricKey();
+    // const buffer = await data.file.arrayBuffer();
+    // const { ciphertext, iv } = await encryptFile(key, buffer);
+    // const packed = packEncrypted(iv, ciphertext);
+    // const placeholderMint = "11111111111111111111111111111111";
+    // let litBundle: any = null;
+    // try { litBundle = await encryptKeyForContent(key, placeholderMint); } catch { }
+    // const bundle = encodeBundle({ metadata, previewUri: "ipfs://pending",
+    //   encryptedBuffer: packed, litBundle, accessMint: placeholderMint });
+    // const arResult = await uploadBundleToArweave(bundle, solanaWallet, onProgress,
+    //   connection, publicKey);
+    // storageUri = arResult.uri;
+    // ─────────────────────────────────────────────────────────────────────────
 
     try {
-      // ── Step 1: Encrypt file + build AmsetsBundle + upload to Arweave ────
-      steps[0] = { ...steps[0], status: "running", detail: "Generating encryption key…" };
+      // ── Step 1: Upload video to Livepeer Studio via TUS ───────────────────
+      steps[0] = { ...steps[0], status: "running", detail: "Requesting upload URL from Livepeer…" };
       setPublishSteps([...steps]);
 
-      const key    = await generateSymmetricKey();
+      let storageUri = `livepeer://pending_${contentHash!.slice(0, 8)}`;
+      let livepeerAssetId: string | null = null;
 
-      const fileSizeMb = (data.file.size / 1_048_576).toFixed(2);
-      steps[0] = { ...steps[0], detail: `Encrypting file (${fileSizeMb} MB) with AES-256-GCM…` };
-      setPublishSteps([...steps]);
+      try {
+        if (!token) throw new Error("Connect your wallet to upload");
 
-      const buffer = await data.file.arrayBuffer();
-      const { ciphertext, iv } = await encryptFile(key, buffer);
-      const packed = packEncrypted(iv, ciphertext);
+        // 1a. Create asset on Livepeer Studio (JWT-gated)
+        const uploadRes = await fetch(`${API_URL}/api/v1/livepeer/request-upload`, {
+          method:  "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+          body:    JSON.stringify({ name: data.title || data.file.name }),
+        });
 
-      // Use system program ID as placeholder mint — updated after set_access_mint
-      const placeholderMint = "11111111111111111111111111111111";
+        if (!uploadRes.ok) {
+          const err = await uploadRes.json().catch(() => ({}));
+          throw new Error((err as any).error ?? `Livepeer upload init failed (${uploadRes.status})`);
+        }
 
-      let storageUri = `ar://pending_${contentHash!.slice(0, 8)}`;
-      let litBundle: any = null;
+        const uploadData = await uploadRes.json();
+        const { tusUploadUrl, assetId, playbackId } = uploadData;
+        livepeerAssetId = assetId;
 
-      if (solanaWallet) {
-        // ── Lit Protocol encryption (non-fatal) ────────────────────────────
-        // Run separately so a Lit timeout does NOT prevent Arweave upload.
-        steps[0] = { ...steps[0], detail: "Encrypting access key via Lit Protocol…" };
+        // 1b. TUS resumable upload directly to Livepeer CDN
+        const fileSizeMb = (data.file.size / 1_048_576).toFixed(2);
+        steps[0] = { ...steps[0], detail: `Uploading video (${fileSizeMb} MB) to Livepeer…` };
         setPublishSteps([...steps]);
-        try {
-          litBundle = await encryptKeyForContent(key, placeholderMint);
-        } catch (litErr: any) {
-          const litMsg: string = litErr?.message ?? String(litErr);
-          // Lit failure is non-fatal: content uploads to Arweave without a
-          // decryption key. Only the author can view until Lit is re-connected.
-          console.warn("[Lit] Encryption failed (non-fatal):", litMsg);
-          steps[0] = { ...steps[0], detail: "Lit encryption skipped (will retry on view) — uploading to Arweave…" };
-          setPublishSteps([...steps]);
-        }
 
-        // ── Arweave upload (independent of Lit result) ─────────────────────
-        try {
-          const bundleMetadata: AmsetsBundleMetadata = {
-            title:        data.title,
-            description:  data.description || undefined,
-            category:     data.category,
-            mime_type:    data.file.type || "application/octet-stream",
-            content_hash: contentHash!,
-          };
-
-          const bundle = encodeBundle({
-            metadata:        bundleMetadata,
-            previewUri:      `ipfs://pending`,
-            encryptedBuffer: packed,
-            litBundle:       litBundle ?? { ciphertext: "", data_to_encrypt_hash: "" },
-            accessMint:      placeholderMint,
+        await new Promise<void>((resolve, reject) => {
+          const upload = new tus.Upload(data.file!, {
+            endpoint:     tusUploadUrl,
+            uploadUrl:    tusUploadUrl,
+            retryDelays:  [0, 1000, 3000, 5000],
+            chunkSize:    5 * 1024 * 1024, // 5 MB chunks
+            metadata: {
+              filename:    data.file!.name,
+              filetype:    data.file!.type,
+            },
+            onProgress: (bytesUploaded, bytesTotal) => {
+              const pct = ((bytesUploaded / bytesTotal) * 100).toFixed(1);
+              steps[0] = { ...steps[0], detail: `Uploading to Livepeer… ${pct}%` };
+              setPublishSteps([...steps]);
+            },
+            onSuccess: () => resolve(),
+            onError:   (err) => reject(err),
           });
+          upload.start();
+        });
 
-          // onProgress wires intermediate messages into the step detail live
-          const onArweaveProgress = (msg: string) => {
-            steps[0] = { ...steps[0], status: "running", detail: msg };
-            setPublishSteps([...steps]);
-          };
-
-          // Pass full walletContext + connection + publicKey so storage.ts can
-          // run a pre-flight SOL balance check BEFORE attempting Irys funding.
-          const arResult = await uploadBundleToArweave(
-            bundle,
-            solanaWallet,
-            onArweaveProgress,
-            connection,   // from useConnection() — used to check Phantom SOL balance
-            publicKey     // from useWallet() — wallet address for balance lookup
-          );
-          // Guard against malformed/undefined receipt IDs from Irys devnet
-          const txId = arResult.txId ?? "";
-          storageUri = txId.length >= 10 ? arResult.uri : `ar://pending_${contentHash!.slice(0, 8)}`;
-
-          steps[0] = {
-            ...steps[0],
-            status: "done",
-            detail: litBundle
-              ? `ar://${arResult.txId.slice(0, 12)}… (${(arResult.size / 1024).toFixed(1)} KB)`
-              : `ar://${arResult.txId.slice(0, 12)}… (Lit skipped — author-only view until re-encrypted)`,
-          };
-        } catch (arErr: any) {
-          const errMsg: string = arErr?.message ?? arErr?.toString() ?? "Unknown Arweave error";
-          steps[0] = {
-            ...steps[0],
-            status: "error",
-            detail: `Arweave upload failed: ${errMsg.slice(0, 120)}${errMsg.length > 120 ? "…" : ""}`,
-          };
-          storageUri = `ar://pending_${contentHash!.slice(0, 8)}`;
-        }
-      } else {
+        storageUri = `livepeer://${playbackId}`;
         steps[0] = {
           ...steps[0],
-          status: "skipped",
-          detail: `File encrypted locally (${(packed.byteLength / 1024).toFixed(1)} KB). Connect a browser wallet (Phantom/Solflare) to upload to Arweave permanently.`,
+          status: "done",
+          detail: `livepeer://${playbackId.slice(0, 16)}… | Livepeer is transcoding…`,
         };
+      } catch (livepeerErr: any) {
+        const errMsg: string = livepeerErr?.message ?? "Livepeer upload failed";
+        steps[0] = {
+          ...steps[0],
+          status: "error",
+          detail: errMsg.slice(0, 150),
+        };
+        // Don't abort — register as draft with pending URI so the content is saved
       }
       setPublishSteps([...steps]);
 
@@ -350,12 +328,8 @@ export function UploadSteps() {
             mime_type:     data.file?.type ?? "application/octet-stream",
           };
 
-          // Include Lit key data only as fallback (for legacy content without Arweave bundle)
-          if (litBundle && storageUri.startsWith("ar://pending_")) {
-            // Bundle upload failed — store keys in backend as fallback
-            regBody.encrypted_key        = litBundle.ciphertext ?? "pending";
-            regBody.lit_conditions_hash  = litBundle.data_to_encrypt_hash ?? "pending";
-          }
+          // Livepeer: no client-side encryption — access is controlled via JWT gating.
+          // Legacy Arweave/Lit fields (encrypted_key, lit_conditions_hash) not needed.
 
           const regRes = await fetch(`${API_URL}/api/v1/content/register`, {
             method: "POST",
@@ -619,10 +593,10 @@ export function UploadSteps() {
         {/* Step content */}
         <div ref={contentRef} className="min-h-[320px]">
 
-          {/* ── Step 1: Upload file ── */}
+          {/* ── Step 1: Upload video ── */}
           {step === 1 && (
             <div className="flex flex-col gap-6">
-              <h2 className="text-xl font-semibold text-[#EDE8F5]">Upload your file</h2>
+              <h2 className="text-xl font-semibold text-[#EDE8F5]">Upload your video</h2>
               <DragZone onFile={handleFileSelect} />
               {data.file && (
                 <div className="flex flex-col gap-3">
@@ -805,7 +779,13 @@ export function UploadSteps() {
               <p className="text-[#7A6E8E] text-sm">
                 Public teaser image buyers see before purchasing. Optional but recommended.
               </p>
-              <DragZone onFile={(f) => setData((d) => ({ ...d, previewFile: f }))} maxSizeMB={10} />
+              <DragZone
+                onFile={(f) => setData((d) => ({ ...d, previewFile: f }))}
+                maxSizeMB={10}
+                allowedMimeTypes={["image/png", "image/jpeg", "image/gif", "image/webp"]}
+                label="preview image"
+                subLabel="PNG · JPG · GIF · WebP"
+              />
 
               {/* ── Deploy mode choice ─────────────────────────────── */}
               <div className="flex flex-col gap-2">
@@ -867,7 +847,7 @@ export function UploadSteps() {
                   isLoading={isProcessing}
                   onClick={handlePublish}
                 >
-                  {deployMode === "auto" ? "Encrypt & Deploy →" : "Save as Draft →"}
+                  {deployMode === "auto" ? "Upload & Deploy →" : "Save as Draft →"}
                 </GlowButton>
               </div>
             </div>
@@ -956,7 +936,9 @@ export function UploadSteps() {
                                 </p>
 
                                 <div className="flex gap-2 flex-wrap justify-center">
-                                  <NeonBadge variant="primary">AES-256-GCM encrypted ✓</NeonBadge>
+                                  {publishSteps[0]?.status === "done" && (
+                                    <NeonBadge variant="primary">Livepeer Video ✓</NeonBadge>
+                                  )}
                                   {publishSteps[1]?.status === "done" && (
                                     <NeonBadge variant="secondary">Preview on IPFS ✓</NeonBadge>
                                   )}

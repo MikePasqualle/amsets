@@ -556,8 +556,11 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
   return (
     <main ref={containerRef} className="min-h-screen max-w-6xl mx-auto px-6 pt-28 pb-16">
 
-      {/* ── Content Viewer (unlocked) ─────────────────────────────────────── */}
-      {(hasAccess || showViewer) && content.storageUri && (
+      {/* ── Content Viewer ────────────────────────────────────────────────── */}
+      {/* Livepeer: show viewer for anyone who has access (author or buyer).   */}
+      {/* The ContentViewer handles its own JWT fetch and shows a "connect"   */}
+      {/* prompt if the user has no access token yet.                         */}
+      {content.storageUri && (hasAccess || showViewer) && (
         <div className="mb-10">
           <div className="flex items-center gap-3 mb-4">
             <NeonBadge variant="secondary">
@@ -573,7 +576,7 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
             contentId={content.contentId}
             storageUri={content.storageUri}
             accessMint={content.mintAddress ?? content.accessMint}
-            mimeType={content.mimeType ?? "application/octet-stream"}
+            mimeType={content.mimeType ?? "video/mp4"}
             encryptedKey={content.encryptedKey}
             litConditionsHash={content.litConditionsHash}
             isAuthor={isAuthor}

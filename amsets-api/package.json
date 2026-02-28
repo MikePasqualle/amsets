@@ -23,6 +23,7 @@
     "drizzle-orm": "^0.45.1",
     "hono": "^4.12.1",
     "jsonwebtoken": "^9.0.3",
+    "livepeer": "^3.5.0",
     "pg": "^8.18.0",
     "redis": "^5.11.0",
     "tweetnacl": "^1.0.3",

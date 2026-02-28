@@ -10,6 +10,7 @@ export const corsMiddleware = cors({
     "Content-Type",
     "Authorization",
     "X-Content-Token",
+    "X-Admin-Secret",
   ],
   allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   credentials: true,

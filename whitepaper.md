@@ -6,7 +6,7 @@
 
 ## Abstract
 
-AMSETS is a fully decentralized intellectual property rights ledger built on the Solana blockchain. It enables creators — writers, musicians, software developers, researchers, visual artists, and other knowledge workers — to register original works on-chain, set programmable access terms, and monetize their content directly, without intermediaries. Buyers receive non-fungible SPL Token-2022 access tokens that unlock end-to-end encrypted content via Lit Protocol. All core ownership data is stored immutably on Solana; previews and metadata live on IPFS; full content bundles are pinned permanently on Arweave. The backend database is a cache only — the blockchain is the single source of truth.
+AMSETS is a fully decentralized intellectual property rights ledger built on the Solana blockchain. It enables creators — filmmakers, musicians, educators, researchers, and other knowledge workers — to register original video works on-chain, set programmable access terms, and monetize their content directly, without intermediaries. Buyers receive non-fungible SPL Token-2022 access tokens that grant streaming access via Livepeer's decentralized video network. All core ownership data is stored immutably on Solana; previews and metadata live on IPFS; video content is streamed via Livepeer Studio with JWT-gated access control. The backend database is a cache only — the blockchain is the single source of truth.
 
 AMSETS solves three critical problems that existing platforms fail to address together: (1) the absence of on-chain, tamper-proof copyright registration accessible to individuals; (2) the centralized control of content distribution and revenue flows; and (3) the lack of programmable, trustless royalty enforcement on secondary sales.
 
@@ -39,8 +39,8 @@ AMSETS addresses all four problems with a four-layer decentralized architecture:
 | Layer | Technology | What it stores |
 |---|---|---|
 | Layer 1 — Ownership | Solana (Anchor) | `ContentRecord` PDA: hash, price, license, access mint |
-| Layer 2 — Access Keys | Lit Protocol | AES-256-GCM symmetric key encrypted under token-ownership conditions |
-| Layer 3 — Content | Arweave via Irys | Encrypted content bundle JSON (permanent, immutable) |
+| Layer 2 — Access Keys | Lit Protocol | JWT-gated playback conditions tied to SPL token ownership |
+| Layer 3 — Content | Livepeer Studio | Transcoded video streams with JWT access control |
 | Layer 4 — Previews | IPFS via Pinata | Preview images and metadata JSON (fast CDN delivery) |
 
 The backend API (Hono + PostgreSQL + Redis) is a **cache layer only** — it indexes and serves data from the chain but cannot alter ownership records, access conditions, or encrypted content.
@@ -56,7 +56,7 @@ The core registry is an Anchor program deployed on Solana. It manages the follow
 **Content Record** (Program Derived Account):
 Each registered work gets a unique on-chain account that stores:
 - SHA-256 fingerprint of the original file (tamper-proof proof of existence)
-- Arweave bundle location (`ar://...`)
+- Livepeer playback ID (`livepeer://...`) — canonical pointer to the video
 - IPFS preview URI
 - Creator wallet address
 - SPL Token-2022 mint address (access token)
@@ -79,22 +79,27 @@ Access tokens use the **SPL Token-2022** standard (Token Extensions Program). Th
 
 Each content item has exactly **one SPL Token-2022 mint**. The author always holds one token (proof of authorship). Buyers receive one token each, up to `total_supply`. Token holders can list their token for sale on the AMSETS marketplace; the `TransferFee` extension ensures the author receives royalties on every resale automatically.
 
-### 3.3 Key Management — Lit Protocol
+### 3.3 Access Control — Lit Protocol + Livepeer JWT
 
-Before uploading, the client generates an AES-256-GCM symmetric key in the browser. The file is encrypted locally — the plaintext never leaves the user's device. The symmetric key is then encrypted by Lit Protocol's decentralized threshold network under an **on-chain access condition** tied to SPL token ownership on Solana.
+Video access is enforced through a two-layer mechanism:
 
-No central server ever holds the symmetric key. The encrypted key is stored alongside the encrypted content in the Arweave bundle. Decryption is only possible by proving valid token ownership to the Lit threshold network — entirely on-chain verification. AMSETS personnel have no ability to decrypt any user content.
+1. **On-chain token check**: The backend verifies that the requesting wallet holds a valid SPL Token-2022 access token by querying the purchase records and Solana token accounts.
+2. **Livepeer JWT**: Upon successful verification, the backend signs an ES256 JSON Web Token using the Livepeer Studio signing key. This JWT is passed to the Livepeer Player, which forwards it to the Livepeer CDN. The CDN refuses playback without a valid JWT.
 
-### 3.4 Content Storage — Arweave
+Lit Protocol remains in the stack for future advanced key management (e.g., decentralized JWT signing conditions tied to on-chain SPL token balance). The current implementation uses backend-signed JWTs for reliability and speed.
 
-Encrypted content is stored permanently on Arweave via the Irys network. Each upload produces an immutable transaction ID (`ar://...`) that is written into the on-chain `ContentRecord`. The stored bundle contains:
+### 3.4 Content Storage — Livepeer Studio
 
-- File metadata (title, MIME type, SHA-256 fingerprint)
-- The AES-256-GCM encrypted content payload
-- The Lit Protocol encrypted symmetric key and access conditions
-- A reference to the SPL Token-2022 mint governing access
+Video content is uploaded to **Livepeer Studio** — a decentralized video streaming network backed by distributed transcoding nodes. Each upload:
 
-Because Arweave storage is permanent and content is encrypted end-to-end, no party — including AMSETS — can delete or decrypt the stored content. The Arweave transaction ID on-chain is the canonical pointer to the content; it cannot be altered after registration.
+- Is processed via TUS resumable upload directly from the browser to Livepeer's CDN
+- Receives a unique `playbackId` that is written into the on-chain `ContentRecord` as `livepeer://{playbackId}`
+- Is transcoded automatically into adaptive bitrate streams (HLS) by the Livepeer network
+- Is protected by JWT-based access control — only verified token holders can play the video
+
+The `playbackId` on-chain is the canonical pointer to the content. Livepeer's open network of transcoding nodes ensures no single point of failure in video delivery.
+
+**Content fingerprinting**: The SHA-256 hash of the original file is still computed client-side and stored on-chain in the `ContentRecord`, providing tamper-proof proof of existence at registration time.
 
 ### 3.5 Marketplace Indexing — Helius
 
@@ -155,11 +160,11 @@ Full-stack engineer with deep experience in distributed systems, cryptography, a
 ### Phase 1 — MVP (Current)
 - On-chain content registration (Solana Devnet → Mainnet)
 - SPL Token-2022 access tokens with TransferFee royalties
-- AES-256-GCM encryption + Lit Protocol key management
-- Arweave permanent storage via Irys
+- Livepeer Studio video upload and JWT-gated playback
+- Lit Protocol access conditions for decentralized key management
 - Web3Auth email/phone + Phantom/Solflare wallet support
 - Marketplace with Helius indexing
-- Token resale listings
+- Token resale listings on the secondary market
 
 ### Phase 2 — Q3 2026
 - Mobile app (React Native)
@@ -187,9 +192,9 @@ Full-stack engineer with deep experience in distributed systems, cryptography, a
 ## 7. Security
 
 - **Smart contract**: All on-chain instructions are permissioned by cryptographic signatures. Ownership transfers and fund movements require valid signer authorization. The program is open-source and pending a third-party security audit before mainnet launch.
-- **Client-side encryption**: Files are encrypted in the user's browser before any network transmission. Symmetric keys are never transmitted in plaintext. AMSETS servers cannot access content.
-- **Decentralized key management**: Lit Protocol uses threshold cryptography across a geographically distributed node network. No single node can reconstruct a symmetric key. Access conditions are enforced by verifying on-chain token ownership.
-- **Immutable storage**: Once content is written to Arweave, it cannot be modified or deleted by any party, including AMSETS.
+- **Access control**: Video playback requires a backend-signed JWT tied to on-chain token ownership. Without a valid JWT, Livepeer CDN refuses delivery. JWTs expire after 1 hour and must be re-requested.
+- **Decentralized key management**: Lit Protocol is integrated in the stack for future threshold-cryptography access conditions. Access conditions will be enforced by verifying on-chain token ownership across a distributed node network.
+- **Content fingerprinting**: SHA-256 hash of every uploaded file is computed client-side and stored immutably on Solana, providing tamper-proof proof of existence at the time of registration.
 - **No custodial control**: The AMSETS backend holds no private keys, no decryption keys, and cannot alter ownership records. Only the content owner, acting with their private key, can modify on-chain state.
 - **Responsible disclosure**: Security vulnerabilities can be reported to security@amsets.xyz. A bug bounty program will be announced alongside the mainnet launch.
 

@@ -11,6 +11,7 @@ import { purchasesRouter } from "./routes/purchases.route";
 import { webhookRouter } from "./routes/webhook.route";
 import { adminRouter } from "./routes/admin.route";
 import { listingsRouter } from "./routes/listings.route";
+import { livepeerRouter } from "./routes/livepeer.route";
 import { connectRedis } from "./db/redis";
 
 const app = new Hono();
@@ -31,6 +32,7 @@ app.route("/api/v1/purchases", purchasesRouter);
 app.route("/api/v1/webhook", webhookRouter);
 app.route("/api/v1/admin", adminRouter);
 app.route("/api/v1/listings", listingsRouter);
+app.route("/api/v1/livepeer", livepeerRouter);
 
 // ─── 404 fallback ─────────────────────────────────────────────────────────────
 app.notFound((c) => c.json({ error: "Not found" }, 404));
