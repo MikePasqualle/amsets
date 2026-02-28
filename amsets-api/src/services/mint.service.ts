@@ -73,42 +73,43 @@ export async function createMintWithMetadata(
   metadata: MintMetadata,
   connection: Connection
 ): Promise<string> {
-  const auth    = getMintAuthorityKeypair();
-  const mintKp  = Keypair.generate();
+  const auth   = getMintAuthorityKeypair();
+  const mintKp = Keypair.generate();
 
+  // Extension order for Token-2022:
+  // MetadataPointer MUST come first in getMintLen AND in initialization.
+  // PermanentDelegate and TransferFeeConfig follow.
+  // InitializeMint comes LAST (after all extensions).
   const extensions = [
-    ExtensionType.TransferFeeConfig,
-    ExtensionType.PermanentDelegate,
     ExtensionType.MetadataPointer,
+    ExtensionType.PermanentDelegate,
+    ExtensionType.TransferFeeConfig,
   ];
-  const mintLen = getMintLen(extensions);
-
-  // Token-2022 on-chain metadata adds variable space after the base mint.
-  // We estimate it generously to avoid rent issues.
-  const metaBytes  = Buffer.from(JSON.stringify({ name: metadata.name, symbol: metadata.symbol, uri: metadata.uri })).length;
-  const totalSpace = mintLen + 4 + metaBytes + 256; // extra padding
-
-  const lamports = await connection.getMinimumBalanceForRentExemption(totalSpace);
+  // Allocate EXACTLY mintLen — no extra bytes.
+  // tokenMetadataInitialize reallocs the account when it adds metadata TLV data.
+  const mintLen  = getMintLen(extensions);
+  const lamports = await connection.getMinimumBalanceForRentExemption(mintLen);
 
   const tx = new Transaction();
 
-  // 1. Create account with total space
+  // 1. Create account with exactly mintLen bytes
   tx.add(
     SystemProgram.createAccount({
       fromPubkey:       auth.publicKey,
       newAccountPubkey: mintKp.publicKey,
-      space:            totalSpace,
+      space:            mintLen,
       lamports,
       programId:        TOKEN_2022_PROGRAM_ID,
     })
   );
 
-  // 2. Initialize extensions BEFORE mint (order matters for Token-2022)
+  // 2. Initialize extensions BEFORE InitializeMint (Token-2022 requirement)
+  // MetadataPointer must point to the mint itself (on-chain metadata pattern)
   tx.add(
     createInitializeMetadataPointerInstruction(
       mintKp.publicKey,
-      auth.publicKey,    // update authority
-      mintKp.publicKey,  // metadata address = mint itself (on-chain metadata)
+      auth.publicKey,   // update authority
+      mintKp.publicKey, // metadata stored in the mint account itself
       TOKEN_2022_PROGRAM_ID
     )
   );
@@ -116,7 +117,7 @@ export async function createMintWithMetadata(
   tx.add(
     createInitializePermanentDelegateInstruction(
       mintKp.publicKey,
-      auth.publicKey,    // backend is permanent delegate → can burn/transfer anytime
+      auth.publicKey,   // backend can burn/transfer anytime without seller signature
       TOKEN_2022_PROGRAM_ID
     )
   );
@@ -124,29 +125,29 @@ export async function createMintWithMetadata(
   tx.add(
     createInitializeTransferFeeConfigInstruction(
       mintKp.publicKey,
-      auth.publicKey,    // fee config authority
-      auth.publicKey,    // withdraw withheld authority
+      auth.publicKey,   // fee config authority
+      auth.publicKey,   // withdraw withheld authority
       royaltyBps,
-      BigInt("18446744073709551615"),
+      BigInt("18446744073709551615"), // u64::MAX — no per-transfer cap
       TOKEN_2022_PROGRAM_ID
     )
   );
 
-  // 3. Initialize mint itself
+  // 3. Initialize mint last (Token-2022 validates extension layout at this point)
   tx.add(
     createInitializeMintInstruction(
       mintKp.publicKey,
-      0,               // 0 decimals — whole tokens only
-      auth.publicKey,  // mint authority = backend
-      null,            // freeze authority = none
+      0,              // 0 decimals — whole-token access passes
+      auth.publicKey, // mint authority = backend keypair
+      null,           // no freeze authority
       TOKEN_2022_PROGRAM_ID
     )
   );
 
   const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
-  tx.recentBlockhash    = blockhash;
+  tx.recentBlockhash      = blockhash;
   tx.lastValidBlockHeight = lastValidBlockHeight;
-  tx.feePayer           = auth.publicKey;
+  tx.feePayer             = auth.publicKey;
 
   await sendAndConfirmTransaction(connection, tx, [auth, mintKp], { commitment: "confirmed" });
 
@@ -191,7 +192,8 @@ export async function createMintForExistingContent(
   // Fallback — no metadata (for old code paths)
   const auth   = getMintAuthorityKeypair();
   const mintKp = Keypair.generate();
-  const extensions = [ExtensionType.TransferFeeConfig, ExtensionType.PermanentDelegate];
+  // PermanentDelegate BEFORE TransferFeeConfig, InitializeMint LAST
+  const extensions = [ExtensionType.PermanentDelegate, ExtensionType.TransferFeeConfig];
   const mintLen    = getMintLen(extensions);
   const lamports   = await connection.getMinimumBalanceForRentExemption(mintLen);
 

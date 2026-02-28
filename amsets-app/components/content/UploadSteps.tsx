@@ -525,24 +525,26 @@ export function UploadSteps() {
           setPublishSteps([...steps]);
 
           // Notify backend → update status to "active" + store PDA + mint address.
-          // Always read token fresh — it may have refreshed during the long upload.
+          // Wrapped in its own try/catch so a network hiccup here does NOT corrupt
+          // the step-4 status (which already shows "done" at this point).
           const freshToken = localStorage.getItem("amsets_token") ?? token;
-          const patchRes = await fetch(`${API_URL}/api/v1/content/${registeredContentId}/publish`, {
-            method: "PATCH",
-            headers: { "Content-Type": "application/json", Authorization: `Bearer ${freshToken}` },
-            body: JSON.stringify({
-              tx_signature: signature,
-              on_chain_pda: pdaAddress,
-              ...(mintAddress ? { mint_address: mintAddress } : {}),
-            }),
-          });
-          if (!patchRes.ok) {
-            console.error("[publish] backend PATCH failed:", patchRes.status, await patchRes.text().catch(() => ""));
-            steps[3] = {
-              ...steps[3],
-              status: "error",
-              detail: `Content IS on Solana (tx: ${signature.slice(0,8)}…) but backend update failed (${patchRes.status}). Go to My Works and click "Publish On-Chain" to retry.`,
-            };
+          try {
+            const patchRes = await fetch(`${API_URL}/api/v1/content/${registeredContentId}/publish`, {
+              method: "PATCH",
+              headers: { "Content-Type": "application/json", Authorization: `Bearer ${freshToken}` },
+              body: JSON.stringify({
+                tx_signature: signature,
+                on_chain_pda: pdaAddress,
+                ...(mintAddress ? { mint_address: mintAddress } : {}),
+              }),
+            });
+            if (!patchRes.ok) {
+              console.error("[publish] backend PATCH failed:", patchRes.status, await patchRes.text().catch(() => ""));
+              // Non-fatal: blockchain is the source of truth; backend auto-sync will pick it up
+            }
+          } catch (patchErr: any) {
+            // Network error on PATCH — non-fatal, blockchain record exists, auto-sync will fix DB
+            console.warn("[publish] PATCH network error (non-fatal):", patchErr?.message);
           }
         } catch (onChainErr: any) {
           const raw: string = onChainErr?.message ?? "";
