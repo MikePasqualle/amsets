@@ -168,21 +168,10 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
       // Step 1: check SPL token balance (primary proof, enables resale revocation)
       if (content.mintAddress) {
         const bal = await checkTokenBalance(connection, content.mintAddress, publicKey).catch(() => 0);
-        if (bal > 0) {
-          // Step 1b: if the user has a token BUT sold their listing, revoke access.
-          // This handles legacy mints where we couldn't burn the seller's token on-chain.
-          try {
-            const soldRes = await fetch(
-              `${API_URL}/api/v1/listings/check-sold/${content.contentId}?wallet=${publicKey.toBase58()}`
-            );
-            if (soldRes.ok) {
-              const { sold } = await soldRes.json();
-              if (sold) return; // sold their listing → no access even if token still in wallet
-            }
-          } catch { /* non-fatal — if check fails, grant access */ }
-          setPurchased(true);
-          return;
-        }
+        // Token balance is the source of truth: if you hold a token, you have access.
+        // With the approve-based listing flow, the token is transferred on sale so the
+        // seller's balance drops to 0 automatically — no extra DB check needed.
+        if (bal > 0) { setPurchased(true); return; }
       }
 
       // Step 2: fallback to AccessReceipt PDA (covers buyers before token was minted,
