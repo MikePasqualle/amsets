@@ -44,7 +44,13 @@ export async function uploadToArweave(
   const { WebUploader } = await import("@irys/web-upload");
   const { WebSolana }   = await import("@irys/web-upload-solana");
 
-  const irys = await WebUploader(WebSolana).withProvider(wallet);
+  // Use the configured Solana RPC (Helius devnet) so Irys doesn't fall back to
+  // mainnet-beta (its default) which returns 403 for devnet blockhash requests.
+  const rpcUrl  = process.env.NEXT_PUBLIC_SOLANA_RPC_URL ?? "https://api.devnet.solana.com";
+  const isDevnet = (process.env.NEXT_PUBLIC_IRYS_NETWORK ?? "devnet") === "devnet";
+
+  const irysBuilder = WebUploader(WebSolana).withProvider(wallet).withRpc(rpcUrl);
+  const irys = await (isDevnet ? irysBuilder.devnet() : irysBuilder);
 
   const uint8 = new Uint8Array(encryptedBuffer);
 
@@ -125,7 +131,13 @@ export async function uploadBundleToArweave(
   const { WebUploader } = await import("@irys/web-upload");
   const { WebSolana }   = await import("@irys/web-upload-solana");
 
-  const irys = await WebUploader(WebSolana).withProvider(wallet);
+  // IMPORTANT: always pass .withRpc() so Irys uses our configured Solana RPC
+  // instead of defaulting to mainnet-beta (which returns 403 on devnet requests).
+  const rpcUrl   = process.env.NEXT_PUBLIC_SOLANA_RPC_URL ?? "https://api.devnet.solana.com";
+  const isDevnet = (process.env.NEXT_PUBLIC_IRYS_NETWORK ?? "devnet") === "devnet";
+
+  const irysBuilder = WebUploader(WebSolana).withProvider(wallet).withRpc(rpcUrl);
+  const irys = await (isDevnet ? irysBuilder.devnet() : irysBuilder);
 
   report("Serialising bundle…");
   const json   = JSON.stringify(bundle);
