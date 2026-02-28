@@ -143,9 +143,14 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
   const previewUrl = resolveIPFS(content.previewUri);
   const priceSOL   = (Number(content.basePrice) / 1_000_000_000).toFixed(3);
 
+  // All addresses for this user (Web3Auth + Phantom both checked)
+  const myAddresses = [walletAddress, publicKey?.toBase58()]
+    .filter(Boolean)
+    .map((a) => a!.toLowerCase());
+
   // Determine access rights
-  const isAuthor  = !!(walletAddress && content.authorWallet &&
-    walletAddress.toLowerCase() === content.authorWallet.toLowerCase());
+  const isAuthor  = !!(content.authorWallet &&
+    myAddresses.includes(content.authorWallet.toLowerCase()));
   const hasAccess = isAuthor || purchased;
 
   // ─── Check on-chain access on mount ──────────────────────────────────────
@@ -278,7 +283,7 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
       if (res.status === 409) {
         await fetchListings(); // refresh to find the existing listing ID
         const myListing = activeListings.find(
-          (l) => l.sellerWallet.toLowerCase() === publicKey.toBase58().toLowerCase()
+          (l) => myAddresses.includes(l.sellerWallet.toLowerCase())
         );
         if (myListing) {
           await fetch(`${API_URL}/api/v1/listings/${myListing.id}`, {
@@ -886,7 +891,7 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
                 </div>
               )}
               {activeListings.map((listing) => {
-                const isOwnListing  = walletAddress?.toLowerCase() === listing.sellerWallet.toLowerCase();
+                const isOwnListing  = myAddresses.includes(listing.sellerWallet.toLowerCase());
                 const priceSOLNum   = Number(listing.price_lamports) / LAMPORTS_PER_SOL;
                 const priceDisplay  = priceSOLNum.toFixed(3);
                 const royaltyBpNum  = content.royaltyBps ?? 0;
