@@ -260,8 +260,15 @@ export function UploadSteps() {
             setPublishSteps([...steps]);
           };
 
-          // Pass full walletContext — @irys/web-upload-solana expects WalletContextState
-          const arResult = await uploadBundleToArweave(bundle, solanaWallet, onArweaveProgress);
+          // Pass full walletContext + connection + publicKey so storage.ts can
+          // run a pre-flight SOL balance check BEFORE attempting Irys funding.
+          const arResult = await uploadBundleToArweave(
+            bundle,
+            solanaWallet,
+            onArweaveProgress,
+            connection,   // from useConnection() — used to check Phantom SOL balance
+            publicKey     // from useWallet() — wallet address for balance lookup
+          );
           storageUri = arResult.uri;
 
           steps[0] = {

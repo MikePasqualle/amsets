@@ -78,63 +78,109 @@ export async function uploadToArweave(
   };
 }
 
+const FAUCET_MSG = "Get free devnet SOL at https://faucet.solana.com";
+
 /**
  * Upload an AmsetsBundle JSON document to Arweave via Irys (browser-safe SDK).
- * This is the Phase 1 preferred upload method — stores all content metadata,
- * encrypted payload, and Lit key bundle in a single permanent document.
  *
- * @param bundle      - Complete AmsetsBundle object to upload
- * @param wallet      - Full useWallet() result from @solana/wallet-adapter-react
- * @param onProgress  - Optional callback for intermediate status messages shown in the UI
+ * @param bundle          - Complete AmsetsBundle object to upload
+ * @param wallet          - Full useWallet() result from @solana/wallet-adapter-react
+ * @param onProgress      - Optional callback for live status messages in the UI
+ * @param solanaConnection - Optional Connection used to pre-check Phantom wallet SOL balance
+ * @param walletPublicKey  - Optional PublicKey for the SOL pre-flight check
  */
 export async function uploadBundleToArweave(
   bundle: AmsetsBundle,
   wallet: any,
-  onProgress?: (msg: string) => void
+  onProgress?: (msg: string) => void,
+  solanaConnection?: any,
+  walletPublicKey?: any
 ): Promise<ArweaveUploadResult> {
   const report = (msg: string) => onProgress?.(msg);
 
-  // Dynamic import — avoids SSR issues and keeps bundle lean
+  // ── Pre-flight: check Phantom wallet SOL balance ──────────────────────────
+  // This catches the "402 Not enough balance" error BEFORE it happens,
+  // and shows a clear user-facing message with a faucet link.
+  if (solanaConnection && walletPublicKey) {
+    try {
+      report("Checking wallet SOL balance…");
+      const lamports = await solanaConnection.getBalance(walletPublicKey);
+      const sol = lamports / 1_000_000_000;
+      const MIN_SOL = 0.005; // 0.005 SOL covers funding + tx fees comfortably
+      if (sol < MIN_SOL) {
+        throw new Error(
+          `Your Phantom wallet only has ${sol.toFixed(6)} SOL — not enough to fund Irys. ` +
+          `You need at least ${MIN_SOL} SOL. ${FAUCET_MSG}`
+        );
+      }
+      report(`Wallet balance: ${sol.toFixed(4)} SOL ✓`);
+    } catch (err: any) {
+      // Re-throw our own balance error; ignore RPC errors (non-fatal)
+      if (err.message?.includes("faucet") || err.message?.includes("SOL")) throw err;
+    }
+  }
+
+  // ── Connect to Irys ───────────────────────────────────────────────────────
   report("Connecting to Irys node…");
   const { WebUploader } = await import("@irys/web-upload");
   const { WebSolana }   = await import("@irys/web-upload-solana");
 
-  // Pass the full useWallet() object — Irys uses publicKey + signTransaction internally
   const irys = await WebUploader(WebSolana).withProvider(wallet);
 
   report("Serialising bundle…");
-  const json  = JSON.stringify(bundle);
-  const uint8 = new TextEncoder().encode(json);
+  const json   = JSON.stringify(bundle);
+  const uint8  = new TextEncoder().encode(json);
   const sizeMb = (uint8.byteLength / 1_048_576).toFixed(2);
 
-  // Check balance and fund if needed.
-  // On Solana devnet, a finalized tx takes 30-60 s — wait before uploading.
-  // On mainnet Irys uses lazy funding so this step is usually a no-op.
+  // ── Balance check + fund ──────────────────────────────────────────────────
+  // Errors here are FATAL — we surface them to the user instead of swallowing.
+  report(`Checking Irys node balance (bundle: ${sizeMb} MB)…`);
+  let needsFunding = false;
   try {
-    report(`Checking Irys node balance (bundle: ${sizeMb} MB)…`);
     const price   = await irys.getPrice(uint8.byteLength);
     const balance = await irys.getLoadedBalance();
-    if (balance.lt(price)) {
-      const fundAmount = price.multipliedBy(1.2).integerValue();
-      report("Funding Irys node — sending SOL transaction…");
-      await irys.fund(fundAmount);
+    needsFunding  = balance.lt(price);
 
-      // Devnet needs ~45 s for the funding tx to reach "finalized".
+    if (needsFunding) {
+      const fundAmount = price.multipliedBy(1.3).integerValue(); // 30% buffer
+      const fundSol    = Number(fundAmount.toString()) / 1_000_000_000;
+      report(`Funding Irys node with ${fundSol.toFixed(6)} SOL — confirm in Phantom…`);
+
+      try {
+        await irys.fund(fundAmount);
+      } catch (fundErr: any) {
+        const raw = fundErr?.message ?? String(fundErr);
+        throw new Error(
+          `Irys funding failed: ${raw.slice(0, 120)}. ` +
+          `Make sure your Phantom wallet has SOL. ${FAUCET_MSG}`
+        );
+      }
+
+      // Devnet: wait for the funding tx to reach "finalized" status (~45 s).
       // Show a countdown so the user knows the UI is not frozen.
       const WAIT_SECS = 50;
-      for (let remaining = WAIT_SECS; remaining > 0; remaining -= 5) {
-        report(`Waiting for funding confirmation… ${remaining}s`);
-        await new Promise((resolve) => setTimeout(resolve, 5_000));
+      for (let t = WAIT_SECS; t > 0; t -= 5) {
+        report(`Waiting for Irys funding confirmation… ${t}s`);
+        await new Promise((r) => setTimeout(r, 5_000));
       }
-      report("Funding confirmed — starting upload…");
+      report("Irys funding confirmed ✓");
     } else {
-      report(`Balance sufficient — uploading ${sizeMb} MB bundle…`);
+      report(`Irys balance sufficient ✓ — uploading ${sizeMb} MB…`);
     }
-  } catch {
-    // Balance check is non-fatal — let upload attempt and surface any real error
-    report(`Uploading ${sizeMb} MB bundle (balance check skipped)…`);
+  } catch (err: any) {
+    // Only rethrow errors we intentionally created above
+    if (
+      err.message?.includes("funding failed") ||
+      err.message?.includes("faucet") ||
+      err.message?.includes("SOL")
+    ) {
+      throw err;
+    }
+    // Irys price/balance API error — non-fatal, attempt upload anyway
+    report(`Balance check skipped (${(err?.message ?? "").slice(0, 60)}) — attempting upload…`);
   }
 
+  // ── Upload ────────────────────────────────────────────────────────────────
   const tags = [
     { name: "Content-Type",      value: "application/json" },
     { name: "AMSETS-Bundle",     value: "1.0" },
@@ -145,7 +191,7 @@ export async function uploadBundleToArweave(
     { name: "AMSETS-Access",     value: bundle.access.access_mint },
   ];
 
-  report("Uploading to Arweave…");
+  report(`Uploading ${sizeMb} MB to Arweave…`);
   const receipt = await irys.upload(Buffer.from(uint8), { tags });
 
   return {
