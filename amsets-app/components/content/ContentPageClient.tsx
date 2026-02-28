@@ -18,10 +18,21 @@ import {
   ensureFeeVaultFunded,
   checkTokenBalance,
   deriveFeeVaultPda,
+  deriveContentRecordPda,
+  uuidToBytes32,
 } from "@/lib/anchor";
 
 /** Platform fee on all sales (primary + secondary): 2.5% = 250 bps */
 const PLATFORM_FEE_BPS = 250n;
+
+/** Format SOL amounts with appropriate decimal places (avoids "0.0000") */
+function fmtSOL(amount: number): string {
+  if (amount === 0) return "0";
+  if (amount < 0.000001) return "< 0.000001";
+  if (amount < 0.001) return amount.toFixed(6);
+  if (amount < 0.01)  return amount.toFixed(5);
+  return amount.toFixed(4);
+}
 import {
   PublicKey,
   Transaction,
@@ -31,6 +42,7 @@ import {
 import {
   TOKEN_2022_PROGRAM_ID,
   getAssociatedTokenAddressSync,
+  createApproveInstruction,
 } from "@solana/spl-token";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3001";
@@ -148,25 +160,44 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
     if (!publicKey) return;
 
     const checkAccess = async () => {
+      // Step 1: check SPL token balance (primary proof, enables resale revocation)
       if (content.mintAddress) {
-        // Content has a mint → SPL token balance is the ONLY valid proof
-        // (This includes author token minted by backend at publish time)
         const bal = await checkTokenBalance(connection, content.mintAddress, publicKey).catch(() => 0);
-        if (bal > 0) { setPurchased(true); return; }
-        // No token found — do NOT fall back to PDA (would allow ex-sellers to retain access)
-      } else {
-        // No mint configured → use AccessReceipt PDA as fallback proof
-        if (content.onChainPda && content.onChainPda !== "pending") {
-          const has = await checkHasPurchased(
-            connection, new PublicKey(content.onChainPda), publicKey
-          ).catch(() => false);
-          if (has) setPurchased(true);
+        if (bal > 0) {
+          // Step 1b: if the user has a token BUT sold their listing, revoke access.
+          // This handles legacy mints where we couldn't burn the seller's token on-chain.
+          try {
+            const soldRes = await fetch(
+              `${API_URL}/api/v1/listings/check-sold/${content.contentId}?wallet=${publicKey.toBase58()}`
+            );
+            if (soldRes.ok) {
+              const { sold } = await soldRes.json();
+              if (sold) return; // sold their listing → no access even if token still in wallet
+            }
+          } catch { /* non-fatal — if check fails, grant access */ }
+          setPurchased(true);
+          return;
         }
       }
+
+      // Step 2: fallback to AccessReceipt PDA (covers buyers before token was minted,
+      // or when mint authority had no SOL to execute the mint)
+      try {
+        let pdaPubkey: PublicKey;
+        if (content.onChainPda && content.onChainPda !== "pending") {
+          pdaPubkey = new PublicKey(content.onChainPda);
+        } else {
+          const authorPubkey   = new PublicKey(content.authorWallet);
+          const contentIdBytes = uuidToBytes32(content.contentId);
+          pdaPubkey            = deriveContentRecordPda(authorPubkey, contentIdBytes);
+        }
+        const has = await checkHasPurchased(connection, pdaPubkey, publicKey).catch(() => false);
+        if (has) setPurchased(true);
+      } catch { /* ignore */ }
     };
 
     checkAccess();
-  }, [publicKey, content.onChainPda, content.mintAddress, connection]);
+  }, [publicKey, content.onChainPda, content.mintAddress, content.authorWallet, content.contentId, connection]);
 
   // ─── Fetch active listings ────────────────────────────────────────────────
   const fetchListings = useCallback(async () => {
@@ -183,35 +214,86 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
 
   // ─── Create sell listing ──────────────────────────────────────────────────
   const handleCreateListing = useCallback(async () => {
-    if (!publicKey || !token) return;
+    if (!publicKey || !token || !sendTransaction) return;
     setIsListing(true);
     setListingError(null);
     try {
       const priceLamports = Math.round(parseFloat(sellPriceSOL) * LAMPORTS_PER_SOL);
       if (isNaN(priceLamports) || priceLamports <= 0) throw new Error("Invalid price");
 
-      // ATA is optional — only computed when the SPL mint exists
       let tokenAccount: string | undefined;
+
+      // Grant backend delegate permission to transfer exactly 1 token on sale.
+      // This allows a true seller→buyer transfer without the seller being online at purchase time.
       if (content.mintAddress) {
-        const sellerAta = getAssociatedTokenAddressSync(
-          new PublicKey(content.mintAddress),
+        const mintPubkey = new PublicKey(content.mintAddress);
+        const sellerAta  = getAssociatedTokenAddressSync(
+          mintPubkey,
           publicKey,
           false,
           TOKEN_2022_PROGRAM_ID
         );
         tokenAccount = sellerAta.toBase58();
+
+        const backendAuthority = process.env.NEXT_PUBLIC_MINT_AUTHORITY_PUBKEY;
+        if (backendAuthority) {
+          try {
+            const approveTx = new Transaction().add(
+              createApproveInstruction(
+                sellerAta,
+                new PublicKey(backendAuthority),
+                publicKey,
+                1n,
+                [],
+                TOKEN_2022_PROGRAM_ID
+              )
+            );
+            const { blockhash } = await connection.getLatestBlockhash("confirmed");
+            approveTx.recentBlockhash = blockhash;
+            approveTx.feePayer = publicKey;
+            const approveSig = await sendTransaction(approveTx, connection);
+            await connection.confirmTransaction(approveSig, "confirmed");
+            console.log("[listing] Approved backend as delegate for token transfer");
+          } catch (approveErr: any) {
+            // Non-fatal — listing will still be created, but transfer may be less clean
+            console.warn("[listing] Approve tx failed:", approveErr?.message);
+          }
+        }
       }
 
-      const res = await fetch(`${API_URL}/api/v1/listings`, {
+      const payload = {
+        content_id:     content.contentId,
+        price_lamports: priceLamports,
+        mint_address:   content.mintAddress ?? undefined,
+        token_account:  tokenAccount,
+      };
+
+      let res = await fetch(`${API_URL}/api/v1/listings`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-        body: JSON.stringify({
-          content_id:     content.contentId,
-          price_lamports: priceLamports,
-          mint_address:   content.mintAddress,  // may be absent
-          token_account:  tokenAccount,
-        }),
+        body: JSON.stringify(payload),
       });
+
+      // If duplicate active listing exists (409), cancel it then retry once
+      if (res.status === 409) {
+        await fetchListings(); // refresh to find the existing listing ID
+        const myListing = activeListings.find(
+          (l) => l.sellerWallet.toLowerCase() === publicKey.toBase58().toLowerCase()
+        );
+        if (myListing) {
+          await fetch(`${API_URL}/api/v1/listings/${myListing.id}`, {
+            method: "DELETE",
+            headers: { Authorization: `Bearer ${token}` },
+          });
+        }
+        // Retry creation
+        res = await fetch(`${API_URL}/api/v1/listings`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+          body: JSON.stringify(payload),
+        });
+      }
+
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
         throw new Error((err as any).error ?? `HTTP ${res.status}`);
@@ -223,7 +305,7 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
     } finally {
       setIsListing(false);
     }
-  }, [publicKey, token, content, sellPriceSOL, fetchListings]);
+  }, [publicKey, token, content, sellPriceSOL, fetchListings, activeListings]);
 
   // ─── Buy from resale listing ──────────────────────────────────────────────
   const handleBuyResale = useCallback(async (listing: ActiveListing) => {
@@ -293,27 +375,28 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
       const signature = await sendTransaction(tx, connection);
       await connection.confirmTransaction(signature, "confirmed");
 
-      // Record access in DB (for Library + access gate)
-      await fetch(`${API_URL}/api/v1/purchases`, {
+      // Backend executes the token transfer seller→buyer (PermanentDelegate or legacy mint)
+      // and records the purchase + marks listing sold atomically.
+      const fulfillRes = await fetch(`${API_URL}/api/v1/listings/${listing.id}/fulfill`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
         body: JSON.stringify({
-          content_id:     content.contentId,
-          tx_signature:   signature,
-          price_lamports: listing.price_lamports,
+          buyer_wallet:  publicKey.toBase58(),
+          tx_signature:  signature,
+          amount_paid:   listing.price_lamports,
         }),
-      }).catch(() => null);
+      });
 
-      // Mark listing as sold in backend
-      await fetch(`${API_URL}/api/v1/listings/${listing.id}/sold`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ tx_signature: signature }),
-      }).catch(() => null);
+      if (!fulfillRes.ok) {
+        const errData = await fulfillRes.json().catch(() => ({}));
+        throw new Error((errData as any).error ?? `Fulfill failed (${fulfillRes.status})`);
+      }
 
       setPurchased(true);
       setShowConfetti(true);
       await fetchListings();
+      // Refresh access check after token transfer
+      setTimeout(() => window.location.reload(), 2000);
     } catch (err: any) {
       // Normalise the error to a human-readable string regardless of the
       // shape thrown by the Wallet Adapter / web3.js / anchor.
@@ -379,11 +462,8 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
       return;
     }
 
-    if (!content.onChainPda || content.onChainPda === "pending") {
-      setPurchaseError(
-        "This content has not been published on-chain yet. " +
-        "The author needs to complete the deployment first."
-      );
+    if (content.status === "draft") {
+      setPurchaseError("This content is a draft and not yet available for purchase.");
       return;
     }
 
@@ -391,7 +471,15 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
     setPurchaseError(null);
 
     try {
-      const contentRecordPda = new PublicKey(content.onChainPda);
+      // Use stored PDA if available, otherwise derive it from content ID + author
+      let contentRecordPda: PublicKey;
+      if (content.onChainPda && content.onChainPda !== "pending") {
+        contentRecordPda = new PublicKey(content.onChainPda);
+      } else {
+        const authorPubkey   = new PublicKey(content.authorWallet);
+        const contentIdBytes = uuidToBytes32(content.contentId);
+        contentRecordPda     = deriveContentRecordPda(authorPubkey, contentIdBytes);
+      }
 
       const alreadyPurchased = await checkHasPurchased(connection, contentRecordPda, publicKey);
       if (alreadyPurchased) {
@@ -405,7 +493,7 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
       } catch { /* Non-fatal — vault may already exist */ }
 
       const { signature, receiptPda } = await purchaseAccess(
-        { contentRecordPda: content.onChainPda, authorWallet: content.authorWallet },
+        { contentRecordPda: contentRecordPda.toBase58(), authorWallet: content.authorWallet },
         publicKey,
         sendTransaction,
         connection
@@ -414,6 +502,10 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
       setPurchaseTxSig(signature);
 
       if (token) {
+        // Only send access_mint if it's a real Solana public key (not "pending" or null)
+        const rawMint = content.mintAddress ?? content.accessMint;
+        const validMint = rawMint && rawMint !== "pending" && rawMint.length >= 32 ? rawMint : undefined;
+
         await fetch(`${API_URL}/api/v1/purchases`, {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
@@ -423,13 +515,15 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
             receipt_pda:   receiptPda,
             amount_paid:   content.basePrice,
             payment_token: content.paymentToken,
-            access_mint:   content.mintAddress ?? content.accessMint,
+            ...(validMint ? { access_mint: validMint } : {}),
           }),
         }).catch(() => null);
       }
 
       setPurchased(true);
       setShowConfetti(true);
+      // Reload to show updated available count
+      setTimeout(() => window.location.reload(), 2000);
     } catch (err: any) {
       const msg = err?.message?.includes("0x1")
         ? "Insufficient SOL balance for purchase + fees"
@@ -608,13 +702,13 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
               <div className="flex justify-between">
                 <span className="text-[#7A6E8E]">Author receives</span>
                 <span className="text-[#81D0B5] font-mono">
-                  {((Number(content.basePrice) / 1e9) * (1 - 0.025)).toFixed(4)} SOL (97.5%)
+                  {fmtSOL((Number(content.basePrice) / 1e9) * (1 - 0.025))} SOL (97.5%)
                 </span>
               </div>
               <div className="flex justify-between">
                 <span className="text-[#7A6E8E]">Platform fee</span>
                 <span className="text-[#F7FF88] font-mono">
-                  {((Number(content.basePrice) / 1e9) * 0.025).toFixed(4)} SOL (2.5%)
+                  {fmtSOL((Number(content.basePrice) / 1e9) * 0.025)} SOL (2.5%)
                 </span>
               </div>
             </div>
@@ -642,7 +736,7 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
               </div>
             )}
 
-            {content.onChainPda === "pending" && !isAuthor && (
+            {content.status === "draft" && !isAuthor && (
               <div className="p-3 rounded-lg bg-amber-500/10 border border-amber-500/30">
                 <p className="text-amber-300 text-sm">
                   This content is a draft and not yet available for purchase.
@@ -698,7 +792,7 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
                 isLoading={isPurchasing}
                 onClick={handlePurchase}
                 className="w-full"
-                disabled={content.onChainPda === "pending"}
+                disabled={content.status === "draft"}
               >
                 {!isAuthenticated
                   ? "Connect Wallet to Purchase"
@@ -747,17 +841,17 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
                           <>
                             <div className="flex justify-between">
                               <span className="text-[#7A6E8E]">Platform fee (2.5%)</span>
-                              <span className="text-[#F7FF88] font-mono">− ◎ {platformCut.toFixed(4)}</span>
+                              <span className="text-[#F7FF88] font-mono">− ◎ {fmtSOL(platformCut)}</span>
                             </div>
                             {royBps > 0 && (
                               <div className="flex justify-between">
                                 <span className="text-[#7A6E8E]">Author royalty ({(royBps / 100).toFixed(1)}%)</span>
-                                <span className="text-[#81D0B5] font-mono">− ◎ {royaltyCut.toFixed(4)}</span>
+                                <span className="text-[#81D0B5] font-mono">− ◎ {fmtSOL(royaltyCut)}</span>
                               </div>
                             )}
                             <div className="flex justify-between border-t border-[#3D2F5A] pt-1 mt-1">
                               <span className="text-[#EDE8F5] font-semibold">You get</span>
-                              <span className="text-[#F7FF88] font-mono font-bold">◎ {sellerGets.toFixed(4)}</span>
+                              <span className="text-[#F7FF88] font-mono font-bold">◎ {fmtSOL(sellerGets)}</span>
                             </div>
                           </>
                         );

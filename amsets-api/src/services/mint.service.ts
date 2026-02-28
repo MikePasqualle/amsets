@@ -1,139 +1,381 @@
 /**
- * Mint Service — backend-controlled SPL Token-2022 minting.
+ * Mint Service — SPL Token-2022 with PermanentDelegate + TokenMetadata.
  *
- * The backend holds a dedicated Solana keypair (MINT_AUTHORITY_SECRET) that
- * is set as the mint authority for every AMSETS access token at publication
- * time. This allows the backend to automatically mint exactly 1 access token
- * to a buyer the moment their purchase is confirmed on-chain, without requiring
- * the author to be online.
+ * Every AMSETS access token mint has:
+ *  - TransferFeeConfig : author royalty on every transfer (bps-based)
+ *  - PermanentDelegate : backend keypair can transfer/burn without seller signature
+ *  - MetadataPointer   : on-chain metadata (name, symbol, URI)
+ *  - TokenMetadata     : title, "AMSETS", IPFS preview URI
  *
  * Flow:
- *   1. Author publishes content → SPL mint created with MINT_AUTHORITY_PUBKEY
- *      as authority (not the author's wallet).
- *   2. Buyer calls purchase_access_sol → AccessReceipt PDA created on Solana.
- *   3. Buyer calls POST /api/v1/purchases → this service mints 1 SPL token to
- *      the buyer's ATA using the backend keypair.
- *   4. Access check on the frontend: SPL token balance > 0 → access granted.
+ *  1. Author publishes → createMintWithMetadata → 1 token minted to author.
+ *  2. Buyer purchases primary → mintAccessTokenToUser (backend mints 1 to buyer).
+ *  3. Seller lists → frontend sends approve tx (for old mints without PermanentDelegate).
+ *  4. Buyer purchases secondary → transferTokenFromSeller (PermanentDelegate or delegated transfer).
  */
 
 import {
   Connection,
   Keypair,
   PublicKey,
+  SystemProgram,
   Transaction,
   sendAndConfirmTransaction,
 } from "@solana/web3.js";
 import {
   TOKEN_2022_PROGRAM_ID,
+  ExtensionType,
   createAssociatedTokenAccountIdempotentInstruction,
+  createInitializeMintInstruction,
+  createInitializeTransferFeeConfigInstruction,
+  createInitializePermanentDelegateInstruction,
+  createInitializeMetadataPointerInstruction,
+  createTransferCheckedInstruction,
+  createBurnInstruction,
   createMintToInstruction,
+  getMintLen,
   getAssociatedTokenAddressSync,
   getAccount,
+  getMint,
+  getPermanentDelegate,
+  tokenMetadataInitialize,
 } from "@solana/spl-token";
 import bs58 from "bs58";
 
-/** Returns the backend's mint-authority keypair from env. */
+// ─── Key helpers ──────────────────────────────────────────────────────────────
+
 function getMintAuthorityKeypair(): Keypair {
   const secret = process.env.MINT_AUTHORITY_SECRET;
   if (!secret) throw new Error("MINT_AUTHORITY_SECRET not set in backend .env");
   return Keypair.fromSecretKey(bs58.decode(secret));
 }
 
-/** The backend's public key — exposed so the frontend can set it as mint authority. */
 export function getMintAuthorityPubkey(): string {
   return getMintAuthorityKeypair().publicKey.toBase58();
 }
 
+// ─── Create mint with metadata ────────────────────────────────────────────────
+
+export interface MintMetadata {
+  name:   string; // content title
+  symbol: string; // e.g. "AMSETS"
+  uri:    string; // IPFS/Arweave URL for content preview JSON
+}
+
 /**
- * Mints exactly 1 SPL Token-2022 access token to a buyer's ATA.
- *
- * - Idempotent: if the buyer already holds ≥ 1 token, returns early.
- * - The backend keypair must be the mint authority of `mintAddress`.
- * - Creates the ATA if it does not exist (backend pays rent).
- *
- * @param mintAddress    - Token-2022 mint public key
- * @param recipientWallet - Buyer's Solana wallet address
- * @param connection     - RPC connection (Helius devnet)
- * @returns tx signature string, or "already_minted" if no action was needed.
+ * Creates a fully-featured SPL Token-2022 mint with:
+ *  - TransferFeeConfig (royalties on every secondary transfer)
+ *  - PermanentDelegate (backend can move/burn tokens without seller approval)
+ *  - MetadataPointer + TokenMetadata (name, symbol, URI shown in wallets)
  */
-export async function mintAccessTokenToUser(
-  mintAddress: string,
-  recipientWallet: string,
+export async function createMintWithMetadata(
+  royaltyBps: number,
+  metadata: MintMetadata,
   connection: Connection
 ): Promise<string> {
-  const mintAuthority = getMintAuthorityKeypair();
-  const mint          = new PublicKey(mintAddress);
-  const recipient     = new PublicKey(recipientWallet);
+  const auth    = getMintAuthorityKeypair();
+  const mintKp  = Keypair.generate();
 
-  // Derive the buyer's ATA for this Token-2022 mint
-  const ata = getAssociatedTokenAddressSync(
-    mint,
-    recipient,
-    false,
-    TOKEN_2022_PROGRAM_ID
-  );
+  const extensions = [
+    ExtensionType.TransferFeeConfig,
+    ExtensionType.PermanentDelegate,
+    ExtensionType.MetadataPointer,
+  ];
+  const mintLen = getMintLen(extensions);
 
-  // Check if already minted — avoids duplicate transactions
-  try {
-    const acct = await getAccount(connection, ata, "confirmed", TOKEN_2022_PROGRAM_ID);
-    if (acct.amount >= 1n) {
-      console.log(`[mint] ${recipient.toBase58().slice(0, 8)} already holds token for ${mintAddress.slice(0, 8)}`);
-      return "already_minted";
-    }
-  } catch {
-    // ATA does not exist yet — will be created below
-  }
+  // Token-2022 on-chain metadata adds variable space after the base mint.
+  // We estimate it generously to avoid rent issues.
+  const metaBytes  = Buffer.from(JSON.stringify({ name: metadata.name, symbol: metadata.symbol, uri: metadata.uri })).length;
+  const totalSpace = mintLen + 4 + metaBytes + 256; // extra padding
+
+  const lamports = await connection.getMinimumBalanceForRentExemption(totalSpace);
 
   const tx = new Transaction();
 
-  // Create ATA if it doesn't exist (idempotent instruction)
+  // 1. Create account with total space
   tx.add(
-    createAssociatedTokenAccountIdempotentInstruction(
-      mintAuthority.publicKey, // payer
-      ata,
-      recipient,
-      mint,
+    SystemProgram.createAccount({
+      fromPubkey:       auth.publicKey,
+      newAccountPubkey: mintKp.publicKey,
+      space:            totalSpace,
+      lamports,
+      programId:        TOKEN_2022_PROGRAM_ID,
+    })
+  );
+
+  // 2. Initialize extensions BEFORE mint (order matters for Token-2022)
+  tx.add(
+    createInitializeMetadataPointerInstruction(
+      mintKp.publicKey,
+      auth.publicKey,    // update authority
+      mintKp.publicKey,  // metadata address = mint itself (on-chain metadata)
       TOKEN_2022_PROGRAM_ID
     )
   );
 
-  // Mint exactly 1 access token
   tx.add(
-    createMintToInstruction(
-      mint,
-      ata,
-      mintAuthority.publicKey,
-      1n,
-      [],
+    createInitializePermanentDelegateInstruction(
+      mintKp.publicKey,
+      auth.publicKey,    // backend is permanent delegate → can burn/transfer anytime
+      TOKEN_2022_PROGRAM_ID
+    )
+  );
+
+  tx.add(
+    createInitializeTransferFeeConfigInstruction(
+      mintKp.publicKey,
+      auth.publicKey,    // fee config authority
+      auth.publicKey,    // withdraw withheld authority
+      royaltyBps,
+      BigInt("18446744073709551615"),
+      TOKEN_2022_PROGRAM_ID
+    )
+  );
+
+  // 3. Initialize mint itself
+  tx.add(
+    createInitializeMintInstruction(
+      mintKp.publicKey,
+      0,               // 0 decimals — whole tokens only
+      auth.publicKey,  // mint authority = backend
+      null,            // freeze authority = none
       TOKEN_2022_PROGRAM_ID
     )
   );
 
   const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
-  tx.recentBlockhash = blockhash;
+  tx.recentBlockhash    = blockhash;
   tx.lastValidBlockHeight = lastValidBlockHeight;
-  tx.feePayer = mintAuthority.publicKey;
+  tx.feePayer           = auth.publicKey;
 
-  const sig = await sendAndConfirmTransaction(connection, tx, [mintAuthority], {
-    commitment: "confirmed",
-  });
+  await sendAndConfirmTransaction(connection, tx, [auth, mintKp], { commitment: "confirmed" });
 
-  console.log(`[mint] Minted 1 token → ${recipient.toBase58().slice(0, 8)}… | mint: ${mintAddress.slice(0, 8)}… | sig: ${sig.slice(0, 12)}…`);
-  return sig;
+  // 4. Initialize on-chain token metadata
+  // tokenMetadataInitialize is an async helper that sends its own transaction.
+  try {
+    await tokenMetadataInitialize(
+      connection,
+      auth,                     // payer
+      mintKp.publicKey,         // mint
+      auth.publicKey,           // updateAuthority
+      auth,                     // mintAuthority (Signer)
+      metadata.name.slice(0, 32),
+      metadata.symbol.slice(0, 10),
+      metadata.uri.slice(0, 200),
+      [],                       // multiSigners
+      { commitment: "confirmed" },
+      TOKEN_2022_PROGRAM_ID
+    );
+    console.log(`[mint] Metadata initialized: "${metadata.name}"`);
+  } catch (e: any) {
+    // Metadata init can fail if space is too tight — non-fatal, token still works
+    console.warn(`[mint] Metadata init warning (non-fatal): ${e?.message?.slice(0, 100)}`);
+  }
+
+  console.log(`[mint] Created mint ${mintKp.publicKey.toBase58()} with PermanentDelegate`);
+  return mintKp.publicKey.toBase58();
 }
 
 /**
- * Mints 1 author access token to the content creator's ATA.
- * Called once when new content is published.
- *
- * @param mintAddress   - Token-2022 mint public key
- * @param authorWallet  - Author's Solana wallet address
- * @param connection    - RPC connection
+ * Legacy: creates a mint WITHOUT metadata (for backwards compat / admin use).
+ * New content should use createMintWithMetadata.
  */
+export async function createMintForExistingContent(
+  royaltyBps: number,
+  connection: Connection,
+  metadata?: MintMetadata
+): Promise<string> {
+  if (metadata) {
+    return createMintWithMetadata(royaltyBps, metadata, connection);
+  }
+  // Fallback — no metadata (for old code paths)
+  const auth   = getMintAuthorityKeypair();
+  const mintKp = Keypair.generate();
+  const extensions = [ExtensionType.TransferFeeConfig, ExtensionType.PermanentDelegate];
+  const mintLen    = getMintLen(extensions);
+  const lamports   = await connection.getMinimumBalanceForRentExemption(mintLen);
+
+  const tx = new Transaction();
+  tx.add(
+    SystemProgram.createAccount({
+      fromPubkey: auth.publicKey, newAccountPubkey: mintKp.publicKey,
+      space: mintLen, lamports, programId: TOKEN_2022_PROGRAM_ID,
+    }),
+    createInitializePermanentDelegateInstruction(mintKp.publicKey, auth.publicKey, TOKEN_2022_PROGRAM_ID),
+    createInitializeTransferFeeConfigInstruction(
+      mintKp.publicKey, auth.publicKey, auth.publicKey, royaltyBps,
+      BigInt("18446744073709551615"), TOKEN_2022_PROGRAM_ID
+    ),
+    createInitializeMintInstruction(mintKp.publicKey, 0, auth.publicKey, null, TOKEN_2022_PROGRAM_ID)
+  );
+
+  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
+  tx.recentBlockhash = blockhash; tx.lastValidBlockHeight = lastValidBlockHeight;
+  tx.feePayer = auth.publicKey;
+  await sendAndConfirmTransaction(connection, tx, [auth, mintKp], { commitment: "confirmed" });
+  console.log(`[mint] Created mint (no metadata): ${mintKp.publicKey.toBase58()}`);
+  return mintKp.publicKey.toBase58();
+}
+
+// ─── Mint 1 token to a user ───────────────────────────────────────────────────
+
+export async function mintAccessTokenToUser(
+  mintAddress: string,
+  recipientWallet: string,
+  connection: Connection
+): Promise<string> {
+  const auth      = getMintAuthorityKeypair();
+  const mint      = new PublicKey(mintAddress);
+  const recipient = new PublicKey(recipientWallet);
+  const ata       = getAssociatedTokenAddressSync(mint, recipient, false, TOKEN_2022_PROGRAM_ID);
+
+  try {
+    const acct = await getAccount(connection, ata, "confirmed", TOKEN_2022_PROGRAM_ID);
+    if (acct.amount >= 1n) {
+      console.log(`[mint] ${recipient.toBase58().slice(0, 8)} already holds token`);
+      return "already_minted";
+    }
+  } catch { /* ATA doesn't exist yet */ }
+
+  const tx = new Transaction();
+  tx.add(
+    createAssociatedTokenAccountIdempotentInstruction(auth.publicKey, ata, recipient, mint, TOKEN_2022_PROGRAM_ID),
+    createMintToInstruction(mint, ata, auth.publicKey, 1n, [], TOKEN_2022_PROGRAM_ID)
+  );
+
+  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
+  tx.recentBlockhash = blockhash; tx.lastValidBlockHeight = lastValidBlockHeight;
+  tx.feePayer = auth.publicKey;
+
+  const sig = await sendAndConfirmTransaction(connection, tx, [auth], { commitment: "confirmed" });
+  console.log(`[mint] Minted 1 → ${recipient.toBase58().slice(0, 8)}… sig: ${sig.slice(0, 12)}…`);
+  return sig;
+}
+
 export async function mintAuthorToken(
   mintAddress: string,
   authorWallet: string,
   connection: Connection
 ): Promise<string> {
   return mintAccessTokenToUser(mintAddress, authorWallet, connection);
+}
+
+// ─── Transfer token from seller to buyer (secondary market) ──────────────────
+
+/**
+ * Transfers 1 access token from seller to buyer.
+ *
+ * Strategy:
+ *  1. If mint has PermanentDelegate = backend → use it to transfer directly.
+ *  2. Otherwise → mint a new token to buyer + burn seller's token if possible,
+ *     else just mint to buyer (graceful degradation for legacy mints).
+ *
+ * @returns tx signature of the transfer (or mint) transaction
+ */
+export async function transferTokenFromSeller(
+  mintAddress: string,
+  sellerWallet: string,
+  buyerWallet: string,
+  connection: Connection
+): Promise<string> {
+  const auth   = getMintAuthorityKeypair();
+  const mint   = new PublicKey(mintAddress);
+  const seller = new PublicKey(sellerWallet);
+  const buyer  = new PublicKey(buyerWallet);
+
+  const sellerAta = getAssociatedTokenAddressSync(mint, seller, false, TOKEN_2022_PROGRAM_ID);
+  const buyerAta  = getAssociatedTokenAddressSync(mint, buyer,  false, TOKEN_2022_PROGRAM_ID);
+
+  // Check if this mint has PermanentDelegate = backend
+  let hasPermanentDelegate = false;
+  try {
+    const mintInfo = await getMint(connection, mint, "confirmed", TOKEN_2022_PROGRAM_ID);
+    const pd = getPermanentDelegate(mintInfo);
+    hasPermanentDelegate = pd?.delegate?.toBase58() === auth.publicKey.toBase58();
+  } catch { /* ignore */ }
+
+  if (hasPermanentDelegate) {
+    // ── Strategy 1: PermanentDelegate — transfer seller → buyer directly ──
+    console.log(`[mint] Using PermanentDelegate to transfer ${mintAddress.slice(0, 8)}`);
+
+    const tx = new Transaction();
+    // Ensure buyer's ATA exists
+    tx.add(
+      createAssociatedTokenAccountIdempotentInstruction(
+        auth.publicKey, buyerAta, buyer, mint, TOKEN_2022_PROGRAM_ID
+      )
+    );
+    // Transfer 1 token from seller to buyer (PermanentDelegate bypasses owner auth)
+    tx.add(
+      createTransferCheckedInstruction(
+        sellerAta,
+        mint,
+        buyerAta,
+        auth.publicKey, // delegate authority = backend
+        1n,
+        0,             // decimals
+        [],
+        TOKEN_2022_PROGRAM_ID
+      )
+    );
+
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
+    tx.recentBlockhash = blockhash; tx.lastValidBlockHeight = lastValidBlockHeight;
+    tx.feePayer = auth.publicKey;
+
+    const sig = await sendAndConfirmTransaction(connection, tx, [auth], { commitment: "confirmed" });
+    console.log(`[mint] Transferred token seller→buyer | sig: ${sig.slice(0, 12)}…`);
+    return sig;
+
+  } else {
+    // ── Strategy 2: Delegate-approved transfer (seller approved backend at listing time) ──
+    // Try to move seller's token using the approved delegation first.
+    // If the seller did not approve (old listing), fall back to minting a new token to buyer.
+    console.log(`[mint] No PermanentDelegate — trying delegate-approved transfer`);
+
+    try {
+      const sellerAcct = await getAccount(connection, sellerAta, "confirmed", TOKEN_2022_PROGRAM_ID);
+      const delegateMatch =
+        sellerAcct.delegate?.toBase58() === auth.publicKey.toBase58() &&
+        sellerAcct.delegatedAmount >= 1n;
+
+      if (delegateMatch) {
+        // Seller approved backend as delegate — do real transfer seller → buyer
+        const tx = new Transaction();
+        tx.add(
+          createAssociatedTokenAccountIdempotentInstruction(
+            auth.publicKey, buyerAta, buyer, mint, TOKEN_2022_PROGRAM_ID
+          )
+        );
+        tx.add(
+          createTransferCheckedInstruction(
+            sellerAta,
+            mint,
+            buyerAta,
+            auth.publicKey, // approved delegate
+            1n,
+            0,
+            [],
+            TOKEN_2022_PROGRAM_ID
+          )
+        );
+        const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
+        tx.recentBlockhash = blockhash; tx.lastValidBlockHeight = lastValidBlockHeight;
+        tx.feePayer = auth.publicKey;
+
+        const sig = await sendAndConfirmTransaction(connection, tx, [auth], { commitment: "confirmed" });
+        console.log(`[mint] Delegate transfer seller→buyer | sig: ${sig.slice(0, 12)}…`);
+        return sig;
+      }
+    } catch (err: any) {
+      console.warn(`[mint] Delegate transfer failed (${err?.message?.slice(0, 60)}) — falling back to mint`);
+    }
+
+    // Fallback: legacy listing without approve → mint new token to buyer.
+    // Seller's token stays but access is revoked via DB listing.sold status
+    // and frontend check-sold endpoint.
+    console.log(`[mint] Fallback: minting new token to buyer (seller had no delegate approval)`);
+    const mintSig = await mintAccessTokenToUser(mintAddress, buyerWallet, connection);
+    return mintSig;
+  }
 }
