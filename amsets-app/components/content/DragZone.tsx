@@ -28,7 +28,7 @@ const ALLOWED_TYPES = [
  * Drag-and-drop file upload zone with GSAP state animations.
  * States: idle (dashed border) | dragover (yellow glow) | success (green border)
  */
-export function DragZone({ onFile, maxSizeMB = 4096, allowedMimeTypes, label, subLabel }: DragZoneProps) {
+export function DragZone({ onFile, maxSizeMB = 10240, allowedMimeTypes, label, subLabel }: DragZoneProps) {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [error, setError] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);

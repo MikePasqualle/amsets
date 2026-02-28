@@ -233,24 +233,78 @@ export function UploadSteps() {
         livepeerAssetId = assetId;
 
         // 1b. TUS resumable upload directly to Livepeer CDN
-        const fileSizeMb = (data.file.size / 1_048_576).toFixed(2);
-        steps[0] = { ...steps[0], detail: `Uploading video (${fileSizeMb} MB) to Livepeer…` };
+        // Chunk size adapts to file size: larger files use bigger chunks for fewer round-trips.
+        // Max chunk = 50 MB (Livepeer accepts up to 200 MB chunks, 50 MB is a safe, fast sweet spot).
+        const fileSizeBytes = data.file.size;
+        const fileSizeMb    = fileSizeBytes / 1_048_576;
+        const fileSizeGb    = fileSizeMb / 1024;
+        const fileSizeLabel = fileSizeGb >= 1
+          ? `${fileSizeGb.toFixed(2)} GB`
+          : `${fileSizeMb.toFixed(1)} MB`;
+
+        // Adaptive chunk size: 5 MB for files < 500 MB, 20 MB for < 2 GB, 50 MB for larger
+        const chunkSizeMB = fileSizeMb < 500 ? 5 : fileSizeMb < 2048 ? 20 : 50;
+        const chunkSize   = chunkSizeMB * 1024 * 1024;
+
+        steps[0] = {
+          ...steps[0],
+          detail: `Uploading video (${fileSizeLabel}) to Livepeer… 0% · chunk: ${chunkSizeMB} MB`,
+        };
         setPublishSteps([...steps]);
+
+        // Use a ref to avoid stale closure captures in onProgress callbacks
+        const currentSteps = steps;
+        let uploadStartTime = Date.now();
 
         await new Promise<void>((resolve, reject) => {
           const upload = new tus.Upload(data.file!, {
-            endpoint:     tusUploadUrl,
-            uploadUrl:    tusUploadUrl,
-            retryDelays:  [0, 1000, 3000, 5000],
-            chunkSize:    5 * 1024 * 1024, // 5 MB chunks
+            endpoint:    tusUploadUrl,
+            uploadUrl:   tusUploadUrl,
+            // Retry with exponential back-off — safe for resumable uploads
+            retryDelays: [0, 2000, 5000, 10000, 20000],
+            chunkSize,
+            // Keep the connection alive for large uploads (10 GB may take 10+ min)
+            overridePatchMethod: false,
             metadata: {
-              filename:    data.file!.name,
-              filetype:    data.file!.type,
+              filename: data.file!.name,
+              filetype: data.file!.type,
+            },
+            onChunkComplete: (_chunkSize, bytesAccepted, _bytesTotal) => {
+              // Reset timer on first chunk so ETA reflects actual upload speed
+              if (bytesAccepted <= chunkSize) uploadStartTime = Date.now();
             },
             onProgress: (bytesUploaded, bytesTotal) => {
-              const pct = ((bytesUploaded / bytesTotal) * 100).toFixed(1);
-              steps[0] = { ...steps[0], detail: `Uploading to Livepeer… ${pct}%` };
-              setPublishSteps([...steps]);
+              const pct        = (bytesUploaded / bytesTotal) * 100;
+              const pctLabel   = pct.toFixed(1);
+              const elapsed    = (Date.now() - uploadStartTime) / 1000;
+              const speed      = elapsed > 1 ? bytesUploaded / elapsed : 0; // bytes/s
+              const remaining  = speed > 0 ? (bytesTotal - bytesUploaded) / speed : null;
+
+              const speedLabel = speed > 0
+                ? speed > 1_048_576
+                  ? `${(speed / 1_048_576).toFixed(1)} MB/s`
+                  : `${(speed / 1024).toFixed(0)} KB/s`
+                : "";
+
+              const etaLabel = remaining !== null
+                ? remaining > 60
+                  ? `${(remaining / 60).toFixed(0)}m left`
+                  : `${Math.ceil(remaining)}s left`
+                : "";
+
+              const uploadedLabel = bytesUploaded > 1_073_741_824
+                ? `${(bytesUploaded / 1_073_741_824).toFixed(2)} GB`
+                : `${(bytesUploaded / 1_048_576).toFixed(1)} MB`;
+
+              const detail = [
+                `Uploading to Livepeer… ${pctLabel}%`,
+                `${uploadedLabel} / ${fileSizeLabel}`,
+                speedLabel,
+                etaLabel,
+              ].filter(Boolean).join(" · ");
+
+              currentSteps[0] = { ...currentSteps[0], detail };
+              setPublishSteps([...currentSteps]);
             },
             onSuccess: () => resolve(),
             onError:   (err) => reject(err),
@@ -259,17 +313,19 @@ export function UploadSteps() {
         });
 
         storageUri = `livepeer://${playbackId}`;
-        steps[0] = {
-          ...steps[0],
+        currentSteps[0] = {
+          ...currentSteps[0],
           status: "done",
-          detail: `livepeer://${playbackId.slice(0, 16)}… | Livepeer is transcoding…`,
+          detail: `livepeer://${playbackId.slice(0, 16)}… | ${fileSizeLabel} uploaded · Livepeer is transcoding`,
         };
+        // Sync back to steps for subsequent operations
+        steps[0] = currentSteps[0];
       } catch (livepeerErr: any) {
         const errMsg: string = livepeerErr?.message ?? "Livepeer upload failed";
         steps[0] = {
           ...steps[0],
           status: "error",
-          detail: errMsg.slice(0, 150),
+          detail: errMsg.slice(0, 200),
         };
         // Don't abort — register as draft with pending URI so the content is saved
       }
@@ -596,7 +652,12 @@ export function UploadSteps() {
           {/* ── Step 1: Upload video ── */}
           {step === 1 && (
             <div className="flex flex-col gap-6">
-              <h2 className="text-xl font-semibold text-[#EDE8F5]">Upload your video</h2>
+              <div>
+                <h2 className="text-xl font-semibold text-[#EDE8F5]">Upload your video</h2>
+                <p className="text-[#7A6E8E] text-sm mt-1">
+                  Uploaded via TUS resumable protocol — pauses and resumes automatically if your connection drops. Max 10 GB.
+                </p>
+              </div>
               <DragZone onFile={handleFileSelect} />
               {data.file && (
                 <div className="flex flex-col gap-3">
@@ -604,7 +665,9 @@ export function UploadSteps() {
                     <span className="text-[#81D0B5] text-sm">✓</span>
                     <span className="text-[#EDE8F5] text-sm truncate">{data.file.name}</span>
                     <span className="text-[#7A6E8E] text-xs ml-auto">
-                      {(data.file.size / 1024 / 1024).toFixed(2)} MB
+                      {data.file.size >= 1_073_741_824
+                        ? `${(data.file.size / 1_073_741_824).toFixed(2)} GB`
+                        : `${(data.file.size / 1_048_576).toFixed(1)} MB`}
                     </span>
                   </div>
                   {contentHash && (
