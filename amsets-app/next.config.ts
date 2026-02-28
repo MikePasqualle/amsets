@@ -1,18 +1,10 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  webpack: (config) => {
-    // Prevent webpack from trying to bundle Node.js-only modules that are not
-    // needed in the browser. Required by @irys/web-upload and related packages.
-    config.resolve.fallback = {
-      ...config.resolve.fallback,
-      fs: false,
-      net: false,
-      tls: false,
-      child_process: false,
-    };
-    return config;
-  },
+  // Turbopack (Next.js 16 default) handles Node.js module resolution automatically.
+  // The turbopack config below silences the "custom webpack config" warning
+  // while still letting @irys/web-upload work in the browser.
+  turbopack: {},
 };
 
 export default nextConfig;
