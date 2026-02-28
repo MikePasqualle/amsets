@@ -367,18 +367,31 @@ export function UploadSteps() {
             steps[2] = { ...steps[2], status: "done", detail: `ID: ${regData.content_id?.slice(0, 8)}…` };
           } else {
             const body = await regRes.json().catch(() => ({}));
-            // Extract a human-readable message from Zod or API errors
+            // Extract a human-readable message from Zod v3/v4 or API errors
             let errMsg: string;
             if (typeof body.error === "string") {
               errMsg = body.error;
             } else if (body.error?.issues?.length) {
-              // Zod validation error — show the first issue's message
+              // Zod v3: error.issues is an array
               const issue = body.error.issues[0];
               errMsg = `${issue.path?.join(".") ?? "field"}: ${issue.message}`;
+            } else if (typeof body.error?.message === "string") {
+              // Zod v4: error.message is a JSON string of issues array
+              try {
+                const issues = JSON.parse(body.error.message);
+                if (Array.isArray(issues) && issues.length > 0) {
+                  const issue = issues[0];
+                  errMsg = `${Array.isArray(issue.path) && issue.path.length ? issue.path.join(".") : "field"}: ${issue.message}`;
+                } else {
+                  errMsg = body.error.message;
+                }
+              } catch {
+                errMsg = body.error.message;
+              }
             } else if (typeof body.message === "string") {
               errMsg = body.message;
             } else {
-              errMsg = `HTTP ${regRes.status} — check browser console for details`;
+              errMsg = `HTTP ${regRes.status} — check server logs for details`;
               console.error("[register] error body:", body);
             }
             throw new Error(errMsg);

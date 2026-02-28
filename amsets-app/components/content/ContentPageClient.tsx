@@ -262,12 +262,15 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
       tx.recentBlockhash = blockhash;
       tx.feePayer = publicKey;
 
+      // Solana rejects 0-lamport transfers — only add each leg if > 0.
       // 1. Platform fee (2.5%) → FeeVault PDA
-      tx.add(SystemProgram.transfer({
-        fromPubkey: publicKey,
-        toPubkey:   feeVaultPda,
-        lamports:   platformFee,
-      }));
+      if (platformFee > 0n) {
+        tx.add(SystemProgram.transfer({
+          fromPubkey: publicKey,
+          toPubkey:   feeVaultPda,
+          lamports:   platformFee,
+        }));
+      }
 
       // 2. Author royalty → author wallet (if any)
       if (royaltyAmount > 0n && content.authorWallet) {
@@ -279,11 +282,13 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
       }
 
       // 3. Remaining → seller
-      tx.add(SystemProgram.transfer({
-        fromPubkey: publicKey,
-        toPubkey:   sellerPubkey,
-        lamports:   sellerAmount,
-      }));
+      if (sellerAmount > 0n) {
+        tx.add(SystemProgram.transfer({
+          fromPubkey: publicKey,
+          toPubkey:   sellerPubkey,
+          lamports:   sellerAmount,
+        }));
+      }
 
       const signature = await sendTransaction(tx, connection);
       await connection.confirmTransaction(signature, "confirmed");
@@ -310,7 +315,17 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
       setShowConfetti(true);
       await fetchListings();
     } catch (err: any) {
-      setResaleError(err?.message?.slice(0, 200) ?? "Resale purchase failed");
+      // Normalise the error to a human-readable string regardless of the
+      // shape thrown by the Wallet Adapter / web3.js / anchor.
+      let msg: string;
+      if (typeof err?.message === "string" && err.message.length > 0) {
+        msg = err.message;
+      } else if (typeof err === "string") {
+        msg = err;
+      } else {
+        try { msg = JSON.stringify(err); } catch { msg = "Resale purchase failed"; }
+      }
+      setResaleError(msg.slice(0, 300));
     } finally {
       setIsBuyingResale(null);
     }
