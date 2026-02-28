@@ -7,9 +7,13 @@
  *   3. packEncrypted(iv, ciphertext) → packed ArrayBuffer
  *   4. encryptKeyForContent(key, accessMint) → litBundle
  *   5. encodeBundle({ metadata, previewUri, encryptedBuffer, litBundle, accessMint })
- *   6. uploadBundleToArweave(bundle, signer) → ar://{txId}
+ *   6. uploadBundleToArweave(bundle, wallet) → ar://{txId}
  *
  * The bundle JSON embeds the encrypted file + Lit key — no backend storage needed.
+ *
+ * IMPORTANT: `wallet` must be the full result of useWallet() from
+ * @solana/wallet-adapter-react — NOT wallet.adapter or window.solana.
+ * The @irys/web-upload-solana package uses the full wallet context internally.
  */
 
 import { packEncrypted, unpackEncrypted } from "./crypto";
@@ -24,38 +28,45 @@ export interface ArweaveUploadResult {
 }
 
 /**
- * Upload encrypted file bytes to Arweave via Irys.
- * Requires the Irys WebIrys SDK loaded client-side.
- * The uploader is initialised with the user's wallet (Phantom/Solflare/Web3Auth).
+ * Upload encrypted file bytes to Arweave via Irys (browser-safe SDK).
  *
  * @param encryptedBuffer - Packed iv+ciphertext buffer
  * @param mimeType        - Original file MIME type (stored as tag)
  * @param title           - Content title (stored as tag)
- * @param signer          - Wallet signer (from wallet-adapter or Web3Auth)
+ * @param wallet          - Full useWallet() result from @solana/wallet-adapter-react
  */
 export async function uploadToArweave(
   encryptedBuffer: ArrayBuffer,
   mimeType: string,
   title: string,
-  signer: any
+  wallet: any
 ): Promise<ArweaveUploadResult> {
-  // Dynamic import to avoid SSR
-  const { WebIrys } = await import("@irys/sdk");
+  const { WebUploader } = await import("@irys/web-upload");
+  const { WebSolana }   = await import("@irys/web-upload-solana");
 
-  const irys = new WebIrys({
-    network: process.env.NEXT_PUBLIC_IRYS_NETWORK ?? "devnet",
-    token: "solana",
-    wallet: { provider: signer },
-  });
-
-  await irys.ready();
+  const irys = await WebUploader(WebSolana).withProvider(wallet);
 
   const uint8 = new Uint8Array(encryptedBuffer);
+
+  // Check balance and fund if needed (devnet requires confirmed balance)
+  try {
+    const price   = await irys.getPrice(uint8.byteLength);
+    const balance = await irys.getLoadedBalance();
+    if (balance.lt(price)) {
+      const fundAmount = price.multipliedBy(1.2).integerValue();
+      await irys.fund(fundAmount);
+      // Solana devnet needs ~30-60s for finalized status — wait before uploading
+      await new Promise((resolve) => setTimeout(resolve, 45_000));
+    }
+  } catch {
+    // Balance check is non-fatal
+  }
+
   const tags = [
-    { name: "Content-Type", value: "application/octet-stream" },
-    { name: "AMSETS-MIME-Type", value: mimeType },
-    { name: "AMSETS-Title", value: title },
-    { name: "AMSETS-Encrypted", value: "AES-256-GCM" },
+    { name: "Content-Type",      value: "application/octet-stream" },
+    { name: "AMSETS-MIME-Type",  value: mimeType },
+    { name: "AMSETS-Title",      value: title },
+    { name: "AMSETS-Encrypted",  value: "AES-256-GCM" },
   ];
 
   const receipt = await irys.upload(Buffer.from(uint8), { tags });
@@ -68,48 +79,40 @@ export async function uploadToArweave(
 }
 
 /**
- * Upload an AmsetsBundle JSON document to Arweave via Irys.
+ * Upload an AmsetsBundle JSON document to Arweave via Irys (browser-safe SDK).
  * This is the Phase 1 preferred upload method — stores all content metadata,
  * encrypted payload, and Lit key bundle in a single permanent document.
  *
  * @param bundle  - Complete AmsetsBundle object to upload
- * @param signer  - Wallet signer (from wallet-adapter or Web3Auth)
+ * @param wallet  - Full useWallet() result from @solana/wallet-adapter-react
  */
 export async function uploadBundleToArweave(
   bundle: AmsetsBundle,
-  signer: any
+  wallet: any
 ): Promise<ArweaveUploadResult> {
-  const { WebIrys } = await import("@irys/sdk");
+  // Dynamic import — avoids SSR issues and keeps bundle lean
+  const { WebUploader } = await import("@irys/web-upload");
+  const { WebSolana }   = await import("@irys/web-upload-solana");
 
-  const network = process.env.NEXT_PUBLIC_IRYS_NETWORK ?? "devnet";
-
-  // Irys WebIrys requires the provider to expose publicKey + signTransaction.
-  // Solana Wallet Adapter adapters and window.solana both satisfy this.
-  const irys = new WebIrys({
-    network,
-    token: "solana",
-    wallet: { provider: signer },
-  });
-
-  await irys.ready();
+  // Pass the full useWallet() object — Irys uses publicKey + signTransaction internally
+  const irys = await WebUploader(WebSolana).withProvider(wallet);
 
   const json  = JSON.stringify(bundle);
   const uint8 = new TextEncoder().encode(json);
 
-  // On devnet, check the Irys node balance and fund if needed.
-  // On mainnet Irys uses lazy funding so this is a no-op for small uploads.
+  // Check balance and fund if needed.
+  // On Solana devnet, a finalized tx takes 30-60 s — wait before uploading.
+  // On mainnet Irys uses lazy funding so this step is usually a no-op.
   try {
     const price   = await irys.getPrice(uint8.byteLength);
     const balance = await irys.getLoadedBalance();
     if (balance.lt(price)) {
-      // Fund 120% of the upload cost to handle price fluctuations.
       const fundAmount = price.multipliedBy(1.2).integerValue();
       await irys.fund(fundAmount);
-      // Give the funding transaction a moment to confirm
-      await new Promise((resolve) => setTimeout(resolve, 2000));
+      await new Promise((resolve) => setTimeout(resolve, 45_000));
     }
   } catch {
-    // Balance check is non-fatal — proceed and let the upload surface any real errors.
+    // Balance check is non-fatal — let upload attempt and surface any real error
   }
 
   const tags = [

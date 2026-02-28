@@ -90,7 +90,11 @@ export function UploadSteps() {
   const [deployMode, setDeployMode] = useState<"auto" | "draft">("auto");
   const contentRef = useRef<HTMLDivElement | null>(null);
 
-  const { publicKey, connected, sendTransaction, wallet } = useWallet();
+  // Capture the full WalletContextState — Irys @irys/web-upload-solana needs
+  // the entire context object (publicKey + signTransaction + sendTransaction),
+  // NOT wallet.adapter or window.solana.
+  const walletContext = useWallet();
+  const { publicKey, connected, sendTransaction, wallet } = walletContext;
   const { connection } = useConnection();
   const { openAuth } = useAuthModal();
   const { loginWithWallet } = useAuth();
@@ -188,16 +192,12 @@ export function UploadSteps() {
       }
     }
 
-    // Wallet provider for Irys WebIrys (Solana).
-    // Priority 1: Wallet Adapter adapter (Phantom, Solflare, etc.) — implements signTransaction/publicKey
-    // Priority 2: window.solana — Phantom legacy injected provider
-    // Priority 3: Web3Auth Solana provider stored after email/phone login
-    // If none found → Arweave upload is skipped and content saved as pending draft.
-    const walletProvider: any =
-      wallet?.adapter ??
-      (window as any)?.solana ??
-      (typeof window !== "undefined" ? (window as any).__amsets_web3auth_provider : null) ??
-      null;
+    // For Arweave upload, pass the full WalletContextState (walletContext) to Irys.
+    // @irys/web-upload-solana reads publicKey + signTransaction + sendTransaction
+    // from the WalletContextState directly — do NOT use wallet.adapter or window.solana.
+    // Only Wallet Adapter wallets (Phantom, Solflare, etc.) work with Irys in the browser.
+    // Web3Auth (email/phone) users will skip Arweave and save as draft instead.
+    const solanaWallet = connected ? walletContext : null;
 
     try {
       // ── Step 1: Encrypt file + build AmsetsBundle + upload to Arweave ────
@@ -209,18 +209,26 @@ export function UploadSteps() {
       const { ciphertext, iv } = await encryptFile(key, buffer);
       const packed = packEncrypted(iv, ciphertext);
 
-      // Use "pending" as access mint placeholder — will be updated after set_access_mint
+      // Use system program ID as placeholder mint — updated after set_access_mint
       const placeholderMint = "11111111111111111111111111111111";
 
       let storageUri = `ar://pending_${contentHash!.slice(0, 8)}`;
       let litBundle: any = null;
 
-      if (walletProvider) {
+      if (solanaWallet) {
+        // ── Lit Protocol encryption (non-fatal) ────────────────────────────
+        // Run separately so a Lit timeout does NOT prevent Arweave upload.
         try {
-          // Encrypt key via Lit Protocol
           litBundle = await encryptKeyForContent(key, placeholderMint);
+        } catch (litErr: any) {
+          const litMsg: string = litErr?.message ?? String(litErr);
+          // Lit failure is non-fatal: content uploads to Arweave without a
+          // decryption key. Only the author can view until Lit is re-connected.
+          console.warn("[Lit] Encryption failed (non-fatal):", litMsg);
+        }
 
-          // Build decentralized bundle
+        // ── Arweave upload (independent of Lit result) ─────────────────────
+        try {
           const bundleMetadata: AmsetsBundleMetadata = {
             title:        data.title,
             description:  data.description || undefined,
@@ -233,24 +241,23 @@ export function UploadSteps() {
             metadata:        bundleMetadata,
             previewUri:      `ipfs://pending`,
             encryptedBuffer: packed,
-            litBundle,
+            litBundle:       litBundle ?? { ciphertext: "", data_to_encrypt_hash: "" },
             accessMint:      placeholderMint,
           });
 
-          // Upload bundle to Arweave
-          const arResult = await uploadBundleToArweave(bundle, walletProvider);
+          // Pass full walletContext — @irys/web-upload-solana expects WalletContextState
+          const arResult = await uploadBundleToArweave(bundle, solanaWallet);
           storageUri = arResult.uri;
 
           steps[0] = {
             ...steps[0],
-            status: "done",
-            detail: `Bundle: ${arResult.txId.slice(0, 12)}… (${(arResult.size / 1024).toFixed(1)} KB)`,
+            status: litBundle ? "done" : "done",
+            detail: litBundle
+              ? `Bundle: ${arResult.txId.slice(0, 12)}… (${(arResult.size / 1024).toFixed(1)} KB)`
+              : `Bundle: ${arResult.txId.slice(0, 12)}… (Lit encryption skipped — content viewable by author only until re-encrypted)`,
           };
         } catch (arErr: any) {
-          // Arweave upload failed — show the real error so the user knows what happened.
-          // Content is still encrypted in memory; the draft will be saved with a pending URI.
-          const errMsg: string =
-            arErr?.message ?? arErr?.toString() ?? "Unknown Arweave error";
+          const errMsg: string = arErr?.message ?? arErr?.toString() ?? "Unknown Arweave error";
           steps[0] = {
             ...steps[0],
             status: "error",
@@ -262,7 +269,7 @@ export function UploadSteps() {
         steps[0] = {
           ...steps[0],
           status: "skipped",
-          detail: `File encrypted locally (${(packed.byteLength / 1024).toFixed(1)} KB). No compatible Solana wallet detected for Arweave upload — content saved as draft.`,
+          detail: `File encrypted locally (${(packed.byteLength / 1024).toFixed(1)} KB). Connect a browser wallet (Phantom/Solflare) to upload to Arweave permanently.`,
         };
       }
       setPublishSteps([...steps]);
