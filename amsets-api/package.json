@@ -1,0 +1,41 @@
+{
+  "name": "amsets-api",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "dev": "nodemon --watch src --ext ts --exec ts-node src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@hono/node-server": "^1.19.9",
+    "@hono/zod-validator": "^0.7.6",
+    "@solana/web3.js": "^1.98.4",
+    "bs58": "^6.0.0",
+    "dotenv": "^17.3.1",
+    "drizzle-orm": "^0.45.1",
+    "hono": "^4.12.1",
+    "jsonwebtoken": "^9.0.3",
+    "pg": "^8.18.0",
+    "redis": "^5.11.0",
+    "tweetnacl": "^1.0.3",
+    "uuid": "^13.0.0",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/node": "^25.3.0",
+    "@types/pg": "^8.16.0",
+    "@types/uuid": "^10.0.0",
+    "drizzle-kit": "^0.31.9",
+    "nodemon": "^3.1.14",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  }
+}

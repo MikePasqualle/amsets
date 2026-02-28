@@ -1,0 +1,21 @@
+[package]
+name = "amsets-registry"
+version = "0.1.0"
+description = "AMSETS — decentralized IP rights registry on Solana"
+edition = "2018"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "amsets_registry"
+
+[features]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+default = []
+
+[dependencies]
+# No spl-token dep — minting is handled client-side (TypeScript) to avoid
+# solana-program 1.x <-> Agave 2.x dep conflicts that pull in edition2024 crates.
+anchor-lang = { version = "0.32.0", features = ["init-if-needed"] }

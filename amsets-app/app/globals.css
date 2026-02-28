@@ -1,0 +1,105 @@
+@import "tailwindcss";
+
+/* ─── AMSETS Brand Design System ───────────────────────────────────────────── */
+
+@theme {
+  /* Colour palette — derived from brandbook SVG */
+  --color-bg:           #0D0A14;
+  --color-surface:      #221533;
+  --color-surface-alt:  #2D1F47;
+  --color-primary:      #F7FF88;
+  --color-secondary:    #81D0B5;
+  --color-text:         #EDE8F5;
+  --color-muted:        #7A6E8E;
+  --color-border:       #3D2F5A;
+
+  /* Typography */
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+
+  /* Spacing / radius */
+  --radius-card: 1rem;
+  --radius-btn:  0.5rem;
+}
+
+/* ─── Base styles ───────────────────────────────────────────────────────────── */
+
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: auto; /* Lenis handles smooth scroll */
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  background-color: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-sans);
+  min-height: 100dvh;
+  overflow-x: hidden;
+}
+
+/* ─── Custom scrollbar ───────────────────────────────────────────────────────── */
+
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: var(--color-bg);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-border);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-muted);
+}
+
+/* ─── Selection highlight ────────────────────────────────────────────────────── */
+
+::selection {
+  background: var(--color-primary);
+  color: var(--color-surface);
+}
+
+/* ─── Focus visible ring ─────────────────────────────────────────────────────── */
+
+:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+}
+
+/* ─── Utility classes ────────────────────────────────────────────────────────── */
+
+.gradient-text {
+  background: linear-gradient(135deg, var(--color-primary), var(--color-secondary));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.glow-primary {
+  box-shadow: 0 0 20px rgba(247, 255, 136, 0.3);
+}
+
+.glow-secondary {
+  box-shadow: 0 0 20px rgba(129, 208, 181, 0.3);
+}
+
+.card-surface {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-card);
+}
+
+/* ─── GSAP animation helpers ─────────────────────────────────────────────────── */
+
+.will-animate {
+  will-change: transform, opacity;
+}
+
+/* ─── Font loading (Google Fonts via next/font preferred) ───────────────────── */
+/* Fonts are loaded via layout.tsx using next/font/google */

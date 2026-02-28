@@ -1,0 +1,54 @@
+version: "3.9"
+
+services:
+  # ─── PostgreSQL 16 ────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: amsets-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: amsets
+      POSTGRES_PASSWORD: amsets
+      POSTGRES_DB: amsets_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U amsets -d amsets_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── Redis 7 ──────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: amsets-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── Solana Test Validator ────────────────────────────────────────────────
+  # Uncomment if you prefer Docker over local `solana-test-validator`
+  # solana:
+  #   image: anzaxyz/agave:v2.0.0
+  #   container_name: amsets-solana
+  #   ports:
+  #     - "8899:8899"
+  #     - "8900:8900"
+  #   command: >
+  #     solana-test-validator
+  #     --bind-address 0.0.0.0
+  #     --rpc-port 8899
+  #     --no-bpf-jit
+
+volumes:
+  postgres_data:
+  redis_data:
