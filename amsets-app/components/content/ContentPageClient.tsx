@@ -17,7 +17,11 @@ import {
   checkHasPurchased,
   ensureFeeVaultFunded,
   checkTokenBalance,
+  deriveFeeVaultPda,
 } from "@/lib/anchor";
+
+/** Platform fee on all sales (primary + secondary): 2.5% = 250 bps */
+const PLATFORM_FEE_BPS = 250n;
 import {
   PublicKey,
   Transaction,
@@ -236,26 +240,36 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
       const sellerPubkey  = new PublicKey(listing.sellerWallet);
       const totalPrice    = BigInt(listing.price_lamports);
 
-      // Royalty split: author receives royaltyBps/10000 of the price
+      // ── Fee distribution (same model as primary sale) ──────────────────
+      // Platform fee : 2.5%  → FeeVault PDA (same vault as primary sales)
+      // Author royalty: royaltyBps/10000 → author wallet
+      // Seller receives: remainder
       const royaltyBps    = BigInt(content.royaltyBps ?? 0);
+      const platformFee   = (totalPrice * PLATFORM_FEE_BPS) / 10000n;
       const royaltyAmount = royaltyBps > 0n
         ? (totalPrice * royaltyBps) / 10000n
         : 0n;
-      const sellerAmount  = totalPrice - royaltyAmount;
+      const sellerAmount  = totalPrice - platformFee - royaltyAmount;
+
+      if (sellerAmount <= 0n) {
+        throw new Error("Price too low to cover platform fee + royalty. Set a higher price.");
+      }
+
+      const feeVaultPda = deriveFeeVaultPda();
 
       const { blockhash } = await connection.getLatestBlockhash();
       const tx = new Transaction();
       tx.recentBlockhash = blockhash;
       tx.feePayer = publicKey;
 
-      // SOL to seller (minus author royalty)
+      // 1. Platform fee (2.5%) → FeeVault PDA
       tx.add(SystemProgram.transfer({
         fromPubkey: publicKey,
-        toPubkey:   sellerPubkey,
-        lamports:   sellerAmount,
+        toPubkey:   feeVaultPda,
+        lamports:   platformFee,
       }));
 
-      // Royalty to author (if any)
+      // 2. Author royalty → author wallet (if any)
       if (royaltyAmount > 0n && content.authorWallet) {
         tx.add(SystemProgram.transfer({
           fromPubkey: publicKey,
@@ -263,6 +277,13 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
           lamports:   royaltyAmount,
         }));
       }
+
+      // 3. Remaining → seller
+      tx.add(SystemProgram.transfer({
+        fromPubkey: publicKey,
+        toPubkey:   sellerPubkey,
+        lamports:   sellerAmount,
+      }));
 
       const signature = await sendTransaction(tx, connection);
       await connection.confirmTransaction(signature, "confirmed");
@@ -562,9 +583,26 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
               <span className="text-[#7A6E8E]">SOL</span>
             </div>
 
+            {/* Fee breakdown for primary sale */}
+            <div className="flex flex-col gap-1 p-3 rounded-xl bg-[#0D0A14] border border-[#3D2F5A] text-xs">
+              <p className="text-[#7A6E8E] font-semibold uppercase tracking-wide mb-1">Fee breakdown</p>
+              <div className="flex justify-between">
+                <span className="text-[#7A6E8E]">Author receives</span>
+                <span className="text-[#81D0B5] font-mono">
+                  {((Number(content.basePrice) / 1e9) * (1 - 0.025)).toFixed(4)} SOL (97.5%)
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-[#7A6E8E]">Platform fee</span>
+                <span className="text-[#F7FF88] font-mono">
+                  {((Number(content.basePrice) / 1e9) * 0.025).toFixed(4)} SOL (2.5%)
+                </span>
+              </div>
+            </div>
+
             <ul className="flex flex-col gap-2 text-sm text-[#7A6E8E]">
               <li className="flex items-center gap-2">
-                <span className="text-[#81D0B5]">✓</span> Permanent on-chain AccessReceipt
+                <span className="text-[#81D0B5]">✓</span> Access token minted to your wallet
               </li>
               <li className="flex items-center gap-2">
                 <span className="text-[#81D0B5]">✓</span> End-to-end encrypted delivery
@@ -574,7 +612,7 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
               </li>
               {content.royaltyBps !== undefined && content.royaltyBps > 0 && (
                 <li className="flex items-center gap-2">
-                  <span className="text-[#81D0B5]">✓</span> Resellable — author earns {(content.royaltyBps / 100).toFixed(1)}% royalty
+                  <span className="text-[#81D0B5]">✓</span> Resellable — author earns {(content.royaltyBps / 100).toFixed(1)}% on every transfer
                 </li>
               )}
             </ul>
@@ -664,12 +702,6 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
               ) : (
                 <div className="flex flex-col gap-3 p-4 rounded-xl bg-[#221533] border border-[#3D2F5A]">
                   <p className="text-[#EDE8F5] text-sm font-semibold">Set your listing price</p>
-                  {content.royaltyBps !== undefined && content.royaltyBps > 0 && (
-                    <p className="text-[#7A6E8E] text-xs">
-                      Author royalty: {(content.royaltyBps / 100).toFixed(1)}% is deducted from
-                      each sale and sent automatically.
-                    </p>
-                  )}
                   <div className="flex items-center gap-2">
                     <input
                       type="number"
@@ -682,6 +714,37 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
                     />
                     <span className="text-[#7A6E8E] text-sm">SOL</span>
                   </div>
+                  {/* Live seller payout preview */}
+                  {parseFloat(sellPriceSOL) > 0 && (
+                    <div className="flex flex-col gap-1 p-2 rounded-lg bg-[#0D0A14] border border-[#3D2F5A] text-xs">
+                      <p className="text-[#7A6E8E] font-semibold mb-0.5">You will receive:</p>
+                      {(() => {
+                        const p = parseFloat(sellPriceSOL) || 0;
+                        const royBps = content.royaltyBps ?? 0;
+                        const platformCut = p * 0.025;
+                        const royaltyCut  = p * (royBps / 10000);
+                        const sellerGets  = p - platformCut - royaltyCut;
+                        return (
+                          <>
+                            <div className="flex justify-between">
+                              <span className="text-[#7A6E8E]">Platform fee (2.5%)</span>
+                              <span className="text-[#F7FF88] font-mono">− ◎ {platformCut.toFixed(4)}</span>
+                            </div>
+                            {royBps > 0 && (
+                              <div className="flex justify-between">
+                                <span className="text-[#7A6E8E]">Author royalty ({(royBps / 100).toFixed(1)}%)</span>
+                                <span className="text-[#81D0B5] font-mono">− ◎ {royaltyCut.toFixed(4)}</span>
+                              </div>
+                            )}
+                            <div className="flex justify-between border-t border-[#3D2F5A] pt-1 mt-1">
+                              <span className="text-[#EDE8F5] font-semibold">You get</span>
+                              <span className="text-[#F7FF88] font-mono font-bold">◎ {sellerGets.toFixed(4)}</span>
+                            </div>
+                          </>
+                        );
+                      })()}
+                    </div>
+                  )}
                   {listingError && (
                     <p className="text-red-400 text-xs">{listingError}</p>
                   )}
@@ -710,39 +773,57 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
                 </div>
               )}
               {activeListings.map((listing) => {
-                const isOwnListing = walletAddress?.toLowerCase() === listing.sellerWallet.toLowerCase();
-                const priceDisplay = (Number(listing.price_lamports) / LAMPORTS_PER_SOL).toFixed(3);
-                const royaltyPct   = ((content.royaltyBps ?? 0) / 100).toFixed(1);
+                const isOwnListing  = walletAddress?.toLowerCase() === listing.sellerWallet.toLowerCase();
+                const priceSOLNum   = Number(listing.price_lamports) / LAMPORTS_PER_SOL;
+                const priceDisplay  = priceSOLNum.toFixed(3);
+                const royaltyBpNum  = content.royaltyBps ?? 0;
+                const platformFeeAmt = priceSOLNum * 0.025;
+                const royaltyAmt    = priceSOLNum * (royaltyBpNum / 10000);
+                const sellerAmt     = priceSOLNum - platformFeeAmt - royaltyAmt;
                 return (
                   <div
                     key={listing.id}
-                    className="flex items-center justify-between gap-3 p-3 rounded-xl bg-[#0D0A14] border border-[#3D2F5A]"
+                    className="flex flex-col gap-2 p-3 rounded-xl bg-[#0D0A14] border border-[#3D2F5A]"
                   >
-                    <div className="flex flex-col gap-0.5">
+                    {/* Price header */}
+                    <div className="flex items-center justify-between">
                       <span className="text-[#F7FF88] text-sm font-bold">◎ {priceDisplay} SOL</span>
                       <span className="text-[#7A6E8E] text-xs font-mono">
                         {listing.sellerWallet.slice(0, 8)}…{listing.sellerWallet.slice(-4)}
                       </span>
-                      {(content.royaltyBps ?? 0) > 0 && (
-                        <span className="text-[#81D0B5] text-xs">
-                          incl. {royaltyPct}% royalty to author
-                        </span>
+                    </div>
+                    {/* Fee breakdown */}
+                    <div className="flex flex-col gap-0.5 text-xs border-t border-[#3D2F5A] pt-2">
+                      <div className="flex justify-between">
+                        <span className="text-[#7A6E8E]">Seller receives</span>
+                        <span className="text-[#EDE8F5] font-mono">◎ {sellerAmt.toFixed(4)}</span>
+                      </div>
+                      {royaltyBpNum > 0 && (
+                        <div className="flex justify-between">
+                          <span className="text-[#7A6E8E]">Author royalty ({(royaltyBpNum / 100).toFixed(1)}%)</span>
+                          <span className="text-[#81D0B5] font-mono">◎ {royaltyAmt.toFixed(4)}</span>
+                        </div>
                       )}
+                      <div className="flex justify-between">
+                        <span className="text-[#7A6E8E]">Platform fee (2.5%)</span>
+                        <span className="text-[#F7FF88] font-mono">◎ {platformFeeAmt.toFixed(4)}</span>
+                      </div>
                     </div>
                     {isOwnListing ? (
                       <GlowButton variant="ghost" size="sm" onClick={() => handleCancelListing(listing.id)}>
-                        Cancel
+                        Cancel listing
                       </GlowButton>
                     ) : purchased || isAuthor ? (
-                      <span className="text-[#81D0B5] text-xs">You own access</span>
+                      <span className="text-[#81D0B5] text-xs font-medium">✓ You own access</span>
                     ) : (
                       <GlowButton
                         variant="primary"
                         size="sm"
                         isLoading={isBuyingResale === listing.id}
                         onClick={() => handleBuyResale(listing)}
+                        className="w-full"
                       >
-                        Buy
+                        Buy for ◎ {priceDisplay} SOL
                       </GlowButton>
                     )}
                   </div>
