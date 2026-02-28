@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { zValidator } from "@hono/zod-validator";
 import { z } from "zod";
-import { eq, desc } from "drizzle-orm";
+import { eq, desc, sql } from "drizzle-orm";
 import { Connection } from "@solana/web3.js";
 import { db } from "../db/index";
 import { purchases, content as contentTable } from "../db/schema";
@@ -90,6 +90,12 @@ purchasesRouter.post(
         paymentToken: body.payment_token,
       })
       .returning({ id: purchases.id });
+
+    // Increment sold_count so available supply is accurate
+    await db
+      .update(contentTable)
+      .set({ soldCount: sql`${contentTable.soldCount} + 1` })
+      .where(eq(contentTable.contentId, body.content_id));
 
     // Auto-mint 1 SPL Token-2022 access token to the buyer.
     // Non-fatal: the AccessReceipt PDA already proves purchase on-chain.

@@ -9,7 +9,13 @@ import { GlowButton } from "@/components/ui/GlowButton";
 import { useAuthModal } from "@/providers/AuthContext";
 import { useAuth } from "@/lib/useAuth";
 import { useSession } from "@/hooks/useSession";
-import { publishOnChain } from "@/lib/anchor";
+import {
+  publishOnChain,
+  createMintForContent,
+  setAccessMint,
+  deriveContentRecordPda,
+  uuidToBytes32,
+} from "@/lib/anchor";
 import { resolveIPFS } from "@/lib/storage";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3001";
@@ -28,6 +34,10 @@ interface ContentItem {
   status: "draft" | "active" | string;
   contentHash: string;
   onChainPda: string;
+  mintAddress: string | null;
+  totalSupply: number;
+  soldCount: number;
+  royaltyBps: number;
   createdAt: string;
 }
 
@@ -50,8 +60,9 @@ export function MyContentClient() {
   const [items, setItems] = useState<ContentItem[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
-  const [deployingId, setDeployingId] = useState<string | null>(null);
-  const [deployError, setDeployError] = useState<Record<string, string>>({});
+  const [deployingId,   setDeployingId]   = useState<string | null>(null);
+  const [deployStep,    setDeployStep]    = useState<Record<string, string>>({});
+  const [deployError,   setDeployError]   = useState<Record<string, string>>({});
   const { openAuth } = useAuthModal();
 
   // ─── Fetch author's content ──────────────────────────────────────────────
@@ -110,57 +121,94 @@ export function MyContentClient() {
     }
   }, [walletAddress, fetchContent]);
 
-  // ─── Publish draft on-chain ───────────────────────────────────────────────
+  // ─── Publish draft on-chain (register → mint → link → backend update) ────
 
   const handlePublishOnChain = async (item: ContentItem) => {
-    if (!publicKey || !connected) {
-      openAuth();
-      return;
-    }
+    if (!publicKey || !connected) { openAuth(); return; }
     const token = localStorage.getItem("amsets_token");
     if (!token) { openAuth(); return; }
 
-    setDeployingId(item.contentId);
-    setDeployError((e) => ({ ...e, [item.contentId]: "" }));
+    const id = item.contentId;
+    setDeployingId(id);
+    setDeployError((e)  => ({ ...e, [id]: "" }));
+    setDeployStep((s)   => ({ ...s, [id]: "Step 1/3 — Registering on Solana…" }));
 
     try {
-      const priceSol = (Number(item.basePrice) / 1_000_000_000).toFixed(4);
+      // ── Step 1: register_content on-chain ──────────────────────────────
+      const storageUri = item.onChainPda === "pending"
+        ? `ar://pending_${item.contentHash.slice(0, 8)}`
+        : `ar://${item.onChainPda}`;
 
       const { signature, pdaAddress } = await publishOnChain(
         {
-          contentId:   item.contentId,
+          contentId:   id,
           contentHash: item.contentHash,
-          storageUri:  item.onChainPda === "pending"
-            ? `ar://pending_${item.contentHash.slice(0, 8)}`
-            : `ar://${item.onChainPda}`,
-          previewCid:  item.previewUri.replace("ipfs://", ""),
-          priceSol,
+          storageUri,
+          previewCid:  item.previewUri.replace("ipfs://", "").replace("https://ipfs.io/ipfs/", ""),
+          priceSol:    (Number(item.basePrice) / 1_000_000_000).toFixed(4),
           license:     item.license,
+          totalSupply: 100,
+          royaltyBps:  item.royaltyBps ?? 1000,
         },
         publicKey,
         sendTransaction,
         connection
       );
 
-      // Notify backend → set status to "active"
-      await fetch(`${API_URL}/api/v1/content/${item.contentId}/publish`, {
+      // ── Step 2: create SPL Token-2022 mint ─────────────────────────────
+      setDeployStep((s) => ({ ...s, [id]: "Step 2/3 — Creating access token mint…" }));
+      let mintAddress: string | null = null;
+
+      try {
+        const { mintKeypair } = await createMintForContent(
+          publicKey,
+          item.royaltyBps ?? 1000,
+          sendTransaction,
+          connection
+        );
+        mintAddress = mintKeypair.publicKey.toBase58();
+
+        // ── Step 3: link mint to ContentRecord on-chain ──────────────────
+        setDeployStep((s) => ({ ...s, [id]: "Step 3/3 — Linking mint to content record…" }));
+        const contentIdBytes   = uuidToBytes32(id);
+        const contentRecordPda = deriveContentRecordPda(publicKey, contentIdBytes);
+        await setAccessMint(contentRecordPda, mintKeypair.publicKey, publicKey, sendTransaction, connection);
+      } catch (mintErr: any) {
+        // Non-fatal — content will be active without SPL mint; mint can be added later
+        console.warn("[deploy] Mint creation skipped:", mintErr?.message);
+      }
+
+      // ── Backend update: mark active + store PDA + mint ─────────────────
+      setDeployStep((s) => ({ ...s, [id]: "Finalising…" }));
+      const patchRes = await fetch(`${API_URL}/api/v1/content/${id}/publish`, {
         method: "PATCH",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({ tx_signature: signature, on_chain_pda: pdaAddress }),
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          tx_signature: signature,
+          on_chain_pda: pdaAddress,
+          ...(mintAddress ? { mint_address: mintAddress } : {}),
+        }),
       });
 
-      // Update local state — reflect new "active" status without a full reload
+      if (!patchRes.ok) {
+        const errBody = await patchRes.json().catch(() => ({}));
+        throw new Error(
+          errBody.error ?? `Backend update failed (HTTP ${patchRes.status}). Content IS on Solana — try refreshing.`
+        );
+      }
+
+      // Reflect "active" in local state immediately
       setItems((prev) =>
         prev.map((i) =>
-          i.contentId === item.contentId ? { ...i, status: "active" } : i
+          i.contentId === id
+            ? { ...i, status: "active", onChainPda: pdaAddress, mintAddress: mintAddress ?? i.mintAddress }
+            : i
         )
       );
+      setDeployStep((s) => ({ ...s, [id]: "" }));
     } catch (err: any) {
-      const msg = err?.message?.slice(0, 120) ?? "Deployment failed";
-      setDeployError((e) => ({ ...e, [item.contentId]: msg }));
+      const msg = typeof err?.message === "string" ? err.message : "Deployment failed";
+      setDeployError((e) => ({ ...e, [id]: msg.slice(0, 200) }));
     } finally {
       setDeployingId(null);
     }
@@ -236,6 +284,7 @@ export function MyContentClient() {
                 item={item}
                 onPublish={() => handlePublishOnChain(item)}
                 isDeploying={deployingId === item.contentId}
+                deployStep={deployStep[item.contentId]}
                 deployError={deployError[item.contentId]}
                 canDeploy={connected && !!publicKey}
                 openAuth={openAuth}
@@ -278,6 +327,7 @@ interface ContentManageCardProps {
   item: ContentItem;
   onPublish?: () => void;
   isDeploying: boolean;
+  deployStep?: string;
   deployError?: string;
   canDeploy: boolean;
   openAuth: () => void;
@@ -287,13 +337,16 @@ function ContentManageCard({
   item,
   onPublish,
   isDeploying,
+  deployStep,
   deployError,
   canDeploy,
   openAuth,
 }: ContentManageCardProps) {
-  const previewUrl = resolveIPFS(item.previewUri);
-  const priceSOL   = (Number(item.basePrice) / 1_000_000_000).toFixed(3);
-  const isDraft    = item.status === "draft";
+  const previewUrl  = resolveIPFS(item.previewUri);
+  const priceSOL    = (Number(item.basePrice) / 1_000_000_000).toFixed(3);
+  const isDraft     = item.status === "draft";
+  const available   = Math.max(0, (item.totalSupply ?? 0) - (item.soldCount ?? 0));
+  const hasMint     = !!item.mintAddress;
 
   return (
     <article className="card-surface overflow-hidden flex flex-col">
@@ -340,6 +393,18 @@ function ContentManageCard({
           </Link>
         </div>
 
+        {/* Token supply info for active content */}
+        {!isDraft && (
+          <div className="flex items-center justify-between text-xs text-[#7A6E8E]">
+            <span>{available} / {item.totalSupply ?? "?"} tokens available</span>
+            {hasMint ? (
+              <span className="text-green-400">✓ Mint active</span>
+            ) : (
+              <span className="text-amber-400">⚠ No mint yet</span>
+            )}
+          </div>
+        )}
+
         {/* Draft: Publish On-Chain button */}
         {isDraft && onPublish && (
           <div className="flex flex-col gap-2 mt-auto pt-2 border-t border-[#3D2F5A]">
@@ -350,7 +415,7 @@ function ContentManageCard({
                 isLoading={isDeploying}
                 onClick={onPublish}
               >
-                {isDeploying ? "Deploying…" : "Publish On-Chain"}
+                {isDeploying ? (deployStep || "Deploying…") : "Publish On-Chain"}
               </GlowButton>
             ) : (
               <div className="flex flex-col gap-1.5">
@@ -363,7 +428,7 @@ function ContentManageCard({
               </div>
             )}
             {deployError && (
-              <p className="text-xs text-red-400 line-clamp-2">{deployError}</p>
+              <p className="text-xs text-red-400 line-clamp-3">{deployError}</p>
             )}
           </div>
         )}

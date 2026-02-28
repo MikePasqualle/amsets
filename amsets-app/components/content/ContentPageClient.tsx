@@ -579,8 +579,12 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
               <div>
                 <span className="text-[#7A6E8E]">Available: </span>
                 <span className="text-[#EDE8F5] font-bold">
-                  {(content.totalSupply - (content.soldCount ?? 0))} / {content.totalSupply}
+                  {Math.max(0, content.totalSupply - (content.soldCount ?? 0))} / {content.totalSupply}
                 </span>
+              </div>
+              <div>
+                <span className="text-[#7A6E8E]">Sold: </span>
+                <span className="text-[#EDE8F5] font-bold">{content.soldCount ?? 0}</span>
               </div>
               {content.royaltyBps !== undefined && (
                 <div>
