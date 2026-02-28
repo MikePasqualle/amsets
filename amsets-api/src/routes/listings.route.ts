@@ -31,8 +31,8 @@ function extractWallet(authHeader: string | undefined): string | null {
 const createListingSchema = z.object({
   content_id:     z.string().min(1),
   price_lamports: z.number().int().positive(),
-  mint_address:   z.string().min(32),
-  token_account:  z.string().min(32).optional(),
+  mint_address:   z.string().optional(),   // Optional — content may not have SPL mint yet
+  token_account:  z.string().optional(),
 });
 
 listingsRouter.post(
@@ -54,7 +54,8 @@ listingsRouter.post(
     if (!row) return c.json({ error: "Content not found" }, 404);
     if (row.status !== "active")
       return c.json({ error: "Cannot list draft content" }, 400);
-    if (row.mintAddress && row.mintAddress !== body.mint_address)
+    // Only validate mint match when both the content record AND the request have a mint
+    if (row.mintAddress && body.mint_address && row.mintAddress !== body.mint_address)
       return c.json({ error: "mint_address does not match content" }, 400);
 
     // Prevent duplicate active listings from same seller
@@ -72,13 +73,16 @@ listingsRouter.post(
 
     if (existing) return c.json({ error: "You already have an active listing for this content" }, 409);
 
+    // Use content's mintAddress if the request omitted it
+    const effectiveMint = body.mint_address ?? row.mintAddress ?? null;
+
     const [created] = await db
       .insert(listings)
       .values({
         contentId:     body.content_id,
         sellerWallet,
         priceLamports: BigInt(body.price_lamports),
-        mintAddress:   body.mint_address,
+        mintAddress:   effectiveMint,
         tokenAccount:  body.token_account ?? null,
         status:        "active",
       })

@@ -16,7 +16,6 @@ import {
   purchaseAccess,
   checkHasPurchased,
   ensureFeeVaultFunded,
-  callMintAccessTokenCheckpoint,
   checkTokenBalance,
 } from "@/lib/anchor";
 import {
@@ -99,6 +98,18 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
   const [purchaseTxSig, setPurchaseTxSig] = useState<string | null>(null);
   const [previewImgError, setPreviewImgError] = useState(false);
 
+  // Auto-open sell form when navigated from Library with #sell hash
+  useEffect(() => {
+    if (typeof window !== "undefined" && window.location.hash === "#sell") {
+      setShowSellForm(true);
+      // Smooth scroll to sell section after purchase check settles
+      setTimeout(() => {
+        const el = document.getElementById("sell-section");
+        el?.scrollIntoView({ behavior: "smooth" });
+      }, 800);
+    }
+  }, []);
+
   // ─── Resale listing state ──────────────────────────────────────────────────
   const [activeListings,    setActiveListings]    = useState<ActiveListing[]>([]);
   const [showSellForm,      setShowSellForm]      = useState(false);
@@ -147,7 +158,6 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
 
   // ─── Fetch active listings ────────────────────────────────────────────────
   const fetchListings = useCallback(async () => {
-    if (!content.mintAddress) return;
     try {
       const res = await fetch(`${API_URL}/api/v1/listings/${content.contentId}`);
       if (res.ok) {
@@ -155,25 +165,30 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
         setActiveListings(data.listings ?? []);
       }
     } catch { /* non-fatal */ }
-  }, [content.contentId, content.mintAddress]);
+  }, [content.contentId]);
 
   useEffect(() => { fetchListings(); }, [fetchListings]);
 
   // ─── Create sell listing ──────────────────────────────────────────────────
   const handleCreateListing = useCallback(async () => {
-    if (!publicKey || !token || !content.mintAddress) return;
+    if (!publicKey || !token) return;
     setIsListing(true);
     setListingError(null);
     try {
       const priceLamports = Math.round(parseFloat(sellPriceSOL) * LAMPORTS_PER_SOL);
       if (isNaN(priceLamports) || priceLamports <= 0) throw new Error("Invalid price");
 
-      const sellerAta = getAssociatedTokenAddressSync(
-        new PublicKey(content.mintAddress),
-        publicKey,
-        false,
-        TOKEN_2022_PROGRAM_ID
-      );
+      // ATA is optional — only computed when the SPL mint exists
+      let tokenAccount: string | undefined;
+      if (content.mintAddress) {
+        const sellerAta = getAssociatedTokenAddressSync(
+          new PublicKey(content.mintAddress),
+          publicKey,
+          false,
+          TOKEN_2022_PROGRAM_ID
+        );
+        tokenAccount = sellerAta.toBase58();
+      }
 
       const res = await fetch(`${API_URL}/api/v1/listings`, {
         method: "POST",
@@ -181,8 +196,8 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
         body: JSON.stringify({
           content_id:     content.contentId,
           price_lamports: priceLamports,
-          mint_address:   content.mintAddress,
-          token_account:  sellerAta.toBase58(),
+          mint_address:   content.mintAddress,  // may be absent
+          token_account:  tokenAccount,
         }),
       });
       if (!res.ok) {
@@ -205,40 +220,52 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
       setResaleError("Connect Phantom or Solflare wallet to purchase.");
       return;
     }
-    if (!content.mintAddress) { setResaleError("Content mint not set."); return; }
 
     setIsBuyingResale(listing.id);
     setResaleError(null);
 
     try {
       const sellerPubkey  = new PublicKey(listing.sellerWallet);
-      const priceLamports = BigInt(listing.price_lamports);
+      const totalPrice    = BigInt(listing.price_lamports);
 
-      // Phase 1 (MVP): SOL-only on-chain payment. The token physically stays
-      // with the seller; access rights are transferred in the DB.
-      // Full trustless escrow (token transfer with seller co-sign) is Phase 2.
+      // Royalty split: author receives royaltyBps/10000 of the price
+      const royaltyBps    = BigInt(content.royaltyBps ?? 0);
+      const royaltyAmount = royaltyBps > 0n
+        ? (totalPrice * royaltyBps) / 10000n
+        : 0n;
+      const sellerAmount  = totalPrice - royaltyAmount;
+
       const { blockhash } = await connection.getLatestBlockhash();
       const tx = new Transaction();
       tx.recentBlockhash = blockhash;
       tx.feePayer = publicKey;
 
-      // SOL payment to seller
+      // SOL to seller (minus author royalty)
       tx.add(SystemProgram.transfer({
         fromPubkey: publicKey,
-        toPubkey: sellerPubkey,
-        lamports: priceLamports,
+        toPubkey:   sellerPubkey,
+        lamports:   sellerAmount,
       }));
+
+      // Royalty to author (if any)
+      if (royaltyAmount > 0n && content.authorWallet) {
+        tx.add(SystemProgram.transfer({
+          fromPubkey: publicKey,
+          toPubkey:   new PublicKey(content.authorWallet),
+          lamports:   royaltyAmount,
+        }));
+      }
 
       const signature = await sendTransaction(tx, connection);
       await connection.confirmTransaction(signature, "confirmed");
 
-      // Record access purchase in DB so the library + access gate work
+      // Record access in DB (for Library + access gate)
       await fetch(`${API_URL}/api/v1/purchases`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
         body: JSON.stringify({
-          content_id: content.contentId,
-          tx_signature: signature,
+          content_id:     content.contentId,
+          tx_signature:   signature,
           price_lamports: listing.price_lamports,
         }),
       }).catch(() => null);
@@ -341,17 +368,6 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
       );
 
       setPurchaseTxSig(signature);
-
-      // Call mint_access_token checkpoint on-chain (verifies receipt + emits event)
-      // Non-fatal: the purchase is already confirmed; this is just an on-chain signal.
-      try {
-        await callMintAccessTokenCheckpoint(
-          contentRecordPda,
-          publicKey,
-          sendTransaction,
-          connection
-        );
-      } catch { /* Non-fatal — purchase is confirmed via AccessReceipt PDA */ }
 
       if (token) {
         await fetch(`${API_URL}/api/v1/purchases`, {
@@ -630,19 +646,22 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
             )}
           </div>
 
-          {/* ── Resale Listings ─────────────────────────────────────────── */}
-          {content.mintAddress && (
-            <div className="flex flex-col gap-4 mt-2">
-
-              {/* Sell Token form (token holder who is not author) */}
-              {purchased && !isAuthor && !showSellForm && (
+          {/* ── Sell My Access (purchased non-authors only) ──────────────── */}
+          {purchased && !isAuthor && (
+            <div id="sell-section" className="flex flex-col gap-3 mt-2">
+              {!showSellForm ? (
                 <GlowButton variant="ghost" size="sm" onClick={() => setShowSellForm(true)}>
                   List My Access Token for Sale
                 </GlowButton>
-              )}
-              {purchased && !isAuthor && showSellForm && (
+              ) : (
                 <div className="flex flex-col gap-3 p-4 rounded-xl bg-[#221533] border border-[#3D2F5A]">
                   <p className="text-[#EDE8F5] text-sm font-semibold">Set your listing price</p>
+                  {content.royaltyBps !== undefined && content.royaltyBps > 0 && (
+                    <p className="text-[#7A6E8E] text-xs">
+                      Author royalty: {(content.royaltyBps / 100).toFixed(1)}% is deducted from
+                      each sale and sent automatically.
+                    </p>
+                  )}
                   <div className="flex items-center gap-2">
                     <input
                       type="number"
@@ -659,13 +678,8 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
                     <p className="text-red-400 text-xs">{listingError}</p>
                   )}
                   <div className="flex gap-2">
-                    <GlowButton
-                      variant="primary"
-                      size="sm"
-                      isLoading={isListing}
-                      onClick={handleCreateListing}
-                    >
-                      List Token
+                    <GlowButton variant="primary" size="sm" isLoading={isListing} onClick={handleCreateListing}>
+                      Confirm Listing
                     </GlowButton>
                     <GlowButton variant="ghost" size="sm" onClick={() => setShowSellForm(false)}>
                       Cancel
@@ -673,57 +687,59 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
                   </div>
                 </div>
               )}
+            </div>
+          )}
 
-              {/* Active listings from other sellers */}
-              {activeListings.length > 0 && (
-                <div className="flex flex-col gap-2">
-                  <p className="text-[#7A6E8E] text-xs font-semibold uppercase tracking-wide">
-                    Resale Listings
-                  </p>
-                  {resaleError && (
-                    <div className="p-2 rounded-lg bg-red-500/10 border border-red-500/30">
-                      <p className="text-red-400 text-xs">{resaleError}</p>
-                    </div>
-                  )}
-                  {activeListings.map((listing) => {
-                    const isOwnListing = walletAddress?.toLowerCase() === listing.sellerWallet.toLowerCase();
-                    const priceDisplay = (Number(listing.price_lamports) / LAMPORTS_PER_SOL).toFixed(3);
-                    return (
-                      <div
-                        key={listing.id}
-                        className="flex items-center justify-between gap-3 p-3 rounded-xl bg-[#0D0A14] border border-[#3D2F5A]"
-                      >
-                        <div className="flex flex-col gap-0.5">
-                          <span className="text-[#F7FF88] text-sm font-bold">◎ {priceDisplay} SOL</span>
-                          <span className="text-[#7A6E8E] text-xs font-mono">
-                            {listing.sellerWallet.slice(0, 8)}…{listing.sellerWallet.slice(-4)}
-                          </span>
-                        </div>
-                        {isOwnListing ? (
-                          <GlowButton
-                            variant="ghost"
-                            size="sm"
-                            onClick={() => handleCancelListing(listing.id)}
-                          >
-                            Cancel
-                          </GlowButton>
-                        ) : !purchased ? (
-                          <GlowButton
-                            variant="primary"
-                            size="sm"
-                            isLoading={isBuyingResale === listing.id}
-                            onClick={() => handleBuyResale(listing)}
-                          >
-                            Buy
-                          </GlowButton>
-                        ) : (
-                          <span className="text-[#81D0B5] text-xs">You own access</span>
-                        )}
-                      </div>
-                    );
-                  })}
+          {/* ── Secondary Market Listings (visible to everyone) ──────────── */}
+          {activeListings.length > 0 && (
+            <div className="flex flex-col gap-3 mt-2">
+              <p className="text-[#7A6E8E] text-xs font-semibold uppercase tracking-wide">
+                Resale Market
+              </p>
+              {resaleError && (
+                <div className="p-2 rounded-lg bg-red-500/10 border border-red-500/30">
+                  <p className="text-red-400 text-xs">{resaleError}</p>
                 </div>
               )}
+              {activeListings.map((listing) => {
+                const isOwnListing = walletAddress?.toLowerCase() === listing.sellerWallet.toLowerCase();
+                const priceDisplay = (Number(listing.price_lamports) / LAMPORTS_PER_SOL).toFixed(3);
+                const royaltyPct   = ((content.royaltyBps ?? 0) / 100).toFixed(1);
+                return (
+                  <div
+                    key={listing.id}
+                    className="flex items-center justify-between gap-3 p-3 rounded-xl bg-[#0D0A14] border border-[#3D2F5A]"
+                  >
+                    <div className="flex flex-col gap-0.5">
+                      <span className="text-[#F7FF88] text-sm font-bold">◎ {priceDisplay} SOL</span>
+                      <span className="text-[#7A6E8E] text-xs font-mono">
+                        {listing.sellerWallet.slice(0, 8)}…{listing.sellerWallet.slice(-4)}
+                      </span>
+                      {(content.royaltyBps ?? 0) > 0 && (
+                        <span className="text-[#81D0B5] text-xs">
+                          incl. {royaltyPct}% royalty to author
+                        </span>
+                      )}
+                    </div>
+                    {isOwnListing ? (
+                      <GlowButton variant="ghost" size="sm" onClick={() => handleCancelListing(listing.id)}>
+                        Cancel
+                      </GlowButton>
+                    ) : purchased || isAuthor ? (
+                      <span className="text-[#81D0B5] text-xs">You own access</span>
+                    ) : (
+                      <GlowButton
+                        variant="primary"
+                        size="sm"
+                        isLoading={isBuyingResale === listing.id}
+                        onClick={() => handleBuyResale(listing)}
+                      >
+                        Buy
+                      </GlowButton>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           )}
 

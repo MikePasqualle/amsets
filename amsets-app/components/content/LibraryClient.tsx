@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState, useCallback } from "react";
+import Link from "next/link";
 import { ContentCard } from "./ContentCard";
 import { GlowButton } from "@/components/ui/GlowButton";
 import { useAuthModal } from "@/providers/AuthContext";
@@ -193,7 +194,24 @@ export function LibraryClient() {
         className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-5"
       >
         {items.map((item) => (
-          <ContentCard key={item.contentId} {...item} />
+          <div key={item.contentId} className="flex flex-col gap-1">
+            <ContentCard {...item} />
+            {/* Sell action — links to the content page where the listing form lives */}
+            <div className="flex justify-between items-center px-1">
+              <Link
+                href={`/c/${item.contentId}`}
+                className="text-xs text-[#81D0B5] hover:text-[#EDE8F5] transition-colors"
+              >
+                View →
+              </Link>
+              <Link
+                href={`/c/${item.contentId}#sell`}
+                className="text-xs text-[#F7FF88] hover:text-[#EDE8F5] transition-colors"
+              >
+                List for Sale →
+              </Link>
+            </div>
+          </div>
         ))}
       </div>
     </div>

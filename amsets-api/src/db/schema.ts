@@ -148,7 +148,7 @@ export const listings = pgTable(
     sellerWallet:  text("seller_wallet").notNull(),     // seller's Solana pubkey
     priceLamports: bigint("price_lamports", { mode: "bigint" }).notNull(),
     status:        text("status").notNull().default("active"), // active | sold | cancelled
-    mintAddress:   text("mint_address").notNull(),      // SPL Token-2022 mint
+    mintAddress:   text("mint_address"),                // SPL Token-2022 mint (optional — access may be via AccessReceipt PDA only)
     tokenAccount:  text("token_account"),               // seller's ATA holding the token
     createdAt:     timestamp("created_at").notNull().defaultNow(),
     updatedAt:     timestamp("updated_at").notNull().defaultNow(),
