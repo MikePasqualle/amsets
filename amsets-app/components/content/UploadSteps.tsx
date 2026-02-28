@@ -20,7 +20,6 @@ import { uploadBundleToArweave, uploadPreviewToIPFS } from "@/lib/storage";
 import {
   publishOnChain,
   createMintForContent,
-  mintAuthorToken,
   setAccessMint,
   deriveContentRecordPda,
   uuidToBytes32,
@@ -451,9 +450,6 @@ export function UploadSteps() {
 
             mintAddress = mintKeypair.publicKey.toBase58();
 
-            // Mint 1 author token to the author's wallet
-            await mintAuthorToken(mintKeypair.publicKey, publicKey, sendTransaction, connection);
-
             // Link the mint to the ContentRecord on-chain
             const contentIdBytes   = uuidToBytes32(registeredContentId);
             const contentRecordPda = deriveContentRecordPda(publicKey, contentIdBytes);
@@ -462,7 +458,8 @@ export function UploadSteps() {
             steps[4] = {
               ...steps[4],
               status: "done",
-              detail: `Mint: ${mintAddress.slice(0, 12)}… | Author token minted`,
+              // Backend will mint author token automatically after /publish is called
+              detail: `Mint: ${mintAddress.slice(0, 12)}… | Backend will mint author token`,
             };
           } catch (mintErr: any) {
             // Non-fatal: content is already registered, token can be minted later

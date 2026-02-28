@@ -2,12 +2,19 @@ import { Hono } from "hono";
 import { zValidator } from "@hono/zod-validator";
 import { z } from "zod";
 import { eq, and, ne, desc } from "drizzle-orm";
+import { Connection } from "@solana/web3.js";
 import { db } from "../db/index";
 import { content as contentTable, purchases } from "../db/schema";
 import { cacheGet, cacheSet, cacheDel } from "../db/redis";
 import { verifyUserJwt, verifyContentJwt } from "../services/jwt.service";
 import { validateArweaveUri } from "../services/storage.service";
+import { mintAuthorToken } from "../services/mint.service";
 import { v4 as uuidv4 } from "uuid";
+
+const solanaConnection = new Connection(
+  `https://devnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY}`,
+  "confirmed"
+);
 
 const contentRouter = new Hono();
 
@@ -300,6 +307,15 @@ contentRouter.patch("/:id/publish", async (c) => {
     .where(eq(contentTable.contentId, contentId));
 
   await cacheDel(`content:${contentId}`);
+
+  // Auto-mint 1 author access token if this publish includes a mint address.
+  // Non-fatal — author can still access their own content without the SPL token.
+  const mintAddress = (updateFields.mintAddress as string | undefined) ?? null;
+  if (mintAddress) {
+    mintAuthorToken(mintAddress, wallet, solanaConnection).catch((err) => {
+      console.error(`[mint] Failed to mint author token for ${contentId}:`, err?.message);
+    });
+  }
 
   return c.json({ success: true, content_id: contentId, status: "active" });
 });

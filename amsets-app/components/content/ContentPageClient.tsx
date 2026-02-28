@@ -133,23 +133,31 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
   const hasAccess = isAuthor || purchased;
 
   // ─── Check on-chain access on mount ──────────────────────────────────────
-  // Priority 1: SPL Token-2022 balance (canonical, survives resale)
-  // Priority 2: AccessReceipt PDA (original purchase, fallback when no mint yet)
+  // Rule:
+  //  - If content has an SPL mint: ONLY the token balance counts (pure on-chain,
+  //    survives resale). The AccessReceipt PDA is NOT enough for content with a mint,
+  //    because resale buyers also have PDA-equivalent DB records but not PDAs.
+  //  - If content has NO SPL mint: fall back to AccessReceipt PDA (legacy content
+  //    or content where minting failed).
+  //  - Author always has access regardless.
   useEffect(() => {
     if (!publicKey) return;
 
     const checkAccess = async () => {
-      // Token balance check (most reliable after resale)
       if (content.mintAddress) {
-        const bal = await checkTokenBalance(connection, content.mintAddress, publicKey);
+        // Content has a mint → SPL token balance is the ONLY valid proof
+        // (This includes author token minted by backend at publish time)
+        const bal = await checkTokenBalance(connection, content.mintAddress, publicKey).catch(() => 0);
         if (bal > 0) { setPurchased(true); return; }
-      }
-      // PDA fallback (for content registered before mint was created)
-      if (content.onChainPda && content.onChainPda !== "pending") {
-        const has = await checkHasPurchased(
-          connection, new PublicKey(content.onChainPda), publicKey
-        ).catch(() => false);
-        if (has) setPurchased(true);
+        // No token found — do NOT fall back to PDA (would allow ex-sellers to retain access)
+      } else {
+        // No mint configured → use AccessReceipt PDA as fallback proof
+        if (content.onChainPda && content.onChainPda !== "pending") {
+          const has = await checkHasPurchased(
+            connection, new PublicKey(content.onChainPda), publicKey
+          ).catch(() => false);
+          if (has) setPurchased(true);
+        }
       }
     };
 

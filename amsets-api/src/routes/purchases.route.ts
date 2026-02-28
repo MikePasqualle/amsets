@@ -2,9 +2,16 @@ import { Hono } from "hono";
 import { zValidator } from "@hono/zod-validator";
 import { z } from "zod";
 import { eq, desc } from "drizzle-orm";
+import { Connection } from "@solana/web3.js";
 import { db } from "../db/index";
 import { purchases, content as contentTable } from "../db/schema";
 import { verifyUserJwt } from "../services/jwt.service";
+import { mintAccessTokenToUser } from "../services/mint.service";
+
+const solanaConnection = new Connection(
+  `https://devnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY}`,
+  "confirmed"
+);
 
 const purchasesRouter = new Hono();
 
@@ -69,20 +76,31 @@ purchasesRouter.post(
         ? BigInt(body.amount_paid)
         : BigInt(Math.round(Number(body.amount_paid)));
 
+    const effectiveMint = body.access_mint ?? contentRow.accessMint ?? null;
+
     const [record] = await db
       .insert(purchases)
       .values({
         contentId:    body.content_id,
         buyerWallet,
         authorWallet: contentRow.authorWallet,
-        accessMint:   body.access_mint ?? contentRow.accessMint,
+        accessMint:   effectiveMint,
         txSignature:  body.tx_signature,
         amountPaid,
         paymentToken: body.payment_token,
       })
       .returning({ id: purchases.id });
 
-    return c.json({ success: true, purchase_id: record.id, cached: false }, 201);
+    // Auto-mint 1 SPL Token-2022 access token to the buyer.
+    // Non-fatal: the AccessReceipt PDA already proves purchase on-chain.
+    // The token makes ownership visible in the wallet and enables resale.
+    if (effectiveMint) {
+      mintAccessTokenToUser(effectiveMint, buyerWallet, solanaConnection).catch((err) => {
+        console.error(`[mint] Failed to mint access token for purchase ${record.id}:`, err?.message);
+      });
+    }
+
+    return c.json({ success: true, purchase_id: record.id, cached: false, mint_triggered: !!effectiveMint }, 201);
   }
 );
 

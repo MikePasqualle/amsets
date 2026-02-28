@@ -510,11 +510,11 @@ export async function ensureFeeVaultFunded(
  * Creates a new SPL Token-2022 mint with the TransferFee extension configured
  * for royalty collection on resale.
  *
- * Returns the mint Keypair so the caller can sign (the mint authority will be
- * the author's wallet — transferred to a PDA later via setAccessMint).
+ * The MINT AUTHORITY is set to the backend's public key (NEXT_PUBLIC_MINT_AUTHORITY_PUBKEY)
+ * so the backend can automatically mint access tokens to buyers without requiring
+ * the author to be online. The author still pays the rent for the mint account.
  *
  * @param royaltyBps   Basis points for the transfer fee (0–5000).
- * @param maxFee       Maximum fee in token lamports (use MAX_SAFE_INTEGER or large value to not cap).
  */
 export async function createMintForContent(
   authorPublicKey: PublicKey,
@@ -527,13 +527,19 @@ export async function createMintForContent(
   const mintLen      = getMintLen(extensions);
   const mintLamports = await connection.getMinimumBalanceForRentExemption(mintLen);
 
+  // Use the backend's public key as mint authority so it can auto-mint access
+  // tokens to buyers after purchase without the author's signature.
+  const mintAuthorityStr = process.env.NEXT_PUBLIC_MINT_AUTHORITY_PUBKEY;
+  const mintAuthority    = mintAuthorityStr
+    ? new PublicKey(mintAuthorityStr)
+    : authorPublicKey; // fallback to author (single-player mode)
+
   // Fee rate in basis points (0-10000). royaltyBps is 0-5000 so fits fine.
   const feeBasisPoints   = royaltyBps;
-  // Max fee: set very high to effectively be uncapped in lamport terms
   const maximumFee       = BigInt("18446744073709551615"); // u64::MAX
 
   const tx = new Transaction().add(
-    // 1. Create the mint account
+    // 1. Create the mint account (author pays rent)
     SystemProgram.createAccount({
       fromPubkey:  authorPublicKey,
       newAccountPubkey: mintKeypair.publicKey,
@@ -541,21 +547,21 @@ export async function createMintForContent(
       lamports:    mintLamports,
       programId:   TOKEN_2022_PROGRAM_ID,
     }),
-    // 2. Initialize TransferFeeConfig extension
+    // 2. Initialize TransferFeeConfig extension (author controls fee rate)
     createInitializeTransferFeeConfigInstruction(
       mintKeypair.publicKey,
-      authorPublicKey, // transfer fee config authority (can update fee)
+      authorPublicKey, // transfer fee config authority
       authorPublicKey, // withdraw withheld tokens authority
       feeBasisPoints,
       maximumFee,
       TOKEN_2022_PROGRAM_ID
     ),
-    // 3. Initialize the mint itself (0 decimals — each token is whole)
+    // 3. Initialize the mint itself — backend is the mint authority
     createInitializeMintInstruction(
       mintKeypair.publicKey,
-      0,               // decimals
-      authorPublicKey, // mint authority
-      null,            // freeze authority (none)
+      0,              // decimals (whole tokens only)
+      mintAuthority,  // backend keypair can mint without author signature
+      null,           // freeze authority (none)
       TOKEN_2022_PROGRAM_ID
     )
   );
