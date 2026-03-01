@@ -7,34 +7,41 @@ interface DragZoneProps {
   onFile: (file: File) => void;
   accept?: string;
   maxSizeMB?: number;
+  /** Override the default video-only MIME type list (e.g. for preview image pickers) */
+  allowedMimeTypes?: string[];
+  label?: string;
+  subLabel?: string;
 }
 
+// Only video uploads are supported — content is delivered via Livepeer Studio.
 const ALLOWED_TYPES = [
   "video/mp4",
   "video/quicktime",
-  "application/pdf",
-  "image/png",
-  "image/jpeg",
-  "image/gif",
-  "audio/mpeg",
-  "audio/wav",
-  "text/plain",
-  "application/zip",
+  "video/webm",
+  "video/x-msvideo",
+  "video/avi",
+  "video/mov",
+  "video/x-matroska",
 ];
 
 /**
  * Drag-and-drop file upload zone with GSAP state animations.
  * States: idle (dashed border) | dragover (yellow glow) | success (green border)
  */
-export function DragZone({ onFile, maxSizeMB = 500 }: DragZoneProps) {
+export function DragZone({ onFile, maxSizeMB = 10240, allowedMimeTypes, label, subLabel }: DragZoneProps) {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [error, setError] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
+  const effectiveTypes = allowedMimeTypes ?? ALLOWED_TYPES;
+
   const handleFile = (file: File) => {
     setError(null);
 
-    if (!ALLOWED_TYPES.includes(file.type)) {
+    const isAllowed = effectiveTypes.some((t) =>
+      t.endsWith("/*") ? file.type.startsWith(t.replace("/*", "/")) : file.type === t
+    );
+    if (!isAllowed) {
       setError(`File type "${file.type}" is not supported.`);
       return;
     }
@@ -66,7 +73,7 @@ export function DragZone({ onFile, maxSizeMB = 500 }: DragZoneProps) {
         ref={inputRef}
         type="file"
         className="hidden"
-        accept={ALLOWED_TYPES.join(",")}
+        accept={effectiveTypes.join(",")}
         onChange={(e) => {
           const file = e.target.files?.[0];
           if (file) handleFile(file);
@@ -89,13 +96,15 @@ export function DragZone({ onFile, maxSizeMB = 500 }: DragZoneProps) {
       ) : (
         <div className="text-center">
           <p className="text-[#EDE8F5] font-medium">
-            {dragState === "dragover" ? "Drop to upload" : "Drop your file here"}
+            {dragState === "dragover"
+              ? `Drop ${label ?? "video"} to upload`
+              : `Drop your ${label ?? "video"} here`}
           </p>
           <p className="text-[#7A6E8E] text-sm mt-1">
-            or click to browse • max {maxSizeMB}MB
+            or click to browse • max {maxSizeMB >= 1024 ? `${(maxSizeMB / 1024).toFixed(0)} GB` : `${maxSizeMB} MB`}
           </p>
           <p className="text-[#3D2F5A] text-xs mt-2">
-            Video, PDF, Image, Audio, Code archive
+            {subLabel ?? "MP4 · MOV · WebM · AVI · MKV"}
           </p>
         </div>
       )}

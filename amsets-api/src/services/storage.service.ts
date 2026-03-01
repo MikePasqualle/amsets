@@ -95,6 +95,7 @@ export function buildContentMetadata(params: {
 export function validateArweaveUri(uri: string): boolean {
   if (!uri.startsWith("ar://")) return false;
   const txId = uri.replace("ar://", "");
-  // Arweave TxIDs are 43-character base64url strings
-  return /^[a-zA-Z0-9_-]{43}$/.test(txId);
+  // Standard Arweave TxIDs are 43 base64url chars; Irys devnet may vary slightly.
+  // Accept any non-empty base64url string (32–64 chars) to handle both environments.
+  return /^[a-zA-Z0-9_-]{32,64}$/.test(txId);
 }

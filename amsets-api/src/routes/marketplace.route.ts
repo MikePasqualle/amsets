@@ -15,7 +15,7 @@
 import { Hono } from "hono";
 import { zValidator } from "@hono/zod-validator";
 import { z } from "zod";
-import { eq, ilike, and, desc } from "drizzle-orm";
+import { eq, ilike, and, desc, inArray } from "drizzle-orm";
 import { db } from "../db/index";
 import { content } from "../db/schema";
 import { cacheGet, cacheSet } from "../db/redis";
@@ -101,9 +101,9 @@ marketplaceRouter.get(
     }
 
     // ── PostgreSQL fallback ───────────────────────────────────────────────────
-    // Only show published (active) content on the public marketplace.
-    // Drafts are visible only in the author's own /my/content page.
-    const conditions = [eq(content.status, "active")];
+    // Only show published (active), non-private content on the public marketplace.
+    // Drafts and private content are only visible to the author.
+    const conditions = [eq(content.status, "active"), eq(content.isPrivate, false)];
     if (category) conditions.push(eq(content.category, category));
     if (search)   conditions.push(ilike(content.title, `%${search}%`));
 
@@ -174,7 +174,12 @@ interface EnrichedRecord {
 async function enrichWithDbMetadata(
   records: Awaited<ReturnType<typeof fetchAllContentRecords>>
 ): Promise<EnrichedRecord[]> {
-  // Pull all active DB rows in one query — includes token/supply fields needed by the frontend
+  if (records.length === 0) return [];
+
+  const onChainIds = records.map((r) => r.contentId.slice(0, 32));
+
+  // Fetch ALL DB rows for the on-chain IDs (both active and draft) so we can
+  // check the DB status for each record and auto-sync stale drafts.
   const dbRows = await db
     .select({
       contentId:   content.contentId,
@@ -189,42 +194,80 @@ async function enrichWithDbMetadata(
       soldCount:   content.soldCount,
       mimeType:    content.mimeType,
       createdAt:   content.createdAt,
+      status:      content.status,
+      onChainPda:  content.onChainPda,
     })
     .from(content)
-    .where(eq(content.status, "active"));
+    .where(inArray(content.contentId, onChainIds));
 
-  // Normalize keys to 32-char hex so lookup succeeds whether the on-chain
-  // ID was deserialized as 32-char (fixed) or 64-char (legacy).
   const dbMap = new Map(dbRows.map((r) => [r.contentId.slice(0, 32), r]));
 
-  return records.map((onChain) => {
-    const normalizedId = onChain.contentId.slice(0, 32);
-    const dbRow = dbMap.get(normalizedId);
-    return {
-      contentId:    normalizedId,
-      pdaAddress:   onChain.pdaAddress,
-      title:        dbRow?.title        ?? `Content ${normalizedId.slice(0, 8)}`,
-      description:  dbRow?.description  ?? undefined,
-      category:     dbRow?.category     ?? "general",
-      tags:         dbRow?.tags         ?? [],
-      previewUri:   dbRow?.previewUri   ?? onChain.previewUri,
-      authorWallet: onChain.primaryAuthor,
-      basePrice:    String(onChain.basePrice),
-      paymentToken: onChain.paymentToken,
-      license:      onChain.license,
-      accessMint:   onChain.accessMint,
-      mintAddress:  dbRow?.mintAddress  ?? null,
-      onChainPda:   onChain.pdaAddress,
-      storageUri:   onChain.storageUri,
-      status:       onChain.isActive ? "active" : "inactive",
-      isActive:     onChain.isActive,
-      totalSupply:  dbRow?.totalSupply  ?? undefined,
-      royaltyBps:   dbRow?.royaltyBps   ?? undefined,
-      soldCount:    dbRow?.soldCount    ?? 0,
-      mimeType:     dbRow?.mimeType     ?? null,
-      createdAt:    dbRow?.createdAt,
-    };
-  });
+  // Auto-sync: content that is confirmed on-chain but still shows "draft" in DB
+  // means the PATCH /publish call failed after the Solana tx. Fix it now.
+  const draftIds = dbRows
+    .filter((r) => r.status === "draft" && onChainIds.includes(r.contentId.slice(0, 32)))
+    .map((r) => r.contentId);
+
+  if (draftIds.length > 0) {
+    console.log(`[marketplace] Auto-syncing ${draftIds.length} on-chain records stuck in draft:`, draftIds);
+    // Build a map of onChainPda per contentId for the sync
+    const pdaMap = new Map(records.map((r) => [r.contentId.slice(0, 32), r.pdaAddress]));
+    // Update each in background with its actual PDA address
+    Promise.all(
+      draftIds.map((id) => {
+        const pda = pdaMap.get(id.slice(0, 32));
+        return db.update(content)
+          .set({ status: "active", ...(pda ? { onChainPda: pda } : {}) })
+          .where(eq(content.contentId, id))
+          .execute();
+      })
+    ).catch((err) => console.error("[marketplace] Auto-sync failed:", err));
+    // Reflect immediately in our in-memory map so this response is correct
+    draftIds.forEach((id) => {
+      const row = dbMap.get(id.slice(0, 32));
+      if (row) {
+        row.status = "active";
+        const pda = pdaMap.get(id.slice(0, 32));
+        if (pda) row.onChainPda = pda;
+      }
+    });
+  }
+
+  return records
+    .map((onChain) => {
+      const normalizedId = onChain.contentId.slice(0, 32);
+      const dbRow = dbMap.get(normalizedId);
+
+      // If the DB record explicitly marks it draft AND it's not being auto-synced,
+      // keep it out of the public marketplace. Only the author sees drafts.
+      if (dbRow && dbRow.status === "draft") return null;
+
+      return {
+        contentId:    normalizedId,
+        pdaAddress:   onChain.pdaAddress,
+        title:        dbRow?.title        ?? `Content ${normalizedId.slice(0, 8)}`,
+        description:  dbRow?.description  ?? undefined,
+        category:     dbRow?.category     ?? "general",
+        tags:         dbRow?.tags         ?? [],
+        previewUri:   dbRow?.previewUri   ?? onChain.previewUri,
+        authorWallet: onChain.primaryAuthor,
+        basePrice:    String(onChain.basePrice),
+        paymentToken: onChain.paymentToken,
+        license:      onChain.license,
+        accessMint:   onChain.accessMint,
+        mintAddress:  dbRow?.mintAddress  ?? null,
+        onChainPda:   onChain.pdaAddress,
+        storageUri:   onChain.storageUri,
+        status:       "active",
+        isActive:     true,
+        totalSupply:  dbRow?.totalSupply  ?? undefined,
+        royaltyBps:   dbRow?.royaltyBps   ?? undefined,
+        soldCount:    dbRow?.soldCount    ?? 0,
+        mimeType:     dbRow?.mimeType     ?? null,
+        createdAt:    dbRow?.createdAt,
+      } as EnrichedRecord;
+    })
+    .filter((r): r is NonNullable<typeof r> => r !== null) as EnrichedRecord[];
 }
 
 export { marketplaceRouter };

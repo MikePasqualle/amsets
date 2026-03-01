@@ -2,12 +2,19 @@ import { Hono } from "hono";
 import { zValidator } from "@hono/zod-validator";
 import { z } from "zod";
 import { eq, and, ne, desc } from "drizzle-orm";
+import { Connection } from "@solana/web3.js";
 import { db } from "../db/index";
 import { content as contentTable, purchases } from "../db/schema";
 import { cacheGet, cacheSet, cacheDel } from "../db/redis";
 import { verifyUserJwt, verifyContentJwt } from "../services/jwt.service";
 import { validateArweaveUri } from "../services/storage.service";
+import { mintAuthorToken, createMintForExistingContent } from "../services/mint.service";
 import { v4 as uuidv4 } from "uuid";
+
+const solanaConnection = new Connection(
+  `https://devnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY}`,
+  "confirmed"
+);
 
 const contentRouter = new Hono();
 
@@ -38,10 +45,12 @@ const registerSchema = z.object({
   storage_uri: z.string().refine(
     (uri) =>
       validateArweaveUri(uri) ||
-      /^ar:\/\/pending_[a-zA-Z0-9]{1,64}$/.test(uri),
+      /^ar:\/\/pending_/.test(uri) ||              // legacy Arweave pending draft
+      /^ar:\/\/[a-zA-Z0-9_-]{10,}$/.test(uri) ||  // legacy Arweave loose fallback
+      /^livepeer:\/\/[a-zA-Z0-9_-]+$/.test(uri),  // Livepeer playbackId
     {
       message:
-        'Must be a valid Arweave URI ("ar://{43-char txId}") or "ar://pending_{id}"',
+        'Must be a valid storage URI: "livepeer://{playbackId}", "ar://{txId}", or "ar://pending_{id}"',
     }
   ),
   preview_cid: z.string().min(1),
@@ -63,6 +72,8 @@ const registerSchema = z.object({
   total_supply: z.number().int().min(1).default(1),
   royalty_bps: z.number().int().min(0).max(5000).default(1000),
   mime_type: z.string().optional(),
+  // Privacy: if true, content is hidden from public marketplace (author + link-share only)
+  is_private: z.boolean().default(false),
 });
 
 contentRouter.post(
@@ -104,6 +115,7 @@ contentRouter.post(
         totalSupply: body.total_supply,
         royaltyBps: body.royalty_bps,
         mimeType: body.mime_type ?? null,
+        isPrivate: body.is_private ?? false,
       })
       .returning({ id: contentTable.id, contentId: contentTable.contentId });
 
@@ -301,6 +313,15 @@ contentRouter.patch("/:id/publish", async (c) => {
 
   await cacheDel(`content:${contentId}`);
 
+  // Auto-mint 1 author access token if this publish includes a mint address.
+  // Non-fatal — author can still access their own content without the SPL token.
+  const mintAddress = (updateFields.mintAddress as string | undefined) ?? null;
+  if (mintAddress) {
+    mintAuthorToken(mintAddress, wallet, solanaConnection).catch((err) => {
+      console.error(`[mint] Failed to mint author token for ${contentId}:`, err?.message);
+    });
+  }
+
   return c.json({ success: true, content_id: contentId, status: "active" });
 });
 
@@ -368,6 +389,80 @@ contentRouter.get("/:id/lit-data", async (c) => {
     lit_conditions_hash: item.litConditionsHash,
     access_mint: item.accessMint,
   });
+});
+
+// ─── POST /api/v1/content/:id/create-mint — create SPL Token-2022 mint for content ─
+
+contentRouter.post("/:id/create-mint", async (c) => {
+  const wallet = extractWallet(c.req.header("Authorization"));
+  if (!wallet) return c.json({ error: "Unauthorized" }, 401);
+
+  const contentId = c.req.param("id");
+
+  const [row] = await db
+    .select({
+      authorWallet: contentTable.authorWallet,
+      mintAddress:  contentTable.mintAddress,
+      accessMint:   contentTable.accessMint,
+      royaltyBps:   contentTable.royaltyBps,
+      status:       contentTable.status,
+      title:        contentTable.title,
+      previewUri:   contentTable.previewUri,
+    })
+    .from(contentTable)
+    .where(eq(contentTable.contentId, contentId))
+    .limit(1);
+
+  if (!row) return c.json({ error: "Content not found" }, 404);
+  if (row.authorWallet !== wallet) return c.json({ error: "Only the author can create a mint" }, 403);
+  if (row.status === "archived") return c.json({ error: "Content is archived" }, 400);
+
+  // If a real mint already exists, return it
+  const existingMint = row.mintAddress ?? row.accessMint;
+  if (existingMint && existingMint !== "pending") {
+    return c.json({ success: true, mint_address: existingMint, created: false });
+  }
+
+  try {
+    const royaltyBps = row.royaltyBps ?? 1000;
+    // Build metadata for on-chain token info
+    const metadata = {
+      name:   (row.title ?? "AMSETS Content").slice(0, 32),
+      symbol: "AMSETS",
+      uri:    (row.previewUri ?? "").replace("ipfs://", "https://gateway.pinata.cloud/ipfs/"),
+    };
+    const mintAddress = await createMintForExistingContent(royaltyBps, solanaConnection, metadata);
+
+    await db
+      .update(contentTable)
+      .set({ mintAddress, accessMint: mintAddress })
+      .where(eq(contentTable.contentId, contentId));
+
+    // Clear cache so marketplace picks up new mint
+    await cacheDel(`content:${contentId}`);
+
+    // Mint 1 author token
+    mintAuthorToken(mintAddress, row.authorWallet, solanaConnection).catch((e) =>
+      console.error("[create-mint] author token failed:", e?.message)
+    );
+
+    // Retry minting for any existing purchases of this content
+    const existingPurchases = await db
+      .select({ buyerWallet: purchases.buyerWallet })
+      .from(purchases)
+      .where(eq(purchases.contentId, contentId));
+
+    for (const p of existingPurchases) {
+      mintAuthorToken(mintAddress, p.buyerWallet, solanaConnection).catch((e) =>
+        console.error("[create-mint] retry mint for", p.buyerWallet, "failed:", e?.message)
+      );
+    }
+
+    return c.json({ success: true, mint_address: mintAddress, created: true });
+  } catch (err: any) {
+    console.error("[create-mint] error:", err?.message);
+    return c.json({ error: `Failed to create mint: ${err?.message ?? "unknown"}` }, 500);
+  }
 });
 
 export { contentRouter };

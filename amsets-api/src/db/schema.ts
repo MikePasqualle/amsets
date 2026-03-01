@@ -98,6 +98,7 @@ export const content = pgTable(
     mintAddress:  text("mint_address"),   // SPL Token-2022 mint pubkey (set after mint creation)
     soldCount:    integer("sold_count").notNull().default(0),
     mimeType:     text("mime_type"),      // original file MIME type
+    isPrivate:    boolean("is_private").notNull().default(false), // hidden from public marketplace
     createdAt: timestamp("created_at").notNull().defaultNow(),
     updatedAt: timestamp("updated_at").notNull().defaultNow(),
   },
@@ -148,7 +149,7 @@ export const listings = pgTable(
     sellerWallet:  text("seller_wallet").notNull(),     // seller's Solana pubkey
     priceLamports: bigint("price_lamports", { mode: "bigint" }).notNull(),
     status:        text("status").notNull().default("active"), // active | sold | cancelled
-    mintAddress:   text("mint_address").notNull(),      // SPL Token-2022 mint
+    mintAddress:   text("mint_address"),                // SPL Token-2022 mint (optional — access may be via AccessReceipt PDA only)
     tokenAccount:  text("token_account"),               // seller's ATA holding the token
     createdAt:     timestamp("created_at").notNull().defaultNow(),
     updatedAt:     timestamp("updated_at").notNull().defaultNow(),

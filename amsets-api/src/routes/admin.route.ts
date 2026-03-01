@@ -1,204 +1,140 @@
 /**
- * Admin routes — protected, not exposed in public API docs.
+ * Admin Routes — platform settings and analytics.
  *
- * POST /api/v1/admin/deploy      — deploy Solana program via CLI
- * GET  /api/v1/admin/deploy-status — check deployer wallet balance + program status
+ * All routes require the X-Admin-Secret header matching ADMIN_SECRET env variable.
+ *
+ * GET    /api/v1/admin/settings              — get current platform settings
+ * PUT    /api/v1/admin/settings              — update platform settings
+ * GET    /api/v1/admin/stats                 — revenue and usage statistics
  */
 
 import { Hono } from "hono";
-import { spawn } from "child_process";
-import { copyFileSync } from "fs";
-import path from "path";
 import { Connection, PublicKey, LAMPORTS_PER_SOL } from "@solana/web3.js";
-import { verifyWalletSignature } from "../services/solana.service";
+import { db } from "../db/index";
+import { purchases, content, users } from "../db/schema";
+import { sum, count } from "drizzle-orm";
+import { Pool } from "pg";
 
 const adminRouter = new Hono();
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
-/**
- * Run `solana program deploy` using spawn (not exec).
- *
- * The Solana CLI argument parser breaks on paths with spaces even when the shell
- * properly quotes them. To work around this, we copy both the .so and the
- * program keypair to /tmp (no spaces) before deploying.
- *
- * The program keypair is auto-discovered from the .so file name
- * (amsets_registry.so → amsets_registry-keypair.json in the same dir),
- * so we do NOT pass --program-id explicitly.
- */
-function runSolanaDeploy(
-  cliKeypair: string,
-  soFile: string,
-  keypairFile: string
-): Promise<{ stdout: string; stderr: string }> {
-  return new Promise((resolve, reject) => {
-    // Copy files to /tmp to avoid Solana CLI space-in-path bug
-    const tmpSo      = "/tmp/amsets_registry.so";
-    const tmpKeypair = "/tmp/amsets_registry-keypair.json";
-    try {
-      copyFileSync(soFile,      tmpSo);
-      copyFileSync(keypairFile, tmpKeypair);
-    } catch (e: any) {
-      return reject(new Error(`Failed to copy deploy files to /tmp: ${e.message}`));
-    }
+const solanaConnection = new Connection(
+  `https://devnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY}`,
+  "confirmed"
+);
 
-    const args = [
-      "program", "deploy",
-      "--keypair",  cliKeypair,
-      "--url",      "devnet",
-      tmpSo,
-    ];
+// ─── Auth middleware ───────────────────────────────────────────────────────────
 
-    console.log("[admin/deploy] solana", args.join(" "));
-
-    const proc = spawn("solana", args, { stdio: "pipe" });
-
-    let stdout = "";
-    let stderr = "";
-
-    proc.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
-    proc.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
-
-    const timer = setTimeout(() => {
-      proc.kill();
-      reject(new Error("Deploy timed out after 120s"));
-    }, 120_000);
-
-    proc.on("close", (code) => {
-      clearTimeout(timer);
-      if (code === 0) {
-        resolve({ stdout, stderr });
-      } else {
-        reject(new Error(stderr || stdout || `Process exited with code ${code}`));
-      }
-    });
-
-    proc.on("error", (err) => {
-      clearTimeout(timer);
-      reject(err);
-    });
-  });
+function checkAdmin(c: any): boolean {
+  const secret = c.req.header("X-Admin-Secret");
+  return !!process.env.ADMIN_SECRET && secret === process.env.ADMIN_SECRET;
 }
 
-const DEPLOYER_WALLET = "CFLk3NaYLP876Vf8RpNbnymP8igsZJ8YjWd4ac73GQH8";
-const PROGRAM_ID      = process.env.PROGRAM_ID ?? "B2gRbiHAfn7sZo8Kyecoc8xbkMzbgA7f7oJvBVjJxatG";
-const RPC_URL         = process.env.SOLANA_RPC_URL ?? "https://api.devnet.solana.com";
+// ─── GET /settings ────────────────────────────────────────────────────────────
 
-// Path to compiled .so and program keypair (relative to repo root)
-const REPO_ROOT   = path.resolve(__dirname, "../../../../");
-const SO_FILE     = path.join(REPO_ROOT, "amsets-contracts/target/deploy/amsets_registry.so");
-const KEYPAIR_FILE = path.join(REPO_ROOT, "amsets-contracts/target/deploy/amsets_registry-keypair.json");
-const CLI_KEYPAIR  = path.join(process.env.HOME ?? "~", ".config/solana/id.json");
+adminRouter.get("/settings", async (c) => {
+  if (!checkAdmin(c)) return c.json({ error: "Unauthorized" }, 401);
 
-// Simple admin auth: check that the request is signed by a known admin wallet.
-// For dev/MVP: any wallet that passes signature check can trigger deploy.
-// In production, add a whitelist of admin wallet addresses.
-function verifyAdminSignature(
-  walletAddress: string,
-  message: string,
-  signature: string,
-  timestamp: number
-): boolean {
-  // Replay protection: reject if older than 5 minutes
-  if (Math.abs(Date.now() - timestamp) > 5 * 60 * 1000) return false;
-  const expectedMessage = `AMSETS admin: ${walletAddress} at ${timestamp}`;
-  if (message !== expectedMessage) return false;
-  return verifyWalletSignature(walletAddress, message, signature);
-}
+  const { rows } = await pool.query("SELECT key, value, updated_at FROM platform_settings");
+  const settings: Record<string, string> = {};
+  rows.forEach((r: any) => { settings[r.key] = r.value; });
 
-// ─── GET /deploy-status ───────────────────────────────────────────────────────
-
-adminRouter.get("/deploy-status", async (c) => {
-  const connection = new Connection(RPC_URL, "confirmed");
-
-  // Check deployer wallet balance
-  let deployerBalance = 0;
+  // Compute FeeVault balance live
+  let feeVaultBalance = 0;
   try {
-    deployerBalance = await connection.getBalance(new PublicKey(DEPLOYER_WALLET));
-  } catch {}
+    const PROGRAM_ID = new PublicKey(
+      process.env.NEXT_PUBLIC_PROGRAM_ID ?? "B2gRbiHAfn7sZo8Kyecoc8xbkMzbgA7f7oJvBVjJxatG"
+    );
+    const [feeVaultPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("fee_vault")],
+      PROGRAM_ID
+    );
+    const lamports = await solanaConnection.getBalance(feeVaultPda);
+    feeVaultBalance = lamports / LAMPORTS_PER_SOL;
+    settings["fee_vault_pda"]     = feeVaultPda.toBase58();
+    settings["fee_vault_balance"] = feeVaultBalance.toFixed(6);
+  } catch {
+    settings["fee_vault_balance"] = "N/A";
+  }
 
-  // Check if program is already deployed
-  let programDeployed = false;
-  let programExecutable = false;
-  try {
-    const info = await connection.getAccountInfo(new PublicKey(PROGRAM_ID));
-    programDeployed    = info !== null;
-    programExecutable  = info?.executable ?? false;
-  } catch {}
-
-  return c.json({
-    deployer_wallet:   DEPLOYER_WALLET,
-    deployer_balance:  deployerBalance / LAMPORTS_PER_SOL,
-    deployer_balance_lamports: deployerBalance,
-    program_id:        PROGRAM_ID,
-    program_deployed:  programDeployed,
-    program_executable: programExecutable,
-    rpc_url:           RPC_URL,
-    min_sol_needed:    2.5,
-    can_deploy:        deployerBalance / LAMPORTS_PER_SOL >= 2.5 && !programExecutable,
-  });
+  return c.json({ settings });
 });
 
-// ─── POST /deploy ─────────────────────────────────────────────────────────────
+// ─── PUT /settings ────────────────────────────────────────────────────────────
 
-adminRouter.post("/deploy", async (c) => {
-  const body = await c.req.json().catch(() => ({})) as {
-    wallet_address?: string;
-    signature?: string;
-    timestamp?: number;
-  };
+adminRouter.put("/settings", async (c) => {
+  if (!checkAdmin(c)) return c.json({ error: "Unauthorized" }, 401);
 
-  const { wallet_address, signature, timestamp } = body;
+  const body = await c.req.json().catch(() => null);
+  if (!body || typeof body !== "object") return c.json({ error: "Invalid body" }, 400);
 
-  if (!wallet_address || !signature || !timestamp) {
-    return c.json({ error: "wallet_address, signature and timestamp are required" }, 400);
+  const ALLOWED_KEYS = ["platform_fee_wallet", "platform_name", "platform_fee_bps"];
+
+  const updates = Object.entries(body as Record<string, string>).filter(([k]) =>
+    ALLOWED_KEYS.includes(k)
+  );
+
+  if (!updates.length) return c.json({ error: "No valid settings provided" }, 400);
+
+  for (const [key, value] of updates) {
+    await pool.query(
+      "INSERT INTO platform_settings (key, value, updated_at) VALUES ($1, $2, NOW()) ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()",
+      [key, String(value)]
+    );
   }
 
-  const message = `AMSETS admin: ${wallet_address} at ${timestamp}`;
-  if (!verifyAdminSignature(wallet_address, message, signature, timestamp)) {
-    return c.json({ error: "Invalid or expired admin signature" }, 401);
-  }
+  return c.json({ ok: true, updated: updates.map(([k]) => k) });
+});
 
-  // Check deployer balance
-  const connection = new Connection(RPC_URL, "confirmed");
-  const deployerBalance = await connection.getBalance(new PublicKey(DEPLOYER_WALLET));
-  const deployerSOL = deployerBalance / LAMPORTS_PER_SOL;
+// ─── GET /stats ───────────────────────────────────────────────────────────────
 
-  if (deployerSOL < 2.5) {
-    return c.json({
-      error: `Deployer wallet needs at least 2.5 SOL (has ${deployerSOL.toFixed(4)} SOL). Send SOL to: ${DEPLOYER_WALLET}`,
-      deployer_wallet: DEPLOYER_WALLET,
-      current_balance: deployerSOL,
-    }, 402);
-  }
+adminRouter.get("/stats", async (c) => {
+  if (!checkAdmin(c)) return c.json({ error: "Unauthorized" }, 401);
 
-  // Check if already deployed
-  const existing = await connection.getAccountInfo(new PublicKey(PROGRAM_ID));
-  if (existing?.executable) {
-    return c.json({
-      success: true,
-      message: "Program already deployed and executable.",
-      program_id: PROGRAM_ID,
-    });
-  }
+  const [purchaseStats] = await db
+    .select({
+      totalPurchases: count(purchases.id),
+      totalRevenue:   sum(purchases.amountPaid),
+    })
+    .from(purchases);
 
-  // Run solana program deploy (using spawn + /tmp copy to avoid space-in-path bug)
+  const [contentStats] = await db
+    .select({ totalContent: count(content.contentId) })
+    .from(content);
+
+  const [userStats] = await db
+    .select({ totalUsers: count(users.walletAddress) })
+    .from(users);
+
+  // Platform fee = 2.5% of total revenue
+  const totalRevenueSol = Number(purchaseStats?.totalRevenue ?? 0) / LAMPORTS_PER_SOL;
+  const platformRevenueSol = totalRevenueSol * 0.025;
+
+  // FeeVault live balance
+  let feeVaultBalance = 0;
+  let feeVaultPdaStr = "N/A";
   try {
-    const { stdout, stderr } = await runSolanaDeploy(CLI_KEYPAIR, SO_FILE, KEYPAIR_FILE);
-    const output = stdout + (stderr ? `\nSTDERR: ${stderr}` : "");
-    console.log("[admin/deploy] Output:", output);
+    const PROGRAM_ID = new PublicKey(
+      process.env.NEXT_PUBLIC_PROGRAM_ID ?? "B2gRbiHAfn7sZo8Kyecoc8xbkMzbgA7f7oJvBVjJxatG"
+    );
+    const [feeVaultPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("fee_vault")],
+      PROGRAM_ID
+    );
+    feeVaultPdaStr = feeVaultPda.toBase58();
+    const lamports = await solanaConnection.getBalance(feeVaultPda);
+    feeVaultBalance = lamports / LAMPORTS_PER_SOL;
+  } catch { /* ignore */ }
 
-    return c.json({
-      success: true,
-      program_id: PROGRAM_ID,
-      output: output.trim(),
-    });
-  } catch (err: any) {
-    console.error("[admin/deploy] Failed:", err);
-    return c.json({
-      success: false,
-      error: err?.message ?? "Deploy failed",
-    }, 500);
-  }
+  return c.json({
+    purchases:       purchaseStats?.totalPurchases ?? 0,
+    total_revenue_sol: totalRevenueSol.toFixed(6),
+    platform_revenue_sol: platformRevenueSol.toFixed(6),
+    fee_vault_balance_sol: feeVaultBalance.toFixed(6),
+    fee_vault_pda:   feeVaultPdaStr,
+    content:         contentStats?.totalContent ?? 0,
+    users:           userStats?.totalUsers ?? 0,
+  });
 });
 
 export { adminRouter };

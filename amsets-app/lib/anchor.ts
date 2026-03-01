@@ -43,6 +43,66 @@ export const AMSETS_PROGRAM_ID = new PublicKey(
   process.env.NEXT_PUBLIC_PROGRAM_ID ?? "B2gRbiHAfn7sZo8Kyecoc8xbkMzbgA7f7oJvBVjJxatG"
 );
 
+// ─── Transaction helpers ──────────────────────────────────────────────────────
+
+/**
+ * Sends a transaction and waits for confirmation using the block-height strategy.
+ * Provides step-by-step error messages so callers know exactly where failures occur.
+ */
+async function sendAndConfirm(
+  tx: Transaction,
+  sendTransaction: (tx: Transaction, conn: Connection) => Promise<string>,
+  connection: Connection,
+  label = "tx"
+): Promise<string> {
+  // Step 1: Get fresh blockhash
+  let blockhash: string;
+  let lastValidBlockHeight: number;
+  try {
+    const latest = await connection.getLatestBlockhash("confirmed");
+    blockhash = latest.blockhash;
+    lastValidBlockHeight = latest.lastValidBlockHeight;
+  } catch (err: any) {
+    throw new Error(
+      `[${label}] Cannot reach Solana RPC — check your internet connection. (${err?.message ?? "network error"})`
+    );
+  }
+  tx.recentBlockhash = blockhash;
+
+  // Step 2: Sign & send (triggers Phantom approval dialog)
+  let signature: string;
+  try {
+    signature = await sendTransaction(tx, connection);
+  } catch (err: any) {
+    // Wallet rejected or disconnected — give the user a clear message
+    const msg: string = err?.message ?? String(err);
+    // "Failed to fetch" from Phantom usually means the wallet is on Mainnet
+    // while the transaction targets Devnet, or Phantom can't reach its RPC.
+    if (msg.toLowerCase().includes("failed to fetch") || msg.toLowerCase().includes("network")) {
+      throw new Error(
+        `[${label}] Wallet cannot send the transaction — make sure Phantom is set to Devnet ` +
+        `(Settings → Developer Settings → Testnet Mode) and try again.`
+      );
+    }
+    throw new Error(`[${label}] Send failed: ${msg.slice(0, 200)}`);
+  }
+
+  // Step 3: Confirm on-chain
+  try {
+    await connection.confirmTransaction(
+      { signature, blockhash, lastValidBlockHeight },
+      "confirmed"
+    );
+  } catch (err: any) {
+    // Transaction was sent but confirmation timed out — it may still succeed.
+    // Return the signature so the caller can report partial success.
+    console.warn(`[${label}] confirmTransaction timed out for ${signature}:`, err);
+    return signature;
+  }
+
+  return signature;
+}
+
 // ─── Instruction discriminators ───────────────────────────────────────────────
 
 const REGISTER_DISCRIMINATOR = new Uint8Array([
@@ -364,13 +424,9 @@ export async function publishOnChain(
   });
 
   const tx = new Transaction().add(ix);
-  const { blockhash } = await connection.getLatestBlockhash();
-  tx.recentBlockhash = blockhash;
   tx.feePayer = authorPublicKey;
 
-  const signature = await sendTransaction(tx, connection);
-  await connection.confirmTransaction(signature, "confirmed");
-
+  const signature = await sendAndConfirm(tx, sendTransaction, connection, "register_content");
   return { signature, pdaAddress: pda.toBase58() };
 }
 
@@ -418,13 +474,9 @@ export async function purchaseAccess(
   });
 
   const tx = new Transaction().add(ix);
-  const { blockhash } = await connection.getLatestBlockhash();
-  tx.recentBlockhash = blockhash;
   tx.feePayer = buyerPublicKey;
 
-  const signature = await sendTransaction(tx, connection);
-  await connection.confirmTransaction(signature, "confirmed");
-
+  const signature = await sendAndConfirm(tx, sendTransaction, connection, "purchase_access");
   return { signature, receiptPda: receiptPda.toBase58() };
 }
 
@@ -453,13 +505,9 @@ export async function setAccessMint(
   });
 
   const tx = new Transaction().add(ix);
-  const { blockhash } = await connection.getLatestBlockhash();
-  tx.recentBlockhash = blockhash;
   tx.feePayer = authorPublicKey;
 
-  const signature = await sendTransaction(tx, connection);
-  await connection.confirmTransaction(signature, "confirmed");
-  return signature;
+  return await sendAndConfirm(tx, sendTransaction, connection, "set_access_mint");
 }
 
 /**
@@ -496,12 +544,9 @@ export async function ensureFeeVaultFunded(
   });
 
   const tx = new Transaction().add(ix);
-  const { blockhash } = await connection.getLatestBlockhash();
-  tx.recentBlockhash = blockhash;
   tx.feePayer = payerPublicKey;
 
-  const sig = await sendTransaction(tx, connection);
-  await connection.confirmTransaction(sig, "confirmed");
+  await sendAndConfirm(tx, sendTransaction, connection, "initialize_vault");
 }
 
 // ─── SPL Token-2022 helpers ───────────────────────────────────────────────────
@@ -510,11 +555,11 @@ export async function ensureFeeVaultFunded(
  * Creates a new SPL Token-2022 mint with the TransferFee extension configured
  * for royalty collection on resale.
  *
- * Returns the mint Keypair so the caller can sign (the mint authority will be
- * the author's wallet — transferred to a PDA later via setAccessMint).
+ * The MINT AUTHORITY is set to the backend's public key (NEXT_PUBLIC_MINT_AUTHORITY_PUBKEY)
+ * so the backend can automatically mint access tokens to buyers without requiring
+ * the author to be online. The author still pays the rent for the mint account.
  *
  * @param royaltyBps   Basis points for the transfer fee (0–5000).
- * @param maxFee       Maximum fee in token lamports (use MAX_SAFE_INTEGER or large value to not cap).
  */
 export async function createMintForContent(
   authorPublicKey: PublicKey,
@@ -527,13 +572,19 @@ export async function createMintForContent(
   const mintLen      = getMintLen(extensions);
   const mintLamports = await connection.getMinimumBalanceForRentExemption(mintLen);
 
+  // Use the backend's public key as mint authority so it can auto-mint access
+  // tokens to buyers after purchase without the author's signature.
+  const mintAuthorityStr = process.env.NEXT_PUBLIC_MINT_AUTHORITY_PUBKEY;
+  const mintAuthority    = mintAuthorityStr
+    ? new PublicKey(mintAuthorityStr)
+    : authorPublicKey; // fallback to author (single-player mode)
+
   // Fee rate in basis points (0-10000). royaltyBps is 0-5000 so fits fine.
   const feeBasisPoints   = royaltyBps;
-  // Max fee: set very high to effectively be uncapped in lamport terms
   const maximumFee       = BigInt("18446744073709551615"); // u64::MAX
 
   const tx = new Transaction().add(
-    // 1. Create the mint account
+    // 1. Create the mint account (author pays rent)
     SystemProgram.createAccount({
       fromPubkey:  authorPublicKey,
       newAccountPubkey: mintKeypair.publicKey,
@@ -541,33 +592,52 @@ export async function createMintForContent(
       lamports:    mintLamports,
       programId:   TOKEN_2022_PROGRAM_ID,
     }),
-    // 2. Initialize TransferFeeConfig extension
+    // 2. Initialize TransferFeeConfig extension (author controls fee rate)
     createInitializeTransferFeeConfigInstruction(
       mintKeypair.publicKey,
-      authorPublicKey, // transfer fee config authority (can update fee)
+      authorPublicKey, // transfer fee config authority
       authorPublicKey, // withdraw withheld tokens authority
       feeBasisPoints,
       maximumFee,
       TOKEN_2022_PROGRAM_ID
     ),
-    // 3. Initialize the mint itself (0 decimals — each token is whole)
+    // 3. Initialize the mint itself — backend is the mint authority
     createInitializeMintInstruction(
       mintKeypair.publicKey,
-      0,               // decimals
-      authorPublicKey, // mint authority
-      null,            // freeze authority (none)
+      0,              // decimals (whole tokens only)
+      mintAuthority,  // backend keypair can mint without author signature
+      null,           // freeze authority (none)
       TOKEN_2022_PROGRAM_ID
     )
   );
 
-  const { blockhash } = await connection.getLatestBlockhash();
-  tx.recentBlockhash = blockhash;
   tx.feePayer = authorPublicKey;
+  // Must get blockhash BEFORE partialSign — otherwise the signature covers a wrong message
+  const { blockhash: mintBlockhash, lastValidBlockHeight: mintBLH } =
+    await connection.getLatestBlockhash("confirmed");
+  tx.recentBlockhash = mintBlockhash;
   tx.partialSign(mintKeypair);
 
-  const signature = await sendTransaction(tx, connection);
-  await connection.confirmTransaction(signature, "confirmed");
-
+  let signature: string;
+  try {
+    signature = await sendTransaction(tx, connection);
+  } catch (err: any) {
+    const msg: string = err?.message ?? String(err);
+    if (msg.toLowerCase().includes("failed to fetch") || msg.toLowerCase().includes("network")) {
+      throw new Error(
+        "[create_mint] Wallet cannot send — make sure Phantom is set to Devnet and try again."
+      );
+    }
+    throw new Error(`[create_mint] Send failed: ${msg.slice(0, 200)}`);
+  }
+  try {
+    await connection.confirmTransaction(
+      { signature, blockhash: mintBlockhash, lastValidBlockHeight: mintBLH },
+      "confirmed"
+    );
+  } catch {
+    console.warn("[create_mint] confirm timed out for", signature);
+  }
   return { mintKeypair, signature };
 }
 
@@ -606,13 +676,9 @@ export async function mintAuthorToken(
     )
   );
 
-  const { blockhash } = await connection.getLatestBlockhash();
-  tx.recentBlockhash = blockhash;
   tx.feePayer = authorPublicKey;
 
-  const signature = await sendTransaction(tx, connection);
-  await connection.confirmTransaction(signature, "confirmed");
-
+  const signature = await sendAndConfirm(tx, sendTransaction, connection, "create_author_ata");
   return { ata: ata.toBase58(), signature };
 }
 
@@ -646,12 +712,9 @@ export async function callMintAccessTokenCheckpoint(
   });
 
   const tx = new Transaction().add(ix);
-  const { blockhash } = await connection.getLatestBlockhash();
-  tx.recentBlockhash = blockhash;
   tx.feePayer = buyerPublicKey;
 
-  const signature = await sendTransaction(tx, connection);
-  await connection.confirmTransaction(signature, "confirmed");
+  const signature = await sendAndConfirm(tx, sendTransaction, connection, "mint_access_token");
   return signature;
 }
 
@@ -699,13 +762,9 @@ export async function mintBuyerAccessToken(
     )
   );
 
-  const { blockhash } = await connection.getLatestBlockhash();
-  tx.recentBlockhash = blockhash;
   tx.feePayer = authorPublicKey;
 
-  const signature = await sendTransaction(tx, connection);
-  await connection.confirmTransaction(signature, "confirmed");
-
+  const signature = await sendAndConfirm(tx, sendTransaction, connection, "create_buyer_ata");
   return { ata: ata.toBase58(), signature };
 }
 

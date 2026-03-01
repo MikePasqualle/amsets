@@ -3,25 +3,22 @@
 import { useRef, useState, useEffect } from "react";
 import { useGSAP } from "@gsap/react";
 import gsap from "gsap";
-import { useRouter } from "next/navigation";
 import { useWallet, useConnection } from "@solana/wallet-adapter-react";
 import { DragZone } from "./DragZone";
 import { GlowButton } from "@/components/ui/GlowButton";
 import { NeonBadge } from "@/components/ui/NeonBadge";
 import { useAuthModal } from "@/providers/AuthContext";
-import {
-  computeSHA256,
-  generateSymmetricKey,
-  encryptFile,
-  packEncrypted,
-} from "@/lib/crypto";
-import { encryptKeyForContent } from "@/lib/lit";
-import { encodeBundle, type AmsetsBundleMetadata } from "@/lib/arweave-bundle";
-import { uploadBundleToArweave, uploadPreviewToIPFS } from "@/lib/storage";
+import { computeSHA256 } from "@/lib/crypto";
+// ── Arweave / Lit imports commented out — replaced by Livepeer ──────────────
+// import { generateSymmetricKey, encryptFile, packEncrypted } from "@/lib/crypto";
+// import { encryptKeyForContent } from "@/lib/lit";
+// import { encodeBundle, type AmsetsBundleMetadata } from "@/lib/arweave-bundle";
+// import { uploadBundleToArweave } from "@/lib/storage";
+import { uploadPreviewToIPFS } from "@/lib/storage";
+import * as tus from "tus-js-client";
 import {
   publishOnChain,
   createMintForContent,
-  mintAuthorToken,
   setAccessMint,
   deriveContentRecordPda,
   uuidToBytes32,
@@ -48,6 +45,7 @@ interface UploadData {
   royalty: string;  // royalty percentage on resale (0–50%)
   license: string;
   previewFile: File | null;
+  isPrivate: boolean; // if true — hidden from marketplace, accessible via link + token only
 }
 
 interface PublishStep {
@@ -82,6 +80,7 @@ export function UploadSteps() {
     royalty: "10",
     license: "personal",
     previewFile: null,
+    isPrivate: false,
   });
   const [isProcessing, setIsProcessing] = useState(false);
   const [publishError, setPublishError] = useState<string | null>(null);
@@ -91,13 +90,15 @@ export function UploadSteps() {
   const [deployMode, setDeployMode] = useState<"auto" | "draft">("auto");
   const contentRef = useRef<HTMLDivElement | null>(null);
 
-  const { publicKey, connected, sendTransaction, wallet } = useWallet();
+  // WalletContextState — used for Solana on-chain transactions (publishOnChain, setAccessMint).
+  // Irys/Arweave code is commented out — wallet signing for uploads no longer needed.
+  const walletContext = useWallet();
+  const { publicKey, connected, sendTransaction } = walletContext;
   const { connection } = useConnection();
   const { openAuth } = useAuthModal();
   const { loginWithWallet } = useAuth();
-  const router = useRouter();
 
-  // ─── Redirect to home if no session ────────────────────────────────────────
+  // ─── Session gate — no redirect, show inline connect prompt ────────────────
   // Checks BOTH Wallet Adapter (Phantom/Solflare) and Web3Auth (email/phone/social).
   // Web3Auth session lives in localStorage ("amsets_wallet" + "amsets_token").
   const [mounted, setMounted] = useState(false);
@@ -114,13 +115,8 @@ export function UploadSteps() {
     return () => window.removeEventListener("amsets_session_changed", syncSession);
   }, []);
 
-  useEffect(() => {
-    if (!mounted) return;
-    // Allow access if EITHER Wallet Adapter OR Web3Auth session is active
-    if (!connected && !hasWeb3AuthSession) {
-      router.push("/");
-    }
-  }, [mounted, connected, hasWeb3AuthSession, router]);
+  // Derived: is any session active right now?
+  const hasSession = connected || hasWeb3AuthSession;
 
   // ─── Step transitions ───────────────────────────────────────────────────────
 
@@ -172,20 +168,17 @@ export function UploadSteps() {
     setIsProcessing(true);
 
     const steps: PublishStep[] = [
-      { label: "Encrypting file + building Arweave bundle", status: "pending" },
-      { label: "Uploading preview to IPFS",                 status: "pending" },
-      { label: "Registering content in backend",            status: "pending" },
-      { label: "Registering on Solana blockchain",          status: "pending" },
-      { label: "Creating access token mint (SPL Token-2022)", status: "pending" },
+      { label: "Uploading video",             status: "pending" },
+      { label: "Uploading preview image",     status: "pending" },
+      { label: "Registering content",         status: "pending" },
+      { label: "Publishing on blockchain",    status: "pending" },
+      { label: "Minting access token",        status: "pending" },
     ];
     setPublishSteps(steps);
     goToStep(5);
 
     let token = typeof window !== "undefined" ? localStorage.getItem("amsets_token") : null;
 
-    // If Wallet Adapter is connected but no JWT yet, authenticate now.
-    // This handles the edge case where the user connected Phantom but the
-    // auto-auth in Navbar didn't complete before they started publishing.
     if (!token && connected && publicKey) {
       try {
         await loginWithWallet("wallet_adapter");
@@ -195,82 +188,156 @@ export function UploadSteps() {
       }
     }
 
-    // Wallet provider for Irys WebIrys (Solana).
-    // Priority 1: Wallet Adapter adapter (Phantom, Solflare, etc.) — implements signTransaction/publicKey
-    // Priority 2: window.solana — Phantom legacy injected provider
-    // Priority 3: Web3Auth Solana provider stored after email/phone login
-    // If none found → Arweave upload is skipped and content saved as pending draft.
-    const walletProvider: any =
-      wallet?.adapter ??
-      (window as any)?.solana ??
-      (typeof window !== "undefined" ? (window as any).__amsets_web3auth_provider : null) ??
-      null;
+    // ── Arweave / Lit upload block commented out — replaced by Livepeer ───────
+    // Previously: encrypt file with AES-256-GCM → encrypt key via Lit Protocol
+    // → build AmsetsBundle JSON → upload to Arweave via Irys TUS.
+    // Keep this block for reference; restore by uncommenting if Arweave is needed.
+    //
+    // const key    = await generateSymmetricKey();
+    // const buffer = await data.file.arrayBuffer();
+    // const { ciphertext, iv } = await encryptFile(key, buffer);
+    // const packed = packEncrypted(iv, ciphertext);
+    // const placeholderMint = "11111111111111111111111111111111";
+    // let litBundle: any = null;
+    // try { litBundle = await encryptKeyForContent(key, placeholderMint); } catch { }
+    // const bundle = encodeBundle({ metadata, previewUri: "ipfs://pending",
+    //   encryptedBuffer: packed, litBundle, accessMint: placeholderMint });
+    // const arResult = await uploadBundleToArweave(bundle, solanaWallet, onProgress,
+    //   connection, publicKey);
+    // storageUri = arResult.uri;
+    // ─────────────────────────────────────────────────────────────────────────
 
     try {
-      // ── Step 1: Encrypt file + build AmsetsBundle + upload to Arweave ────
-      steps[0] = { ...steps[0], status: "running" };
+      // ── Step 1: Upload video to Livepeer Studio via TUS ───────────────────
+      steps[0] = { ...steps[0], status: "running", detail: "Requesting upload URL from Livepeer…" };
       setPublishSteps([...steps]);
 
-      const key    = await generateSymmetricKey();
-      const buffer = await data.file.arrayBuffer();
-      const { ciphertext, iv } = await encryptFile(key, buffer);
-      const packed = packEncrypted(iv, ciphertext);
+      let storageUri = `livepeer://pending_${contentHash!.slice(0, 8)}`;
+      let livepeerAssetId: string | null = null;
 
-      // Use "pending" as access mint placeholder — will be updated after set_access_mint
-      const placeholderMint = "11111111111111111111111111111111";
+      try {
+        if (!token) throw new Error("Connect your wallet to upload");
 
-      let storageUri = `ar://pending_${contentHash!.slice(0, 8)}`;
-      let litBundle: any = null;
+        // 1a. Create asset on Livepeer Studio (JWT-gated)
+        const uploadRes = await fetch(`${API_URL}/api/v1/livepeer/request-upload`, {
+          method:  "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+          body:    JSON.stringify({ name: data.title || data.file.name }),
+        });
 
-      if (walletProvider) {
-        try {
-          // Encrypt key via Lit Protocol
-          litBundle = await encryptKeyForContent(key, placeholderMint);
-
-          // Build decentralized bundle
-          const bundleMetadata: AmsetsBundleMetadata = {
-            title:        data.title,
-            description:  data.description || undefined,
-            category:     data.category,
-            mime_type:    data.file.type || "application/octet-stream",
-            content_hash: contentHash!,
-          };
-
-          const bundle = encodeBundle({
-            metadata:        bundleMetadata,
-            previewUri:      `ipfs://pending`,
-            encryptedBuffer: packed,
-            litBundle,
-            accessMint:      placeholderMint,
-          });
-
-          // Upload bundle to Arweave
-          const arResult = await uploadBundleToArweave(bundle, walletProvider);
-          storageUri = arResult.uri;
-
-          steps[0] = {
-            ...steps[0],
-            status: "done",
-            detail: `Bundle: ${arResult.txId.slice(0, 12)}… (${(arResult.size / 1024).toFixed(1)} KB)`,
-          };
-        } catch (arErr: any) {
-          // Arweave upload failed — show the real error so the user knows what happened.
-          // Content is still encrypted in memory; the draft will be saved with a pending URI.
-          const errMsg: string =
-            arErr?.message ?? arErr?.toString() ?? "Unknown Arweave error";
-          steps[0] = {
-            ...steps[0],
-            status: "error",
-            detail: `Arweave upload failed: ${errMsg.slice(0, 100)}${errMsg.length > 100 ? "…" : ""}`,
-          };
-          storageUri = `ar://pending_${contentHash!.slice(0, 8)}`;
+        if (!uploadRes.ok) {
+          const err = await uploadRes.json().catch(() => ({}));
+          throw new Error((err as any).error ?? `Livepeer upload init failed (${uploadRes.status})`);
         }
-      } else {
+
+        const uploadData = await uploadRes.json();
+        const { tusUploadUrl, assetId, playbackId } = uploadData;
+        livepeerAssetId = assetId;
+
+        // 1b. TUS resumable upload directly to Livepeer CDN
+        // Chunk size adapts to file size: larger files use bigger chunks for fewer round-trips.
+        // Max chunk = 50 MB (Livepeer accepts up to 200 MB chunks, 50 MB is a safe, fast sweet spot).
+        const fileSizeBytes = data.file.size;
+        const fileSizeMb    = fileSizeBytes / 1_048_576;
+        const fileSizeGb    = fileSizeMb / 1024;
+        const fileSizeLabel = fileSizeGb >= 1
+          ? `${fileSizeGb.toFixed(2)} GB`
+          : `${fileSizeMb.toFixed(1)} MB`;
+
+        // Adaptive chunk size: 5 MB for files < 500 MB, 20 MB for < 2 GB, 50 MB for larger
+        const chunkSizeMB = fileSizeMb < 500 ? 5 : fileSizeMb < 2048 ? 20 : 50;
+        const chunkSize   = chunkSizeMB * 1024 * 1024;
+
         steps[0] = {
           ...steps[0],
-          status: "skipped",
-          detail: `File encrypted locally (${(packed.byteLength / 1024).toFixed(1)} KB). No compatible Solana wallet detected for Arweave upload — content saved as draft.`,
+          detail: `Uploading video (${fileSizeLabel}) to Livepeer… 0% · chunk: ${chunkSizeMB} MB`,
         };
+        setPublishSteps([...steps]);
+
+        // Use a ref to avoid stale closure captures in onProgress callbacks
+        const currentSteps = steps;
+        let uploadStartTime = Date.now();
+
+        await new Promise<void>((resolve, reject) => {
+          const upload = new tus.Upload(data.file!, {
+            endpoint:    tusUploadUrl,
+            uploadUrl:   tusUploadUrl,
+            // Retry with exponential back-off — safe for resumable uploads
+            retryDelays: [0, 2000, 5000, 10000, 20000],
+            chunkSize,
+            // Keep the connection alive for large uploads (10 GB may take 10+ min)
+            overridePatchMethod: false,
+            metadata: {
+              filename: data.file!.name,
+              filetype: data.file!.type,
+            },
+            onChunkComplete: (_chunkSize, bytesAccepted, _bytesTotal) => {
+              // Reset timer on first chunk so ETA reflects actual upload speed
+              if (bytesAccepted <= chunkSize) uploadStartTime = Date.now();
+            },
+            onProgress: (bytesUploaded, bytesTotal) => {
+              const pct        = (bytesUploaded / bytesTotal) * 100;
+              const pctLabel   = pct.toFixed(1);
+              const elapsed    = (Date.now() - uploadStartTime) / 1000;
+              const speed      = elapsed > 1 ? bytesUploaded / elapsed : 0; // bytes/s
+              const remaining  = speed > 0 ? (bytesTotal - bytesUploaded) / speed : null;
+
+              const speedLabel = speed > 0
+                ? speed > 1_048_576
+                  ? `${(speed / 1_048_576).toFixed(1)} MB/s`
+                  : `${(speed / 1024).toFixed(0)} KB/s`
+                : "";
+
+              const etaLabel = remaining !== null
+                ? remaining > 60
+                  ? `${(remaining / 60).toFixed(0)}m left`
+                  : `${Math.ceil(remaining)}s left`
+                : "";
+
+              const uploadedLabel = bytesUploaded > 1_073_741_824
+                ? `${(bytesUploaded / 1_073_741_824).toFixed(2)} GB`
+                : `${(bytesUploaded / 1_048_576).toFixed(1)} MB`;
+
+              const detail = [
+                `Uploading to Livepeer… ${pctLabel}%`,
+                `${uploadedLabel} / ${fileSizeLabel}`,
+                speedLabel,
+                etaLabel,
+              ].filter(Boolean).join(" · ");
+
+              currentSteps[0] = { ...currentSteps[0], detail };
+              setPublishSteps([...currentSteps]);
+            },
+            onSuccess: () => resolve(),
+            onError:   (err) => reject(err),
+          });
+          upload.start();
+        });
+
+        storageUri = `livepeer://${playbackId}`;
+        currentSteps[0] = {
+          ...currentSteps[0],
+          status: "done",
+          detail: `livepeer://${playbackId.slice(0, 16)}… | ${fileSizeLabel} uploaded · Livepeer is transcoding`,
+        };
+        // Sync back to steps for subsequent operations
+        steps[0] = currentSteps[0];
+      } catch (livepeerErr: any) {
+        const errMsg: string = livepeerErr?.message ?? "Livepeer upload failed";
+        steps[0] = {
+          ...steps[0],
+          status: "error",
+          detail: errMsg.slice(0, 200),
+        };
+        // Video upload failed — save as draft without going on-chain.
+        // A valid Livepeer playback ID is required before blockchain registration.
+        steps[1] = { ...steps[1], status: "skipped", detail: "Skipped — video upload failed" };
+        steps[2] = { ...steps[2], status: "skipped", detail: "Skipped — video upload failed" };
+        steps[3] = { ...steps[3], status: "skipped", detail: "Skipped — fix video upload first, then retry" };
+        steps[4] = { ...steps[4], status: "skipped", detail: "Skipped" };
+        setPublishSteps([...steps]);
+        setIsProcessing(false);
+        return;
       }
       setPublishSteps([...steps]);
 
@@ -325,14 +392,11 @@ export function UploadSteps() {
             total_supply:  supplyVal,
             royalty_bps:   royaltyVal,
             mime_type:     data.file?.type ?? "application/octet-stream",
+            is_private:    data.isPrivate,
           };
 
-          // Include Lit key data only as fallback (for legacy content without Arweave bundle)
-          if (litBundle && storageUri.startsWith("ar://pending_")) {
-            // Bundle upload failed — store keys in backend as fallback
-            regBody.encrypted_key        = litBundle.ciphertext ?? "pending";
-            regBody.lit_conditions_hash  = litBundle.data_to_encrypt_hash ?? "pending";
-          }
+          // Livepeer: no client-side encryption — access is controlled via JWT gating.
+          // Legacy Arweave/Lit fields (encrypted_key, lit_conditions_hash) not needed.
 
           const regRes = await fetch(`${API_URL}/api/v1/content/register`, {
             method: "POST",
@@ -346,18 +410,31 @@ export function UploadSteps() {
             steps[2] = { ...steps[2], status: "done", detail: `ID: ${regData.content_id?.slice(0, 8)}…` };
           } else {
             const body = await regRes.json().catch(() => ({}));
-            // Extract a human-readable message from Zod or API errors
+            // Extract a human-readable message from Zod v3/v4 or API errors
             let errMsg: string;
             if (typeof body.error === "string") {
               errMsg = body.error;
             } else if (body.error?.issues?.length) {
-              // Zod validation error — show the first issue's message
+              // Zod v3: error.issues is an array
               const issue = body.error.issues[0];
               errMsg = `${issue.path?.join(".") ?? "field"}: ${issue.message}`;
+            } else if (typeof body.error?.message === "string") {
+              // Zod v4: error.message is a JSON string of issues array
+              try {
+                const issues = JSON.parse(body.error.message);
+                if (Array.isArray(issues) && issues.length > 0) {
+                  const issue = issues[0];
+                  errMsg = `${Array.isArray(issue.path) && issue.path.length ? issue.path.join(".") : "field"}: ${issue.message}`;
+                } else {
+                  errMsg = body.error.message;
+                }
+              } catch {
+                errMsg = body.error.message;
+              }
             } else if (typeof body.message === "string") {
               errMsg = body.message;
             } else {
-              errMsg = `HTTP ${regRes.status} — check browser console for details`;
+              errMsg = `HTTP ${regRes.status} — check server logs for details`;
               console.error("[register] error body:", body);
             }
             throw new Error(errMsg);
@@ -382,7 +459,7 @@ export function UploadSteps() {
           ...steps[3],
           status: "skipped",
           detail: deployMode === "draft"
-            ? "Saved as Draft — deploy from My Content whenever you're ready"
+            ? "Saved as Draft — deploy from My Works whenever you're ready"
             : "Saved as Draft (registration step failed)",
         };
       } else if (!connected || !publicKey) {
@@ -429,9 +506,6 @@ export function UploadSteps() {
 
             mintAddress = mintKeypair.publicKey.toBase58();
 
-            // Mint 1 author token to the author's wallet
-            await mintAuthorToken(mintKeypair.publicKey, publicKey, sendTransaction, connection);
-
             // Link the mint to the ContentRecord on-chain
             const contentIdBytes   = uuidToBytes32(registeredContentId);
             const contentRecordPda = deriveContentRecordPda(publicKey, contentIdBytes);
@@ -440,7 +514,8 @@ export function UploadSteps() {
             steps[4] = {
               ...steps[4],
               status: "done",
-              detail: `Mint: ${mintAddress.slice(0, 12)}… | Author token minted`,
+              // Backend will mint author token automatically after /publish is called
+              detail: `Mint: ${mintAddress.slice(0, 12)}… | Backend will mint author token`,
             };
           } catch (mintErr: any) {
             // Non-fatal: content is already registered, token can be minted later
@@ -452,16 +527,28 @@ export function UploadSteps() {
           }
           setPublishSteps([...steps]);
 
-          // Notify backend → update status to "active" + store PDA + mint address
-          await fetch(`${API_URL}/api/v1/content/${registeredContentId}/publish`, {
-            method: "PATCH",
-            headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-            body: JSON.stringify({
-              tx_signature: signature,
-              on_chain_pda: pdaAddress,
-              ...(mintAddress ? { mint_address: mintAddress } : {}),
-            }),
-          }).catch(() => null);
+          // Notify backend → update status to "active" + store PDA + mint address.
+          // Wrapped in its own try/catch so a network hiccup here does NOT corrupt
+          // the step-4 status (which already shows "done" at this point).
+          const freshToken = localStorage.getItem("amsets_token") ?? token;
+          try {
+            const patchRes = await fetch(`${API_URL}/api/v1/content/${registeredContentId}/publish`, {
+              method: "PATCH",
+              headers: { "Content-Type": "application/json", Authorization: `Bearer ${freshToken}` },
+              body: JSON.stringify({
+                tx_signature: signature,
+                on_chain_pda: pdaAddress,
+                ...(mintAddress ? { mint_address: mintAddress } : {}),
+              }),
+            });
+            if (!patchRes.ok) {
+              console.error("[publish] backend PATCH failed:", patchRes.status, await patchRes.text().catch(() => ""));
+              // Non-fatal: blockchain is the source of truth; backend auto-sync will pick it up
+            }
+          } catch (patchErr: any) {
+            // Network error on PATCH — non-fatal, blockchain record exists, auto-sync will fix DB
+            console.warn("[publish] PATCH network error (non-fatal):", patchErr?.message);
+          }
         } catch (onChainErr: any) {
           const raw: string = onChainErr?.message ?? "";
           // Determine if this is a "program not deployed" case vs a real error
@@ -492,6 +579,38 @@ export function UploadSteps() {
   };
 
   // ─── Render ─────────────────────────────────────────────────────────────────
+
+  // Show connect-wallet gate before the wizard mounts, and as an overlay when the
+  // wallet disconnects mid-flow (step 1-4). On step 5 (publishing) we don't
+  // interrupt — the publish action will fail gracefully with an error message.
+  if (!mounted) return null;
+
+  if (!hasSession) {
+    return (
+      <div className="flex flex-col items-center gap-6 py-24 text-center">
+        <div className="w-16 h-16 rounded-2xl bg-[#221533] border border-[#3D2F5A] flex items-center justify-center mb-2">
+          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#F7FF88" strokeWidth="1.5">
+            <rect x="2" y="7" width="20" height="14" rx="2" />
+            <path d="M16 11a1 1 0 0 1 0 2 1 1 0 0 1 0-2z" fill="#F7FF88" stroke="none" />
+            <path d="M6 7V5a6 6 0 0 1 12 0v2" />
+          </svg>
+        </div>
+        <div>
+          <p className="text-[#EDE8F5] text-lg font-semibold mb-1">
+            {step > 1 ? "Reconnect to continue publishing" : "Connect your wallet to publish"}
+          </p>
+          <p className="text-[#7A6E8E] text-sm max-w-xs mx-auto">
+            {step > 1
+              ? "Your progress is saved. Reconnect your wallet and you can pick up right where you left off."
+              : "Use email, phone, Google, or your Phantom / Solflare wallet to get started."}
+          </p>
+        </div>
+        <GlowButton variant="primary" size="md" onClick={openAuth}>
+          Connect Wallet
+        </GlowButton>
+      </div>
+    );
+  }
 
   return (
     <>
@@ -543,10 +662,15 @@ export function UploadSteps() {
         {/* Step content */}
         <div ref={contentRef} className="min-h-[320px]">
 
-          {/* ── Step 1: Upload file ── */}
+          {/* ── Step 1: Upload video ── */}
           {step === 1 && (
             <div className="flex flex-col gap-6">
-              <h2 className="text-xl font-semibold text-[#EDE8F5]">Upload your file</h2>
+              <div>
+                <h2 className="text-xl font-semibold text-[#EDE8F5]">Upload your video</h2>
+                <p className="text-[#7A6E8E] text-sm mt-1">
+                  Uploaded via TUS resumable protocol — pauses and resumes automatically if your connection drops. Max 10 GB.
+                </p>
+              </div>
               <DragZone onFile={handleFileSelect} />
               {data.file && (
                 <div className="flex flex-col gap-3">
@@ -554,7 +678,9 @@ export function UploadSteps() {
                     <span className="text-[#81D0B5] text-sm">✓</span>
                     <span className="text-[#EDE8F5] text-sm truncate">{data.file.name}</span>
                     <span className="text-[#7A6E8E] text-xs ml-auto">
-                      {(data.file.size / 1024 / 1024).toFixed(2)} MB
+                      {data.file.size >= 1_073_741_824
+                        ? `${(data.file.size / 1_073_741_824).toFixed(2)} GB`
+                        : `${(data.file.size / 1_048_576).toFixed(1)} MB`}
                     </span>
                   </div>
                   {contentHash && (
@@ -715,6 +841,46 @@ export function UploadSteps() {
                 </div>
               </div>
 
+              {/* ── Privacy mode ─────────────────────────────────────── */}
+              <div className="mt-2">
+                <p className="text-sm text-[#EDE8F5] font-medium mb-2">Visibility</p>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <button
+                    onClick={() => setData((d) => ({ ...d, isPrivate: false }))}
+                    className={`flex flex-col gap-1 p-4 rounded-xl border text-left transition-all ${
+                      !data.isPrivate
+                        ? "border-[#F7FF88] bg-[#F7FF88]/10"
+                        : "border-[#3D2F5A] bg-[#221533] hover:border-[#7A6E8E]"
+                    }`}
+                  >
+                    <div className="flex items-center gap-2">
+                      <span className="text-lg">🌐</span>
+                      <span className={`text-sm font-semibold ${!data.isPrivate ? "text-[#F7FF88]" : "text-[#EDE8F5]"}`}>
+                        Public
+                      </span>
+                    </div>
+                    <p className="text-xs text-[#7A6E8E]">Listed on the marketplace. Anyone can discover and purchase.</p>
+                  </button>
+
+                  <button
+                    onClick={() => setData((d) => ({ ...d, isPrivate: true }))}
+                    className={`flex flex-col gap-1 p-4 rounded-xl border text-left transition-all ${
+                      data.isPrivate
+                        ? "border-[#81D0B5] bg-[#81D0B5]/10"
+                        : "border-[#3D2F5A] bg-[#221533] hover:border-[#7A6E8E]"
+                    }`}
+                  >
+                    <div className="flex items-center gap-2">
+                      <span className="text-lg">🔒</span>
+                      <span className={`text-sm font-semibold ${data.isPrivate ? "text-[#81D0B5]" : "text-[#EDE8F5]"}`}>
+                        Private
+                      </span>
+                    </div>
+                    <p className="text-xs text-[#7A6E8E]">Hidden from marketplace. Share via link. Buyers access via token.</p>
+                  </button>
+                </div>
+              </div>
+
               <div className="flex gap-3">
                 <GlowButton variant="ghost" size="md" onClick={() => goToStep(2)}>← Back</GlowButton>
                 <GlowButton variant="primary" size="md" onClick={() => goToStep(4)}>Continue →</GlowButton>
@@ -729,7 +895,13 @@ export function UploadSteps() {
               <p className="text-[#7A6E8E] text-sm">
                 Public teaser image buyers see before purchasing. Optional but recommended.
               </p>
-              <DragZone onFile={(f) => setData((d) => ({ ...d, previewFile: f }))} maxSizeMB={10} />
+              <DragZone
+                onFile={(f) => setData((d) => ({ ...d, previewFile: f }))}
+                maxSizeMB={10}
+                allowedMimeTypes={["image/png", "image/jpeg", "image/gif", "image/webp"]}
+                label="preview image"
+                subLabel="PNG · JPG · GIF · WebP"
+              />
 
               {/* ── Deploy mode choice ─────────────────────────────── */}
               <div className="flex flex-col gap-2">
@@ -751,7 +923,7 @@ export function UploadSteps() {
                       </span>
                     </div>
                     <p className="text-xs text-[#7A6E8E]">
-                      Register on Solana right now. Requires Phantom or Solflare wallet.
+                      Register on blockchain right now. Requires a Solana wallet (Phantom or Solflare).
                     </p>
                     {deployMode === "auto" && !connected && (
                       <p className="text-xs text-amber-400 mt-1">
@@ -777,7 +949,7 @@ export function UploadSteps() {
                       </span>
                     </div>
                     <p className="text-xs text-[#7A6E8E]">
-                      Save now, deploy on Solana later from My Content.
+                      Save now, deploy on blockchain later from My Works.
                     </p>
                   </button>
                 </div>
@@ -791,7 +963,7 @@ export function UploadSteps() {
                   isLoading={isProcessing}
                   onClick={handlePublish}
                 >
-                  {deployMode === "auto" ? "Encrypt & Deploy →" : "Save as Draft →"}
+                  {deployMode === "auto" ? "Upload & Deploy →" : "Save as Draft →"}
                 </GlowButton>
               </div>
             </div>
@@ -861,48 +1033,52 @@ export function UploadSteps() {
 
                                 <h3 className="text-xl font-bold text-[#F7FF88]">
                                   {tokenDone
-                                    ? "Fully Published! Token Minted 🎉"
+                                    ? "Published! Access token minted 🎉"
                                     : onChainDone
-                                    ? "Published on Solana"
+                                    ? "Published on blockchain"
                                     : savedInDB
                                     ? "Saved as Draft"
-                                    : "Content Encrypted"}
+                                    : "Something went wrong"}
                                 </h3>
 
                                 <p className="text-[#7A6E8E] text-sm max-w-sm text-center">
                                   {tokenDone
-                                    ? "Your content is live on Solana. Author token minted to your wallet. Buyers can now purchase access tokens."
+                                    ? `Your content is live${data.isPrivate ? " (private — share via link)" : " on the marketplace"}. Author token minted to your wallet.`
                                     : onChainDone
-                                    ? "Registered on Solana devnet. Token mint step pending — you can retry from My Content."
+                                    ? "Registered on blockchain. Access token creation pending — retry from My Works."
                                     : savedInDB
-                                    ? "Saved as draft. Complete on-chain registration to publish to the marketplace."
-                                    : "Your file is encrypted locally. Sign in and try again."}
+                                    ? "Saved as draft. Complete on-chain registration to publish."
+                                    : "Sign in with your wallet and try again."}
                                 </p>
 
                                 <div className="flex gap-2 flex-wrap justify-center">
-                                  <NeonBadge variant="primary">AES-256-GCM encrypted ✓</NeonBadge>
+                                  {publishSteps[0]?.status === "done" && (
+                                    <NeonBadge variant="primary">Video uploaded ✓</NeonBadge>
+                                  )}
                                   {publishSteps[1]?.status === "done" && (
-                                    <NeonBadge variant="secondary">Preview on IPFS ✓</NeonBadge>
+                                    <NeonBadge variant="secondary">Preview uploaded ✓</NeonBadge>
                                   )}
                                   {savedInDB && (
-                                    <NeonBadge variant="primary">Saved in AMSETS ✓</NeonBadge>
+                                    <NeonBadge variant="primary">Registered ✓</NeonBadge>
                                   )}
                                   {onChainDone && (
                                     <NeonBadge variant="primary">On-chain ✓</NeonBadge>
                                   )}
                                   {tokenDone && (
-                                    <NeonBadge variant="secondary">SPL Token-2022 ✓</NeonBadge>
+                                    <NeonBadge variant="secondary">Access token ✓</NeonBadge>
+                                  )}
+                                  {data.isPrivate && savedInDB && (
+                                    <NeonBadge variant="muted">🔒 Private</NeonBadge>
                                   )}
                                 </div>
 
                                 {savedInDB && !onChainDone && (
                                   <div className="w-full max-w-sm bg-amber-400/10 border border-amber-400/30 rounded-xl p-4 text-left">
                                     <p className="text-amber-300 text-xs font-semibold mb-1">
-                                      ⚠ On-chain deployment pending
+                                      ⚠ Blockchain deployment pending
                                     </p>
                                     <p className="text-[#7A6E8E] text-xs">
-                                      Smart contract must be deployed to Solana devnet first.
-                                      Your draft is saved — complete deployment from My Content when ready.
+                                      Your draft is saved. Connect a Solana wallet and complete deployment from My Works.
                                     </p>
                                   </div>
                                 )}
@@ -911,12 +1087,12 @@ export function UploadSteps() {
                           })()}
 
                           <div className="flex gap-3 flex-wrap justify-center">
-                            <GlowButton variant="primary" size="md" onClick={() => window.location.href = "/"}>
+                            <GlowButton variant="primary" size="md" onClick={() => window.location.href = "/marketplace"}>
                               View Marketplace
                             </GlowButton>
                             {publishSteps[2]?.status === "done" && (
-                              <GlowButton variant="ghost" size="md" onClick={() => window.location.href = "/my/library"}>
-                                My Content
+                              <GlowButton variant="ghost" size="md" onClick={() => window.location.href = "/my/content"}>
+                                My Works
                               </GlowButton>
                             )}
                           </div>

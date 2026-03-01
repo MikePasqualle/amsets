@@ -73,14 +73,29 @@ export interface EncodeBundleParams {
 }
 
 /**
+ * Safe base64 encoding that works for arbitrarily large Uint8Arrays.
+ *
+ * The naive `btoa(String.fromCharCode(...bytes))` spreads all bytes as
+ * individual function arguments, which causes "Maximum call stack size exceeded"
+ * for files larger than ~250 KB. This implementation processes the data
+ * in 8 KB chunks to avoid that limit.
+ */
+function toBase64Safe(bytes: Uint8Array): string {
+  const CHUNK = 8192;
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(binary);
+}
+
+/**
  * Assembles an AmsetsBundle from the provided components.
- * The encrypted payload is base64-encoded for JSON storage.
+ * The encrypted payload is base64-encoded for JSON storage using a
+ * chunk-safe encoder (handles files of any size without stack overflow).
  */
 export function encodeBundle(params: EncodeBundleParams): AmsetsBundle {
   const { iv, ciphertext } = unpackEncrypted(params.encryptedBuffer);
-
-  const toBase64 = (bytes: Uint8Array): string =>
-    btoa(String.fromCharCode(...bytes));
 
   return {
     version: "1.0",
@@ -88,8 +103,8 @@ export function encodeBundle(params: EncodeBundleParams): AmsetsBundle {
     metadata: params.metadata,
     preview_uri: params.previewUri,
     encrypted_payload: {
-      ciphertext_b64: toBase64(new Uint8Array(ciphertext)),
-      iv_b64:         toBase64(iv),
+      ciphertext_b64: toBase64Safe(new Uint8Array(ciphertext)),
+      iv_b64:         toBase64Safe(iv),
     },
     lit_bundle: params.litBundle,
     access: {

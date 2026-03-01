@@ -1,333 +1,316 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+/**
+ * ContentViewer — native HLS video player with JWT-gated access.
+ *
+ * Flow:
+ *   storageUri = "livepeer://{playbackId}"
+ *   → backend issues signed JWT + returns assetStatus
+ *   → HLS.js (Chrome/Firefox) or native <video> (Safari) plays the stream
+ *
+ * Legacy Arweave/Lit code is commented out at the bottom for rollback reference.
+ */
+
+// ── Arweave/Lit imports commented out — restore if switching back ─────────────
+// import { decryptFile } from "@/lib/crypto";
+// import { decryptKeyFromBundle, decryptKeyForContent, buildAuthSig } from "@/lib/lit";
+// import { decodeBundle, bundleToEncryptedBuffer } from "@/lib/arweave-bundle";
+// import { downloadFromArweave, unpackEncrypted } from "@/lib/storage";
+// import bs58 from "bs58";
+// ──────────────────────────────────────────────────────────────────────────────
+
+import { useEffect, useRef, useState, useCallback } from "react";
 import { NeonBadge } from "@/components/ui/NeonBadge";
 import { GlowButton } from "@/components/ui/GlowButton";
-import { decryptFile } from "@/lib/crypto";
-import { decryptKeyFromBundle, decryptKeyForContent, buildAuthSig } from "@/lib/lit";
-import { decodeBundle, bundleToEncryptedBuffer } from "@/lib/arweave-bundle";
-import { downloadFromArweave, unpackEncrypted } from "@/lib/storage";
-import { useWallet } from "@solana/wallet-adapter-react";
 import { useSession } from "@/hooks/useSession";
-import bs58 from "bs58";
+
+const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3001";
+const LIVEPEER_CDN = "https://livepeercdn.studio/hls";
 
 interface ContentViewerProps {
-  contentId: string;
+  contentId:  string;
   storageUri: string;
   accessMint: string;
-  mimeType: string;
-  /** Legacy: encryptedKey from PostgreSQL (Phase 0 content) */
-  encryptedKey?: string;
-  /** Legacy: litConditionsHash from PostgreSQL (Phase 0 content) */
-  litConditionsHash?: string;
-  /** When true, bypass Lit Protocol checks — author always has access */
+  mimeType:   string;
+  encryptedKey?:       string;
+  litConditionsHash?:  string;
   isAuthor?: boolean;
 }
 
-type ViewerState = "idle" | "loading" | "ready" | "error";
+type AssetStatus = "ready" | "transcoding" | "not_found";
+type ViewerState = "idle" | "loading" | "ready" | "transcoding" | "not_found" | "error";
 
-/**
- * Secure content viewer with two decryption paths:
- *
- * Path A (Phase 1+ — decentralized):
- *   ar://txId → fetch AmsetsBundle JSON → extract lit_bundle + encrypted_payload
- *   → Lit Protocol decryption (no backend involved)
- *
- * Path B (Legacy — Phase 0):
- *   encryptedKey + litConditionsHash passed as props (came from PostgreSQL)
- *   → Lit Protocol decryption with legacy authSig
- *
- * Supported output formats:
- *   - Video: HTML5 <video> with blob: URL
- *   - Image: <img> with watermark overlay
- *   - PDF: PDF.js canvas rendering
- *   - Audio: <audio> player
- */
 export function ContentViewer({
   contentId,
   storageUri,
-  accessMint,
-  mimeType,
-  encryptedKey,
-  litConditionsHash,
   isAuthor = false,
 }: ContentViewerProps) {
-  const { publicKey, signMessage } = useWallet();
-  const { isAuthenticated, walletAddress } = useSession();
+  const { token } = useSession();
+  const videoRef = useRef<HTMLVideoElement>(null);
 
-  // All hooks must come before any conditional return (Rules of Hooks)
-  const [state, setState] = useState<ViewerState>("idle");
-  const [error, setError] = useState<string | null>(null);
-  const [blobUrl, setBlobUrl] = useState<string | null>(null);
-  const [decryptStatus, setDecryptStatus] = useState<string>("Initialising…");
-  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const [viewerState, setViewerState] = useState<ViewerState>("idle");
+  const [statusText,  setStatusText]  = useState("");
+  const [errorText,   setErrorText]   = useState("");
+  const [hlsUrl,      setHlsUrl]      = useState<string | null>(null);
+  const [playbackId,  setPlaybackId]  = useState<string | null>(null);
 
-  useEffect(() => {
-    return () => {
-      if (blobUrl) URL.revokeObjectURL(blobUrl);
-    };
-  }, [blobUrl]);
+  const isLivepeer = storageUri.startsWith("livepeer://");
+  const isArweave  = storageUri.startsWith("ar://");
 
-  // ─── Pending upload guard (after all hooks) ────────────────────────────────
-  if (storageUri.startsWith("ar://pending_")) {
-    return (
-      <div className="flex flex-col items-center gap-4 py-12 text-center">
-        <div className="text-4xl opacity-40">⏳</div>
-        <p className="text-[#EDE8F5] font-semibold">Content upload pending</p>
-        <p className="text-[#7A6E8E] text-sm max-w-sm">
-          The author has not yet uploaded the encrypted file to Arweave.
-          The content preview and metadata are available, but the full file will
-          appear here once the upload completes.
-        </p>
-      </div>
-    );
-  }
-
-  const handleDecryptAndView = async () => {
-    if (!isAuthenticated || !walletAddress) {
-      setError("Please connect your wallet first");
+  const fetchPlaybackAccess = useCallback(async () => {
+    const authToken = token ?? localStorage.getItem("amsets_token");
+    if (!authToken) {
+      setErrorText("Connect your wallet to view this content.");
+      setViewerState("error");
       return;
     }
 
-    // Authors always have access — but still need a wallet for the actual decryption signature.
-    // Lit Protocol is bypassed only if we store content without encryption (not yet implemented).
-    // For now, all content — including author's — goes through Lit but with relaxed conditions.
-    if (!publicKey || !signMessage) {
-      setError(
-        "Content decryption requires a Phantom or Solflare wallet for signing. " +
-        "Please connect via the wallet button."
-      );
-      return;
-    }
-
-    setState("loading");
-    setError(null);
+    setViewerState("loading");
+    setStatusText("Verifying access…");
 
     try {
-      let symmetricKey: CryptoKey;
-      let encryptedBuffer: ArrayBuffer;
+      const res = await fetch(
+        `${API_URL}/api/v1/livepeer/playback-jwt/${contentId}`,
+        { headers: { Authorization: `Bearer ${authToken}` } }
+      );
 
-      // ─── Attempt Path A: read from Arweave bundle ─────────────────────────
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error((data as any).error ?? `Access denied (${res.status})`);
+      }
 
-      setDecryptStatus("Fetching content bundle from Arweave…");
-      const bundle = await decodeBundle(storageUri);
+      const data = await res.json();
+      const pid         = data.playbackId as string;
+      const jwt         = data.jwt as string | null;
+      const assetStatus = (data.assetStatus as AssetStatus) ?? "ready";
 
-      if (bundle) {
-        setDecryptStatus("Decrypting access key via Lit Protocol…");
-        symmetricKey = await decryptKeyFromBundle({
-          litBundle: bundle.lit_bundle,
-          accessMint: bundle.access.access_mint !== "pending"
-            ? bundle.access.access_mint
-            : accessMint,
-          walletAddress: publicKey.toBase58(),
-          signMessage,
-        });
+      setPlaybackId(pid);
 
-        setDecryptStatus("Assembling encrypted payload…");
-        encryptedBuffer = bundleToEncryptedBuffer(bundle);
-
-      } else if (encryptedKey && litConditionsHash) {
-        // ─── Path B: legacy PostgreSQL-sourced keys ──────────────────────────
-
-        setDecryptStatus("Using legacy Lit key data…");
-
-        const timestamp  = Date.now();
-        const message    = `AMSETS view: ${contentId} at ${timestamp}`;
-        const msgBytes   = new TextEncoder().encode(message);
-        const sigBytes   = await signMessage(msgBytes);
-        const signature  = bs58.encode(sigBytes);
-        const authSig    = buildAuthSig(publicKey.toBase58(), signature, message);
-
-        setDecryptStatus("Decrypting access key via Lit Protocol…");
-        symmetricKey = await decryptKeyForContent(
-          encryptedKey,
-          litConditionsHash,
-          authSig,
-          accessMint
-        );
-
-        setDecryptStatus("Downloading encrypted file from Arweave…");
-        const packed = await downloadFromArweave(storageUri);
-        const { iv, ciphertext } = unpackEncrypted(packed);
-        encryptedBuffer = (await Promise.resolve(null))!;
-
-        setDecryptStatus("Decrypting content…");
-        const { iv: iv2, ciphertext: ct2 } = unpackEncrypted(packed);
-        const decrypted = await decryptFile(symmetricKey, iv2, ct2);
-        const blob = new Blob([decrypted], { type: mimeType });
-        setBlobUrl(URL.createObjectURL(blob));
-        setState("ready");
+      if (assetStatus === "not_found") {
+        setViewerState("not_found");
         return;
-
-      } else {
-        throw new Error(
-          "Content is not yet available for viewing. " +
-          "The Arweave upload may still be propagating (this can take a few minutes)."
-        );
       }
 
-      // ─── Decrypt file from bundle ─────────────────────────────────────────
+      if (assetStatus === "transcoding") {
+        setViewerState("transcoding");
+        return;
+      }
 
-      setDecryptStatus("Decrypting content…");
-      const { iv, ciphertext } = unpackEncrypted(encryptedBuffer);
-      const decrypted = await decryptFile(symmetricKey, iv, ciphertext);
+      const url = jwt
+        ? `${LIVEPEER_CDN}/${pid}/index.m3u8?jwt=${jwt}`
+        : `${LIVEPEER_CDN}/${pid}/index.m3u8`;
 
-      const blob = new Blob([decrypted], { type: mimeType });
-      setBlobUrl(URL.createObjectURL(blob));
-      setState("ready");
-
+      setHlsUrl(url);
+      setViewerState("ready");
+      setStatusText("");
     } catch (err: any) {
-      setState("error");
-      const msg: string = err.message ?? "Failed to decrypt content";
-      if (msg.toLowerCase().includes("not_authorized") || msg.toLowerCase().includes("access denied")) {
-        setError(
-          "Access denied — you must hold the access token to view this content. " +
-          "Purchase the content first."
-        );
-      } else {
-        setError(msg);
-      }
+      setErrorText(err?.message ?? "Failed to load content");
+      setViewerState("error");
     }
-  };
+  }, [contentId, token]);
 
-  if (state === "idle") {
+  // Auto-load for Livepeer content when user has a token
+  useEffect(() => {
+    if (!isLivepeer) return;
+    const authToken = token ?? (typeof window !== "undefined" ? localStorage.getItem("amsets_token") : null);
+    if (authToken) fetchPlaybackAccess();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [storageUri, token]);
+
+  // Set up HLS.js player when hlsUrl is ready
+  useEffect(() => {
+    if (!hlsUrl || !videoRef.current) return;
+    const video = videoRef.current;
+
+    // Safari supports HLS natively
+    if (video.canPlayType("application/vnd.apple.mpegurl")) {
+      video.src = hlsUrl;
+      return;
+    }
+
+    // Chrome / Firefox — use HLS.js
+    let Hls: any;
+    let hls: any;
+
+    import("hls.js").then((mod) => {
+      Hls = mod.default;
+      if (!Hls.isSupported()) return;
+      hls = new Hls({ enableWorker: false });
+      hls.loadSource(hlsUrl);
+      hls.attachMedia(video);
+      hls.on(Hls.Events.ERROR, (_: any, data: any) => {
+        if (data.fatal) {
+          console.error("[ContentViewer] HLS fatal error:", data.type, data.details);
+        }
+      });
+    });
+
+    return () => {
+      hls?.destroy();
+    };
+  }, [hlsUrl]);
+
+  // Auto-refresh transcoding state every 15 seconds
+  useEffect(() => {
+    if (viewerState !== "transcoding") return;
+    const interval = setInterval(() => {
+      fetchPlaybackAccess();
+    }, 15_000);
+    return () => clearInterval(interval);
+  }, [viewerState, fetchPlaybackAccess]);
+
+  // ─── Render: Livepeer content ─────────────────────────────────────────────
+
+  if (isLivepeer) {
+    if (viewerState === "idle") {
+      return (
+        <div className="w-full rounded-xl overflow-hidden bg-[#0D0A14] border border-[#3D2F5A] flex flex-col items-center justify-center gap-4 py-16 px-6 text-center">
+          <div className="w-14 h-14 rounded-2xl bg-[#221533] border border-[#3D2F5A] flex items-center justify-center">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#F7FF88" strokeWidth="1.5">
+              <rect x="2" y="7" width="20" height="14" rx="2"/>
+              <path d="M16 11a1 1 0 0 1 0 2 1 1 0 0 1 0-2z" fill="#F7FF88" stroke="none"/>
+              <path d="M6 7V5a6 6 0 0 1 12 0v2"/>
+            </svg>
+          </div>
+          <p className="text-[#EDE8F5] font-semibold">Connect wallet to watch</p>
+          <p className="text-[#7A6E8E] text-sm max-w-xs">
+            Your access token grants you viewing rights. Connect to verify.
+          </p>
+          <GlowButton variant="primary" size="sm" onClick={fetchPlaybackAccess}>
+            Verify Access
+          </GlowButton>
+        </div>
+      );
+    }
+
+    if (viewerState === "loading") {
+      return (
+        <div className="w-full aspect-video rounded-xl bg-[#0D0A14] border border-[#3D2F5A] flex flex-col items-center justify-center gap-3">
+          <span className="inline-block w-8 h-8 border-2 border-[#F7FF88] border-t-transparent rounded-full animate-spin" />
+          <p className="text-[#7A6E8E] text-sm">{statusText}</p>
+        </div>
+      );
+    }
+
+    if (viewerState === "transcoding") {
+      return (
+        <div className="w-full aspect-video rounded-xl bg-[#0D0A14] border border-[#3D2F5A] flex flex-col items-center justify-center gap-4 px-6 text-center">
+          <span className="inline-block w-10 h-10 border-2 border-[#F7FF88] border-t-transparent rounded-full animate-spin" />
+          <p className="text-[#EDE8F5] font-semibold">Processing video…</p>
+          <p className="text-[#7A6E8E] text-sm max-w-xs">
+            Your video is being processed. This usually takes 1–5 minutes. The player will refresh automatically.
+          </p>
+          <GlowButton variant="ghost" size="sm" onClick={fetchPlaybackAccess}>
+            Check Now
+          </GlowButton>
+        </div>
+      );
+    }
+
+    if (viewerState === "not_found") {
+      return (
+        <div className="w-full aspect-video rounded-xl bg-[#0D0A14] border border-amber-500/30 flex flex-col items-center justify-center gap-4 px-6 text-center">
+          <span className="text-4xl">⚠️</span>
+          <p className="text-amber-400 font-semibold">Video not available</p>
+          <p className="text-[#7A6E8E] text-sm max-w-xs">
+            This video could not be found in the storage network. The content may need to be re-uploaded.
+          </p>
+          {isAuthor && (
+            <NeonBadge variant="muted">Re-upload in My Works to fix</NeonBadge>
+          )}
+        </div>
+      );
+    }
+
+    if (viewerState === "error") {
+      return (
+        <div className="w-full aspect-video rounded-xl bg-[#0D0A14] border border-red-500/30 flex flex-col items-center justify-center gap-4 px-6 text-center">
+          <span className="text-4xl">🔒</span>
+          <p className="text-red-400 text-sm font-medium">{errorText}</p>
+          <GlowButton variant="ghost" size="sm" onClick={() => { setViewerState("idle"); setErrorText(""); }}>
+            Try Again
+          </GlowButton>
+        </div>
+      );
+    }
+
+    if (viewerState === "ready" && hlsUrl) {
+      return (
+        <div className="w-full rounded-xl overflow-hidden bg-black border border-[#3D2F5A]">
+          <div className="relative w-full aspect-video bg-black">
+            <video
+              ref={videoRef}
+              className="w-full h-full"
+              controls
+              playsInline
+              preload="metadata"
+              style={{ display: "block" }}
+            />
+          </div>
+          {playbackId && (
+            <div className="px-4 py-2 bg-[#0D0A14] flex items-center gap-2 border-t border-[#3D2F5A]">
+              <div className="w-1.5 h-1.5 rounded-full bg-[#00EB88] animate-pulse" />
+              <span className="text-[#7A6E8E] text-xs">Decentralized video network</span>
+              <NeonBadge variant="muted" className="ml-auto text-[10px]">
+                {playbackId.slice(0, 12)}…
+              </NeonBadge>
+            </div>
+          )}
+        </div>
+      );
+    }
+
     return (
-      <div className="flex flex-col items-center gap-4 py-12 text-center">
-        <NeonBadge variant="secondary">Access Verified ✓</NeonBadge>
-        <p className="text-[#7A6E8E] text-sm">
-          Click to decrypt and view your content securely in-browser.
-          Your decryption key is verified on Lit Protocol — the content never leaves your browser unencrypted.
+      <div className="w-full aspect-video rounded-xl bg-[#0D0A14] border border-[#3D2F5A] flex items-center justify-center">
+        <span className="inline-block w-8 h-8 border-2 border-[#F7FF88] border-t-transparent rounded-full animate-spin" />
+      </div>
+    );
+  }
+
+  // ─── Legacy Arweave content (ar://) ─────────────────────────────────────────
+
+  if (isArweave) {
+    return (
+      <div className="w-full rounded-xl overflow-hidden bg-[#0D0A14] border border-[#3D2F5A] flex flex-col items-center justify-center gap-4 py-16 px-6 text-center">
+        <span className="text-4xl">📦</span>
+        <p className="text-[#EDE8F5] font-semibold">Legacy Content</p>
+        <p className="text-[#7A6E8E] text-sm max-w-xs">
+          This content was stored on an older network. Contact support if you need access.
         </p>
-        <GlowButton variant="primary" size="md" onClick={handleDecryptAndView}>
-          Decrypt & View
-        </GlowButton>
+        <NeonBadge variant="muted">{storageUri.slice(0, 30)}…</NeonBadge>
       </div>
     );
   }
 
-  if (state === "loading") {
-    return (
-      <div className="flex flex-col items-center gap-4 py-12">
-        <div className="w-10 h-10 border-2 border-[#F7FF88] border-t-transparent rounded-full animate-spin" />
-        <p className="text-[#7A6E8E] text-sm">{decryptStatus}</p>
-      </div>
-    );
-  }
-
-  if (state === "error") {
-    return (
-      <div className="flex flex-col items-center gap-4 py-12 text-center">
-        <p className="text-red-400 text-sm max-w-sm">{error}</p>
-        <GlowButton variant="ghost" size="sm" onClick={() => setState("idle")}>
-          Try Again
-        </GlowButton>
-      </div>
-    );
-  }
-
+  // ─── Unknown storage type ──────────────────────────────────────────────────
   return (
-    <div className="w-full rounded-xl overflow-hidden bg-[#0D0A14] border border-[#3D2F5A]">
-      {mimeType.startsWith("video/") && blobUrl && (
-        <video
-          ref={videoRef}
-          src={blobUrl}
-          controls
-          controlsList="nodownload nofullscreen"
-          disablePictureInPicture
-          className="w-full max-h-[70vh]"
-          onContextMenu={(e) => e.preventDefault()}
-        />
-      )}
-
-      {mimeType.startsWith("image/") && blobUrl && (
-        <div className="relative">
-          {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img
-            src={blobUrl}
-            alt="Decrypted content"
-            className="w-full object-contain max-h-[80vh]"
-            onContextMenu={(e) => e.preventDefault()}
-            draggable={false}
-          />
-          <div className="absolute inset-0 pointer-events-none flex items-center justify-center opacity-10">
-            <span className="text-white text-4xl font-black rotate-[-30deg] select-none">
-              AMSETS
-            </span>
-          </div>
-        </div>
-      )}
-
-      {mimeType === "application/pdf" && blobUrl && (
-        <PdfViewer url={blobUrl} />
-      )}
-
-      {mimeType.startsWith("audio/") && blobUrl && (
-        <div className="p-6">
-          <audio
-            src={blobUrl}
-            controls
-            controlsList="nodownload"
-            className="w-full"
-          />
-        </div>
-      )}
-
-      {!mimeType.startsWith("video/") &&
-        !mimeType.startsWith("image/") &&
-        mimeType !== "application/pdf" &&
-        !mimeType.startsWith("audio/") && (
-          <div className="p-8 text-center">
-            <p className="text-[#7A6E8E]">Content decrypted successfully.</p>
-            <p className="text-[#3D2F5A] text-sm mt-2">File type: {mimeType}</p>
-          </div>
-        )}
+    <div className="w-full rounded-xl bg-[#0D0A14] border border-[#3D2F5A] flex items-center justify-center py-12">
+      <p className="text-[#7A6E8E] text-sm">Unsupported content format.</p>
     </div>
   );
 }
 
-function PdfViewer({ url }: { url: string }) {
-  const containerRef = useRef<HTMLDivElement | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    async function renderPdf() {
-      try {
-        const pdfjsLib = await import("pdfjs-dist");
-        pdfjsLib.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.js";
-
-        const pdf      = await pdfjsLib.getDocument(url).promise;
-        const container = containerRef.current;
-        if (!container || cancelled) return;
-
-        for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
-          if (cancelled) break;
-          const page     = await pdf.getPage(pageNum);
-          const viewport = page.getViewport({ scale: 1.5 });
-
-          const canvas  = document.createElement("canvas");
-          canvas.width  = viewport.width;
-          canvas.height = viewport.height;
-          canvas.style.width        = "100%";
-          canvas.style.marginBottom = "8px";
-          canvas.oncontextmenu = (e) => e.preventDefault();
-
-          const ctx = canvas.getContext("2d");
-          if (!ctx) continue;
-
-          await page.render({ canvasContext: ctx as any, viewport, canvas }).promise;
-          container.appendChild(canvas);
-        }
-      } catch (err) {
-        console.error("PDF render failed:", err);
-      }
-    }
-
-    renderPdf();
-    return () => { cancelled = true; };
-  }, [url]);
-
-  return (
-    <div ref={containerRef} className="overflow-y-auto max-h-[80vh] p-4 bg-[#0D0A14]" />
-  );
-}
+// ── LEGACY ARWEAVE / LIT DECRYPTION BLOCK (commented out) ────────────────────
+//
+// To restore Arweave support:
+// async function handleDecrypt() {
+//   setViewerState("loading");
+//   try {
+//     if (storageUri.startsWith("ar://") && !storageUri.includes("pending")) {
+//       const txId = storageUri.replace("ar://", "");
+//       setStatusText("Fetching bundle from Arweave…");
+//       const raw = await downloadFromArweave(txId);
+//       const bundle = decodeBundle(raw);
+//       setStatusText("Decrypting via Lit Protocol…");
+//       const key = await decryptKeyFromBundle(bundle.lit_bundle, bundle.access_mint);
+//       const { iv, ciphertext } = unpackEncrypted(bundleToEncryptedBuffer(bundle));
+//       const decrypted = await decryptFile(key, ciphertext, iv);
+//       const blob = new Blob([decrypted], { type: bundle.metadata.mime_type });
+//       const url = URL.createObjectURL(blob);
+//     }
+//   } catch (err: any) {
+//     setErrorText(err?.message ?? "Decryption failed");
+//     setViewerState("error");
+//   }
+// }
+// ─────────────────────────────────────────────────────────────────────────────
