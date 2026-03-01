@@ -58,6 +58,7 @@ interface ContentItem {
   litConditionsHash?: string;
   totalSupply?: number;
   royaltyBps?: number;
+  minRoyaltyLamports?: number;
   mintAddress?: string;
   authorNftMint?: string;
   soldCount?: number;
@@ -287,6 +288,7 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
         const { pdaAddress } = await createListingOnChain(
           listingUuid,
           content.contentId,
+          content.onChainPda ?? "",   // ContentRecord PDA — for on-chain min_royalty validation
           BigInt(priceLamports),
           mintAddress,
           publicKey,
@@ -855,6 +857,30 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
               ) : (
                 <div className="flex flex-col gap-3 p-4 rounded-xl bg-[#221533] border border-[#3D2F5A]">
                   <p className="text-[#EDE8F5] text-sm font-semibold">Set your listing price</p>
+
+                  {/* Min royalty info — shown when author set a floor */}
+                  {(() => {
+                    const minRoyLam  = content.minRoyaltyLamports ?? 0;
+                    const royBps     = content.royaltyBps ?? 0;
+                    if (minRoyLam <= 0) return null;
+                    const minPriceLam = royBps > 0
+                      ? Math.ceil(minRoyLam * 10_000 / royBps)
+                      : minRoyLam + Math.ceil(minRoyLam * 250 / 9_750);
+                    const minPriceSOL = minPriceLam / 1e9;
+                    return (
+                      <div className="flex flex-col gap-0.5 p-2 rounded-lg bg-[#0D0A14] border border-[#81D0B5]/30 text-xs">
+                        <div className="flex justify-between">
+                          <span className="text-[#7A6E8E]">Author min. royalty</span>
+                          <span className="text-[#81D0B5] font-mono">◎ {(minRoyLam / 1e9).toFixed(4)} SOL</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-[#7A6E8E]">Min. listing price</span>
+                          <span className="text-[#F7FF88] font-mono">◎ {minPriceSOL.toFixed(4)} SOL</span>
+                        </div>
+                      </div>
+                    );
+                  })()}
+
                   <div className="flex items-center gap-2">
                     <input
                       type="number"
@@ -867,44 +893,97 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
                     />
                     <span className="text-[#7A6E8E] text-sm">SOL</span>
                   </div>
-                  {/* Live seller payout preview */}
+
+                  {/* Live seller payout preview with max(%, min) royalty */}
                   {parseFloat(sellPriceSOL) > 0 && (
                     <div className="flex flex-col gap-1 p-2 rounded-lg bg-[#0D0A14] border border-[#3D2F5A] text-xs">
-                      <p className="text-[#7A6E8E] font-semibold mb-0.5">You will receive:</p>
+                      <p className="text-[#7A6E8E] font-semibold mb-0.5">Payout breakdown:</p>
                       {(() => {
-                        const p = parseFloat(sellPriceSOL) || 0;
-                        const royBps = content.royaltyBps ?? 0;
+                        const p          = parseFloat(sellPriceSOL) || 0;
+                        const royBps     = content.royaltyBps ?? 0;
+                        const minRoyLam  = content.minRoyaltyLamports ?? 0;
                         const platformCut = p * 0.025;
-                        const royaltyCut  = p * (royBps / 10000);
-                        const sellerGets  = p - platformCut - royaltyCut;
+                        const pctRoyalty  = p * (royBps / 10000);
+                        const minRoySOL   = minRoyLam / 1e9;
+                        const actualRoy   = Math.max(pctRoyalty, minRoySOL);
+                        const sellerGets  = p - platformCut - actualRoy;
+                        const usingFloor  = minRoySOL > 0 && minRoySOL > pctRoyalty;
+                        const royLabel    = royBps > 0
+                          ? (usingFloor
+                              ? `Author royalty (floor ◎${minRoySOL.toFixed(3)})`
+                              : `Author royalty (${(royBps / 100).toFixed(1)}%)`)
+                          : "Author royalty";
                         return (
                           <>
                             <div className="flex justify-between">
                               <span className="text-[#7A6E8E]">Platform fee (2.5%)</span>
                               <span className="text-[#F7FF88] font-mono">− ◎ {fmtSOL(platformCut)}</span>
                             </div>
-                            {royBps > 0 && (
+                            {(royBps > 0 || minRoyLam > 0) && (
                               <div className="flex justify-between">
-                                <span className="text-[#7A6E8E]">Author royalty ({(royBps / 100).toFixed(1)}%)</span>
-                                <span className="text-[#81D0B5] font-mono">− ◎ {fmtSOL(royaltyCut)}</span>
+                                <span className="text-[#7A6E8E]">{royLabel}</span>
+                                <span className="text-[#81D0B5] font-mono">− ◎ {fmtSOL(actualRoy)}</span>
                               </div>
                             )}
                             <div className="flex justify-between border-t border-[#3D2F5A] pt-1 mt-1">
                               <span className="text-[#EDE8F5] font-semibold">You get</span>
-                              <span className="text-[#F7FF88] font-mono font-bold">◎ {fmtSOL(sellerGets)}</span>
+                              <span className={`font-mono font-bold ${sellerGets < 0 ? "text-red-400" : "text-[#F7FF88]"}`}>
+                                ◎ {fmtSOL(Math.max(0, sellerGets))}
+                              </span>
                             </div>
                           </>
                         );
                       })()}
                     </div>
                   )}
+
+                  {/* Warning when price is below the minimum */}
+                  {(() => {
+                    const minRoyLam  = content.minRoyaltyLamports ?? 0;
+                    const royBps     = content.royaltyBps ?? 0;
+                    const pSOL       = parseFloat(sellPriceSOL) || 0;
+                    if (minRoyLam <= 0 || pSOL <= 0) return null;
+                    const minPriceLam = royBps > 0
+                      ? Math.ceil(minRoyLam * 10_000 / royBps)
+                      : minRoyLam + Math.ceil(minRoyLam * 250 / 9_750);
+                    const minPriceSOL = minPriceLam / 1e9;
+                    if (pSOL >= minPriceSOL) return null;
+                    return (
+                      <p className="text-amber-400 text-xs">
+                        ⚠ Price too low — the author requires a minimum royalty of ◎{(minRoyLam / 1e9).toFixed(4)} SOL.
+                        Minimum listing price: ◎{minPriceSOL.toFixed(4)} SOL.
+                      </p>
+                    );
+                  })()}
+
                   {listingError && (
                     <p className="text-red-400 text-xs">{listingError}</p>
                   )}
                   <div className="flex gap-2">
-                    <GlowButton variant="primary" size="sm" isLoading={isListing} onClick={handleCreateListing}>
-                      Confirm Listing
-                    </GlowButton>
+                    {(() => {
+                      const minRoyLam  = content.minRoyaltyLamports ?? 0;
+                      const royBps     = content.royaltyBps ?? 0;
+                      const pSOL       = parseFloat(sellPriceSOL) || 0;
+                      let priceTooLow  = false;
+                      if (minRoyLam > 0 && pSOL > 0) {
+                        const minPriceLam = royBps > 0
+                          ? Math.ceil(minRoyLam * 10_000 / royBps)
+                          : minRoyLam + Math.ceil(minRoyLam * 250 / 9_750);
+                        priceTooLow = pSOL < minPriceLam / 1e9;
+                      }
+                      return (
+                        <GlowButton
+                          variant="primary"
+                          size="sm"
+                          isLoading={isListing}
+                          onClick={handleCreateListing}
+                          disabled={priceTooLow}
+                          title={priceTooLow ? "Raise your price to meet the author's minimum royalty" : undefined}
+                        >
+                          Confirm Listing
+                        </GlowButton>
+                      );
+                    })()}
                     <GlowButton variant="ghost" size="sm" onClick={() => setShowSellForm(false)}>
                       Cancel
                     </GlowButton>
@@ -931,12 +1010,14 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
                 // "cannot buy own listing" errors when the JWT and Phantom wallet diverged.
                 const isOwnListing = !!(myAuthWallet &&
                   listing.sellerWallet.toLowerCase() === myAuthWallet);
-                const priceSOLNum   = Number(listing.price_lamports) / LAMPORTS_PER_SOL;
-                const priceDisplay  = priceSOLNum.toFixed(3);
-                const royaltyBpNum  = content.royaltyBps ?? 0;
+                const priceSOLNum    = Number(listing.price_lamports) / LAMPORTS_PER_SOL;
+                const priceDisplay   = priceSOLNum.toFixed(3);
+                const royaltyBpNum   = content.royaltyBps ?? 0;
+                const minRoyLamNum   = content.minRoyaltyLamports ?? 0;
                 const platformFeeAmt = priceSOLNum * 0.025;
-                const royaltyAmt    = priceSOLNum * (royaltyBpNum / 10000);
-                const sellerAmt     = priceSOLNum - platformFeeAmt - royaltyAmt;
+                const pctRoyaltyAmt  = priceSOLNum * (royaltyBpNum / 10000);
+                const royaltyAmt     = Math.max(pctRoyaltyAmt, minRoyLamNum / 1e9);
+                const sellerAmt      = priceSOLNum - platformFeeAmt - royaltyAmt;
                 return (
                   <div
                     key={listing.id}
@@ -955,10 +1036,12 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
                         <span className="text-[#7A6E8E]">Seller receives</span>
                         <span className="text-[#EDE8F5] font-mono">◎ {sellerAmt.toFixed(4)}</span>
                       </div>
-                      {royaltyBpNum > 0 && (
+                      {(royaltyBpNum > 0 || minRoyLamNum > 0) && (
                         <div className="flex justify-between">
                           <span className="text-[#7A6E8E]">
-                            Royalty ({(royaltyBpNum / 100).toFixed(1)}%) →{" "}
+                            {minRoyLamNum > 0 && royaltyAmt > pctRoyaltyAmt
+                              ? `Royalty (floor ◎${(minRoyLamNum / 1e9).toFixed(3)}) →`
+                              : `Royalty (${(royaltyBpNum / 100).toFixed(1)}%) →`}{" "}
                             {royaltyHolder
                               ? <span className="font-mono">{royaltyHolder.slice(0, 6)}…</span>
                               : "NFT holder"}

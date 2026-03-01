@@ -41,8 +41,9 @@ interface UploadData {
   description: string;
   category: string;
   price: string;
-  supply: string;   // number of access tokens for sale (max supply)
-  royalty: string;  // royalty percentage on resale (0–50%)
+  supply: string;         // number of access tokens for sale (max supply)
+  royalty: string;        // royalty percentage on resale (0–50%)
+  minRoyaltySol: string;  // absolute minimum royalty per secondary sale in SOL (0 = no floor)
   license: string;
   previewFile: File | null;
   isPrivate: boolean; // if true — hidden from marketplace, accessible via link + token only
@@ -78,6 +79,7 @@ export function UploadSteps() {
     price: "0.1",
     supply: "100",
     royalty: "10",
+    minRoyaltySol: "0",
     license: "personal",
     previewFile: null,
     isPrivate: false,
@@ -264,12 +266,23 @@ export function UploadSteps() {
 
         await new Promise<void>((resolve, reject) => {
           const upload = new tus.Upload(data.file!, {
-            endpoint:    tusUploadUrl,
-            uploadUrl:   tusUploadUrl,
+            // Livepeer's tusEndpoint is a TUS Creation Extension endpoint —
+            // POST to it creates the upload session (returns 201 + Location header),
+            // then tus-js-client PATCHes chunks to the Location URL.
+            // Do NOT use `uploadUrl` — that would send HEAD first which returns 404
+            // on a fresh session and triggers "unable to resume upload" error.
+            endpoint: tusUploadUrl,
+            // Disable fingerprint URL caching — Livepeer pre-signed URLs expire
+            // and we always want a fresh session per publish attempt.
+            urlStorage: {
+              findUploadsByFingerprint: async () => [],
+              addUpload: async () => "",
+              removeUpload: async () => {},
+              listAllUploads: async () => [],
+            } as any,
             // Retry with exponential back-off — safe for resumable uploads
-            retryDelays: [0, 2000, 5000, 10000, 20000],
+            retryDelays: [0, 3000, 8000, 20000],
             chunkSize,
-            // Keep the connection alive for large uploads (10 GB may take 10+ min)
             overridePatchMethod: false,
             metadata: {
               filename: data.file!.name,
@@ -480,10 +493,11 @@ export function UploadSteps() {
               contentHash: contentHash!,
               storageUri,
               previewCid,
-              priceSol:    data.price,
-              license:     data.license,
-              totalSupply: parseInt(data.supply) || 100,
-              royaltyBps:  Math.round(parseFloat(data.royalty || "10") * 100),
+              priceSol:             data.price,
+              license:              data.license,
+              totalSupply:          parseInt(data.supply) || 100,
+              royaltyBps:           Math.round(parseFloat(data.royalty || "10") * 100),
+              minRoyaltyLamports:   BigInt(Math.round(parseFloat(data.minRoyaltySol || "0") * 1e9)),
             },
             publicKey,
             sendTransaction,
@@ -881,6 +895,29 @@ export function UploadSteps() {
                     You earn this % automatically each time a buyer resells their token.
                   </p>
                 </div>
+              </div>
+
+              {/* Min. Royalty SOL — absolute floor enforced on-chain */}
+              <div className="flex flex-col gap-1.5">
+                <label className="text-sm text-[#7A6E8E]">
+                  Min. Royalty (SOL)
+                  <span className="ml-1 text-[#3D2F5A] text-xs">(absolute floor per resale)</span>
+                </label>
+                <div className="relative">
+                  <span className="absolute left-4 top-1/2 -translate-y-1/2 text-[#F7FF88] font-bold">◎</span>
+                  <input
+                    type="number"
+                    min="0"
+                    step="0.001"
+                    value={data.minRoyaltySol}
+                    onChange={(e) => setData((d) => ({ ...d, minRoyaltySol: e.target.value }))}
+                    className="w-full bg-[#221533] border border-[#3D2F5A] rounded-lg pl-10 pr-4 py-3 text-[#EDE8F5] outline-none focus:border-[#F7FF88] transition-colors"
+                  />
+                </div>
+                <p className="text-xs text-[#7A6E8E]">
+                  Even if {data.royalty || "10"}% is less than this amount, you always receive at least ◎{parseFloat(data.minRoyaltySol || "0").toFixed(3)} SOL per resale.
+                  Set to 0 to use percentage only. Enforced on-chain — sellers cannot list below this floor.
+                </p>
               </div>
 
               <div className="flex flex-col gap-1.5">

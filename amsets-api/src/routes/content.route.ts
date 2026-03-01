@@ -16,6 +16,7 @@ import {
   resolveAuthorNftHolder,
 } from "../services/mint.service";
 import { v4 as uuidv4 } from "uuid";
+import { fetchContentRecord } from "../services/helius.service";
 
 const solanaConnection = new Connection(
   `https://devnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY}`,
@@ -77,6 +78,9 @@ const registerSchema = z.object({
   // Phase 2: Token system fields
   total_supply: z.number().int().min(1).default(1),
   royalty_bps: z.number().int().min(0).max(5000).default(1000),
+  // Absolute minimum royalty per secondary sale in lamports (0 = percentage-only).
+  // Stored for reference; the authoritative value lives in ContentRecord on Solana.
+  min_royalty_lamports: z.coerce.number().int().min(0).default(0),
   mime_type: z.string().optional(),
   // Privacy: if true, content is hidden from public marketplace (author + link-share only)
   is_private: z.boolean().default(false),
@@ -84,10 +88,13 @@ const registerSchema = z.object({
 
 contentRouter.post(
   "/register",
+  async (c, next) => {
+    if (!extractWallet(c.req.header("Authorization"))) return c.json({ error: "Unauthorized" }, 401);
+    await next();
+  },
   zValidator("json", registerSchema),
   async (c) => {
-    const wallet = extractWallet(c.req.header("Authorization"));
-    if (!wallet) return c.json({ error: "Unauthorized" }, 401);
+    const wallet = extractWallet(c.req.header("Authorization"))!;
 
   const body = c.req.valid("json");
   const contentId = uuidv4().replace(/-/g, "");
@@ -140,6 +147,8 @@ contentRouter.post(
         base_price: body.base_price,
         payment_token: body.payment_token,
         license: body.license,
+        // Passed through so the frontend can include it in the on-chain register_content call.
+        min_royalty_lamports: body.min_royalty_lamports,
       },
     });
   }
@@ -283,7 +292,34 @@ contentRouter.get("/:id", async (c) => {
   if (!item) return c.json({ error: "Content not found" }, 404);
 
   const serialized = serializeContent(item as Record<string, unknown>);
-  await cacheSet(cacheKey, serialized, 600);
+
+  // Enrich with on-chain data for fields that are authoritative on-chain.
+  // minRoyaltyLamports lives only in the ContentRecord PDA, not in DB.
+  const pda = (item as any).onChainPda;
+  if (pda && pda !== "pending") {
+    try {
+      const onChain = await fetchContentRecord(pda);
+      if (onChain) {
+        // Old-format PDAs (registered with older contract) return base_price=0 when
+        // parsed with the new layout (author_nft_mint field was inserted before base_price).
+        // Detect this case and fall back entirely to DB for those fields.
+        const isOldLayout = onChain.basePrice === 0n;
+
+        (serialized as any).royaltyBps      = (!isOldLayout && onChain.royaltyBps > 0)  ? onChain.royaltyBps  : ((item as any).royaltyBps  ?? 1000);
+        (serialized as any).totalSupply     = (!isOldLayout && onChain.totalSupply > 0)  ? onChain.totalSupply  : ((item as any).totalSupply  ?? 1);
+        (serialized as any).availableSupply = (!isOldLayout && onChain.availableSupply >= 0) ? onChain.availableSupply : ((item as any).totalSupply ?? 1);
+        // authorNftMint: trust on-chain only for new-format PDAs; always fallback to DB for old
+        (serialized as any).authorNftMint   = (!isOldLayout && onChain.authorNftMint && onChain.authorNftMint !== "pending")
+                                                ? onChain.authorNftMint
+                                                : ((item as any).authorNftMint ?? undefined);
+        (serialized as any).minRoyaltyLamports = isOldLayout ? 0 : Number(onChain.minRoyaltyLamports);
+      }
+    } catch {
+      // Non-fatal — serve DB data without on-chain enrichment
+    }
+  }
+
+  await cacheSet(cacheKey, serialized, 60); // shorter TTL so on-chain changes propagate quickly
   return c.json(serialized);
 });
 
@@ -342,11 +378,14 @@ const confirmSchema = z.object({
 
 contentRouter.post(
   "/:id/confirm",
+  async (c, next) => {
+    if (!extractWallet(c.req.header("Authorization"))) return c.json({ error: "Unauthorized" }, 401);
+    await next();
+  },
   zValidator("json", confirmSchema),
   async (c) => {
     const contentId = c.req.param("id");
-    const wallet = extractWallet(c.req.header("Authorization"));
-    if (!wallet) return c.json({ error: "Unauthorized" }, 401);
+    const wallet = extractWallet(c.req.header("Authorization"))!;
 
     const { tx_signature, access_mint, on_chain_pda } = c.req.valid("json");
 
@@ -428,6 +467,26 @@ contentRouter.post("/:id/create-mint", async (c) => {
   const existingMint = row.mintAddress ?? row.accessMint;
   if (existingMint && existingMint !== "pending") {
     return c.json({ success: true, mint_address: existingMint, created: false });
+  }
+
+  // Pre-flight: check that the mint authority has enough SOL (~0.002 SOL per mint)
+  try {
+    const mintAuthorityPubkey = process.env.MINT_AUTHORITY_PUBKEY;
+    if (mintAuthorityPubkey) {
+      const { PublicKey: SolPubkey } = await import("@solana/web3.js");
+      const balance = await solanaConnection.getBalance(new SolPubkey(mintAuthorityPubkey));
+      const MIN_BALANCE = 2_000_000; // 0.002 SOL
+      if (balance < MIN_BALANCE) {
+        console.error(`[create-mint] mint authority balance too low: ${balance} lamports`);
+        return c.json({
+          error: `Mint authority has insufficient SOL (${(balance / 1e9).toFixed(4)} SOL). ` +
+                 `Please contact the platform admin to top up the minting wallet.`,
+        }, 503);
+      }
+    }
+  } catch (balanceErr: any) {
+    console.warn("[create-mint] balance check failed:", balanceErr?.message);
+    // Non-fatal — proceed and let the actual mint attempt fail with a clear error
   }
 
   try {

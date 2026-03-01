@@ -19,7 +19,7 @@ import { eq, ilike, and, desc, inArray } from "drizzle-orm";
 import { db } from "../db/index";
 import { content } from "../db/schema";
 import { cacheGet, cacheSet } from "../db/redis";
-import { fetchAllContentRecords } from "../services/helius.service";
+import { fetchAllContentRecords, readRegistryState } from "../services/helius.service";
 
 const marketplaceRouter = new Hono();
 
@@ -165,7 +165,10 @@ interface EnrichedRecord {
   status: string;
   isActive: boolean;
   totalSupply?: number;
+  availableSupply?: number;
   royaltyBps?: number;
+  minRoyaltyLamports?: number;
+  authorNftMint?: string;
   soldCount?: number;
   mimeType?: string | null;
   createdAt?: Date;
@@ -189,13 +192,15 @@ async function enrichWithDbMetadata(
       tags:        content.tags,
       previewUri:  content.previewUri,
       mintAddress: content.mintAddress,
-      totalSupply: content.totalSupply,
-      royaltyBps:  content.royaltyBps,
-      soldCount:   content.soldCount,
-      mimeType:    content.mimeType,
-      createdAt:   content.createdAt,
-      status:      content.status,
-      onChainPda:  content.onChainPda,
+      basePrice:     content.basePrice,
+      totalSupply:   content.totalSupply,
+      royaltyBps:    content.royaltyBps,
+      soldCount:     content.soldCount,
+      mimeType:      content.mimeType,
+      createdAt:     content.createdAt,
+      status:        content.status,
+      onChainPda:    content.onChainPda,
+      authorNftMint: content.authorNftMint,
     })
     .from(content)
     .where(inArray(content.contentId, onChainIds));
@@ -238,9 +243,17 @@ async function enrichWithDbMetadata(
       const normalizedId = onChain.contentId.slice(0, 32);
       const dbRow = dbMap.get(normalizedId);
 
+      // If no DB record exists, this PDA is orphaned (deleted from DB but still on-chain).
+      // Skip it — the marketplace only shows content that has backend metadata.
+      if (!dbRow) return null;
+
       // If the DB record explicitly marks it draft AND it's not being auto-synced,
       // keep it out of the public marketplace. Only the author sees drafts.
-      if (dbRow && dbRow.status === "draft") return null;
+      if (dbRow.status === "draft") return null;
+
+      // Old-format PDAs (created before author_nft_mint field was added) return basePrice=0
+      // when parsed with the new Borsh layout. Fall back to DB for those fields.
+      const isOldLayout = onChain.basePrice === 0n;
 
       return {
         contentId:    normalizedId,
@@ -251,7 +264,7 @@ async function enrichWithDbMetadata(
         tags:         dbRow?.tags         ?? [],
         previewUri:   dbRow?.previewUri   ?? onChain.previewUri,
         authorWallet: onChain.primaryAuthor,
-        basePrice:    String(onChain.basePrice),
+        basePrice:    isOldLayout ? String(dbRow?.basePrice ?? "0") : String(onChain.basePrice),
         paymentToken: onChain.paymentToken,
         license:      onChain.license,
         accessMint:   onChain.accessMint,
@@ -260,8 +273,15 @@ async function enrichWithDbMetadata(
         storageUri:   onChain.storageUri,
         status:       "active",
         isActive:     true,
-        totalSupply:  dbRow?.totalSupply  ?? undefined,
-        royaltyBps:   dbRow?.royaltyBps   ?? undefined,
+        // Prefer on-chain data for supply/royalty/min-royalty; fall back to DB for old-layout PDAs
+        totalSupply:        (!isOldLayout && onChain.totalSupply > 0)      ? onChain.totalSupply     : (dbRow?.totalSupply  ?? undefined),
+        availableSupply:    (!isOldLayout && onChain.availableSupply >= 0) ? onChain.availableSupply : undefined,
+        royaltyBps:         (!isOldLayout && onChain.royaltyBps > 0)       ? onChain.royaltyBps      : (dbRow?.royaltyBps   ?? undefined),
+        minRoyaltyLamports: isOldLayout ? 0 : Number(onChain.minRoyaltyLamports),
+        // authorNftMint: trust on-chain only for new-format PDAs
+        authorNftMint:      (!isOldLayout && onChain.authorNftMint && onChain.authorNftMint !== "pending")
+                              ? onChain.authorNftMint
+                              : (dbRow?.authorNftMint ?? undefined),
         soldCount:    dbRow?.soldCount    ?? 0,
         mimeType:     dbRow?.mimeType     ?? null,
         createdAt:    dbRow?.createdAt,
@@ -269,5 +289,54 @@ async function enrichWithDbMetadata(
     })
     .filter((r): r is NonNullable<typeof r> => r !== null) as EnrichedRecord[];
 }
+
+/**
+ * GET /api/v1/marketplace/stats
+ *
+ * Returns real-time aggregated statistics from the RegistryState PDA on Solana.
+ * Falls back to DB counts if the PDA is not yet initialized.
+ */
+marketplaceRouter.get("/stats", async (c) => {
+  const cacheKey = "marketplace:stats";
+  const cached = await cacheGet<Record<string, unknown>>(cacheKey);
+  if (cached) return c.json(cached);
+
+  try {
+    // Try to read from the on-chain RegistryState PDA first
+    const onChain = await readRegistryState();
+
+    if (onChain) {
+      const stats = {
+        source:             "chain",
+        totalContent:       Number(onChain.totalContent),
+        totalPurchases:     Number(onChain.totalPurchases),
+        totalSecondarySales: Number(onChain.totalSecondarySales),
+        totalSolVolumeLamports: String(onChain.totalSolVolume),
+        totalSolVolumeSol:  (Number(onChain.totalSolVolume) / 1e9).toFixed(4),
+      };
+      await cacheSet(cacheKey, stats, 30); // 30s TTL for stats
+      return c.json(stats);
+    }
+  } catch (err) {
+    console.error("[marketplace/stats] chain read failed:", err);
+  }
+
+  // Fallback: count from DB
+  const rows = await db
+    .select({ contentId: content.contentId })
+    .from(content)
+    .where(eq(content.status, "active"));
+
+  const stats = {
+    source:             "db",
+    totalContent:       rows.length,
+    totalPurchases:     0,
+    totalSecondarySales: 0,
+    totalSolVolumeLamports: "0",
+    totalSolVolumeSol:  "0.0000",
+  };
+  await cacheSet(cacheKey, stats, 30);
+  return c.json(stats);
+});
 
 export { marketplaceRouter };

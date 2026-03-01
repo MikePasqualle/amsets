@@ -41,18 +41,31 @@ export function HeroSection() {
 
   const isAuthenticated = connected || hasWeb3AuthSession;
 
-  // Real-time stats from the marketplace API
-  const [stats, setStats] = useState({ works: 0, creators: 0 });
+  // Real-time stats from the on-chain RegistryState PDA (via /api/v1/marketplace/stats)
+  const [stats, setStats] = useState({ works: 0, purchases: 0, solVolume: "0" });
   useEffect(() => {
     async function fetchStats() {
       try {
-        const res = await fetch(`${API_URL}/api/v1/marketplace?limit=50`);
+        // Primary: on-chain RegistryState aggregated stats
+        const statsRes = await fetch(`${API_URL}/api/v1/marketplace/stats`);
+        if (statsRes.ok) {
+          const data = await statsRes.json();
+          setStats({
+            works:     data.totalContent     ?? 0,
+            purchases: data.totalPurchases   ?? 0,
+            solVolume: data.totalSolVolumeSol ?? "0",
+          });
+          return;
+        }
+      } catch {
+        // fall through to marketplace fallback
+      }
+      try {
+        // Fallback: count from marketplace listing
+        const res = await fetch(`${API_URL}/api/v1/marketplace?limit=1`);
         if (!res.ok) return;
         const data = await res.json();
-        const items: Array<{ authorWallet: string }> = data.items ?? [];
-        const works   = data.total ?? items.length;
-        const creators = new Set(items.map((i) => i.authorWallet)).size;
-        setStats({ works, creators });
+        setStats({ works: data.total ?? 0, purchases: 0, solVolume: "0" });
       } catch {
         // Non-fatal — keep defaults
       }
@@ -159,12 +172,12 @@ export function HeroSection() {
             </Link>
           </div>
 
-          {/* Stats row — fetched from on-chain marketplace data */}
+          {/* Stats row — pulled from RegistryState PDA on-chain */}
           <div className="flex gap-8 mt-10 pt-10 border-t border-[#3D2F5A] text-center">
             {[
               { label: "Works Registered", value: stats.works > 0 ? String(stats.works) : "—" },
-              { label: "Creators", value: stats.creators > 0 ? String(stats.creators) : "—" },
-              { label: "Solana TPS", value: "65k+" },
+              { label: "Total Purchases",  value: stats.purchases > 0 ? String(stats.purchases) : "—" },
+              { label: "SOL Volume",       value: parseFloat(stats.solVolume) > 0 ? `${stats.solVolume} SOL` : "—" },
             ].map((stat) => (
               <div key={stat.label} className="flex flex-col gap-1">
                 <span className="text-2xl font-bold text-[#F7FF88]">{stat.value}</span>

@@ -134,6 +134,10 @@ const EXECUTE_SALE_DISCRIMINATOR = new Uint8Array([
   37, 74, 217, 157, 79, 49, 35, 6,
 ]);
 
+const INITIALIZE_REGISTRY_DISCRIMINATOR = new Uint8Array([
+  189, 181, 20, 17, 174, 57, 249, 59,
+]);
+
 // ─── Encoding helpers ────────────────────────────────────────────────────────
 
 /** UUID string (with or without hyphens) → zero-padded 32-byte array */
@@ -247,6 +251,83 @@ export function deriveFeeVaultPda(): PublicKey {
   return pda;
 }
 
+/**
+ * Derives the singleton RegistryState PDA.
+ * Seeds: [b"registry"]
+ * This PDA tracks global aggregated stats: total content, purchases, secondary sales, SOL volume.
+ */
+export function deriveRegistryStatePda(): PublicKey {
+  const [pda] = PublicKey.findProgramAddressSync(
+    [Buffer.from("registry")],
+    AMSETS_PROGRAM_ID
+  );
+  return pda;
+}
+
+export interface RegistryStateData {
+  totalContent: bigint;
+  totalPurchases: bigint;
+  totalSecondarySales: bigint;
+  totalSolVolume: bigint;
+}
+
+/**
+ * Reads and deserializes the RegistryState PDA directly from the blockchain.
+ * Returns null if the PDA is not yet initialized.
+ *
+ * Borsh layout (after 8-byte discriminator):
+ *   total_content[8] | total_purchases[8] | total_secondary_sales[8]
+ *   | total_sol_volume[8] | bump[1]
+ */
+export async function readRegistryState(
+  connection: Connection
+): Promise<RegistryStateData | null> {
+  try {
+    const pda  = deriveRegistryStatePda();
+    const info = await connection.getAccountInfo(pda);
+    if (!info || info.data.length < 8 + 32) return null;
+
+    const data = info.data;
+    let off = 8; // skip discriminator
+    const totalContent         = data.readBigUInt64LE(off); off += 8;
+    const totalPurchases       = data.readBigUInt64LE(off); off += 8;
+    const totalSecondarySales  = data.readBigUInt64LE(off); off += 8;
+    const totalSolVolume       = data.readBigUInt64LE(off);
+
+    return { totalContent, totalPurchases, totalSecondarySales, totalSolVolume };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Sends the `initialize_registry` instruction to create the RegistryState PDA.
+ * Should be called once after deploying the program.
+ * Safe to call only once — Anchor `init` prevents re-initialization.
+ */
+export async function initializeRegistry(
+  payerPublicKey: PublicKey,
+  sendTransaction: (tx: Transaction, conn: Connection) => Promise<string>,
+  connection: Connection
+): Promise<string> {
+  const registryPda = deriveRegistryStatePda();
+
+  const ix = new TransactionInstruction({
+    programId: AMSETS_PROGRAM_ID,
+    keys: [
+      { pubkey: payerPublicKey, isSigner: true,  isWritable: true  },
+      { pubkey: registryPda,    isSigner: false, isWritable: true  },
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+    ],
+    data: Buffer.from(INITIALIZE_REGISTRY_DISCRIMINATOR),
+  });
+
+  const tx = new Transaction().add(ix);
+  tx.feePayer = payerPublicKey;
+
+  return await sendAndConfirm(tx, sendTransaction, connection, "initialize_registry");
+}
+
 // ─── On-chain state queries ───────────────────────────────────────────────────
 
 /**
@@ -303,29 +384,37 @@ export async function readAccessMintFromChain(
 // ─── Instruction builders ─────────────────────────────────────────────────────
 
 export interface RegisterContentArgs {
-  contentId:    Uint8Array;   // 32 bytes (from UUID)
-  contentHash:  Uint8Array;   // 32 bytes (SHA-256)
-  storageUri:   string;       // "ar://{txId}" or "ar://pending_{id}"
-  previewUri:   string;       // "ipfs://{cid}"
-  basePrice:    bigint;       // lamports, must be > 0
-  paymentToken: 0 | 1;       // 0 = SOL, 1 = USDC
-  license:      0 | 1 | 2 | 3; // Personal / Commercial / Derivative / Unlimited
-  totalSupply:  number;       // max tokens for sale (default 1)
-  royaltyBps:   number;       // royalty in basis points (0–5000, default 1000 = 10%)
+  contentId:           Uint8Array;   // 32 bytes (from UUID)
+  contentHash:         Uint8Array;   // 32 bytes (SHA-256)
+  storageUri:          string;       // "ar://{txId}" or "ar://pending_{id}"
+  previewUri:          string;       // "ipfs://{cid}"
+  basePrice:           bigint;       // lamports, must be > 0
+  paymentToken:        0 | 1;       // 0 = SOL, 1 = USDC
+  license:             0 | 1 | 2 | 3; // Personal / Commercial / Derivative / Unlimited
+  totalSupply:         number;       // max tokens for sale (default 1)
+  royaltyBps:          number;       // royalty in basis points (0–5000, default 1000 = 10%)
+  minRoyaltyLamports:  bigint;       // absolute royalty floor per secondary sale; 0 = %-only
 }
 
 /**
  * Builds the complete Borsh-serialized instruction data for `register_content`.
+ *
+ * Borsh layout:
+ *   discriminator(8) | content_id(32) | content_hash(32)
+ *   | storage_uri(4+n) | preview_uri(4+m)
+ *   | base_price(8) | payment_token(1) | license(1)
+ *   | total_supply(4) | royalty_bps(2) | min_royalty_lamports(8)
  */
 export function buildRegisterContentData(args: RegisterContentArgs): Uint8Array {
-  const storageBytes  = encodeString(args.storageUri);
-  const previewBytes  = encodeString(args.previewUri);
-  const priceBytes    = encodeU64(args.basePrice);
-  const supplyBytes   = encodeU32(args.totalSupply);
-  const royaltyBytes  = encodeU16(args.royaltyBps);
+  const storageBytes     = encodeString(args.storageUri);
+  const previewBytes     = encodeString(args.previewUri);
+  const priceBytes       = encodeU64(args.basePrice);
+  const supplyBytes      = encodeU32(args.totalSupply);
+  const royaltyBytes     = encodeU16(args.royaltyBps);
+  const minRoyaltyBytes  = encodeU64(args.minRoyaltyLamports);
 
   const total =
-    8 + 32 + 32 + storageBytes.length + previewBytes.length + 8 + 1 + 1 + 4 + 2;
+    8 + 32 + 32 + storageBytes.length + previewBytes.length + 8 + 1 + 1 + 4 + 2 + 8;
   const result = new Uint8Array(total);
   let offset = 0;
 
@@ -338,7 +427,8 @@ export function buildRegisterContentData(args: RegisterContentArgs): Uint8Array 
   result[offset] = args.paymentToken;          offset += 1;
   result[offset] = args.license;               offset += 1;
   result.set(supplyBytes, offset);             offset += 4;
-  result.set(royaltyBytes, offset);
+  result.set(royaltyBytes, offset);            offset += 2;
+  result.set(minRoyaltyBytes, offset);
 
   return result;
 }
@@ -378,6 +468,11 @@ export interface PublishOnChainParams {
   totalSupply?: number;
   /** Royalty in basis points, 0–5000 (default 1000 = 10%) */
   royaltyBps?: number;
+  /**
+   * Absolute minimum royalty the author must receive per secondary sale, in lamports.
+   * 0 means percentage-only (no floor). Enforced on-chain at listing time.
+   */
+  minRoyaltyLamports?: bigint;
 }
 
 export interface PublishOnChainResult {
@@ -419,22 +514,26 @@ export async function publishOnChain(
   );
 
   const ixData = buildRegisterContentData({
-    contentId:    contentIdBytes,
-    contentHash:  contentHashBytes,
-    storageUri:   params.storageUri,
-    previewUri:   `ipfs://${params.previewCid}`,
+    contentId:           contentIdBytes,
+    contentHash:         contentHashBytes,
+    storageUri:          params.storageUri,
+    previewUri:          `ipfs://${params.previewCid}`,
     basePrice,
-    paymentToken: 0,
-    license:      licenseToEnum(params.license) as 0 | 1 | 2 | 3,
-    totalSupply:  params.totalSupply ?? 1,
-    royaltyBps:   params.royaltyBps ?? 1000,
+    paymentToken:        0,
+    license:             licenseToEnum(params.license) as 0 | 1 | 2 | 3,
+    totalSupply:         params.totalSupply ?? 1,
+    royaltyBps:          params.royaltyBps ?? 1000,
+    minRoyaltyLamports:  params.minRoyaltyLamports ?? 0n,
   });
+
+  const registryPda = deriveRegistryStatePda();
 
   const ix = new TransactionInstruction({
     programId: AMSETS_PROGRAM_ID,
     keys: [
-      { pubkey: authorPublicKey,         isSigner: true,  isWritable: true },
-      { pubkey: pda,                     isSigner: false, isWritable: true },
+      { pubkey: authorPublicKey,         isSigner: true,  isWritable: true  },
+      { pubkey: pda,                     isSigner: false, isWritable: true  },
+      { pubkey: registryPda,             isSigner: false, isWritable: true  }, // RegistryState
       { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
     ],
     data: Buffer.from(ixData),
@@ -479,16 +578,18 @@ export async function purchaseAccess(
   const feeVaultPda         = deriveFeeVaultPda();
   const receiptPda          = deriveAccessReceiptPda(contentRecordPda, buyerPublicKey);
 
-  const ixData = buildPurchaseAccessSolData();
+  const ixData      = buildPurchaseAccessSolData();
+  const registryPda = deriveRegistryStatePda();
 
   const ix = new TransactionInstruction({
     programId: AMSETS_PROGRAM_ID,
     keys: [
-      { pubkey: buyerPublicKey,       isSigner: true,  isWritable: true  },
-      { pubkey: contentRecordPda,     isSigner: false, isWritable: true  },
-      { pubkey: receiptPda,           isSigner: false, isWritable: true  },
-      { pubkey: royaltyRecipientKey,  isSigner: false, isWritable: true  }, // NEW: current NFT holder
-      { pubkey: feeVaultPda,          isSigner: false, isWritable: true  },
+      { pubkey: buyerPublicKey,          isSigner: true,  isWritable: true  },
+      { pubkey: contentRecordPda,        isSigner: false, isWritable: true  },
+      { pubkey: receiptPda,              isSigner: false, isWritable: true  },
+      { pubkey: royaltyRecipientKey,     isSigner: false, isWritable: true  }, // current NFT holder
+      { pubkey: feeVaultPda,             isSigner: false, isWritable: true  },
+      { pubkey: registryPda,             isSigner: false, isWritable: true  }, // RegistryState
       { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
     ],
     data: Buffer.from(ixData),
@@ -583,24 +684,31 @@ export interface CreateListingResult {
  * Creates a ListingRecord on-chain for a secondary market sale.
  * Seller signs. After this tx, backend moves the access token to escrow.
  *
- * @param listingUuid    UUID that will be used as the listing ID (from DB)
- * @param contentUuid    UUID of the content item
- * @param priceLamports  Listing price in lamports
- * @param tokenMintStr   Access token mint address
+ * The smart contract validates that `price > max(royalty_bps%, min_royalty_lamports) + platform_fee`
+ * on-chain using the content_record PDA. Pass `contentRecordPdaStr` (content.onChainPda) so the
+ * contract can read the author's minimum royalty setting.
+ *
+ * @param listingUuid          UUID that will be used as the listing ID (from DB)
+ * @param contentUuid          UUID of the content item
+ * @param contentRecordPdaStr  On-chain ContentRecord PDA address (content.onChainPda)
+ * @param priceLamports        Listing price in lamports
+ * @param tokenMintStr         Access token mint address
  */
 export async function createListingOnChain(
   listingUuid: string,
   contentUuid: string,
+  contentRecordPdaStr: string,
   priceLamports: bigint,
   tokenMintStr: string,
   sellerPublicKey: PublicKey,
   sendTransaction: (tx: Transaction, conn: Connection) => Promise<string>,
   connection: Connection
 ): Promise<CreateListingResult> {
-  const listingIdBytes = uuidToBytes32(listingUuid);
-  const contentIdBytes = uuidToBytes32(contentUuid);
-  const tokenMintKey   = new PublicKey(tokenMintStr);
-  const listingPda     = deriveListingRecordPda(listingIdBytes);
+  const listingIdBytes   = uuidToBytes32(listingUuid);
+  const contentIdBytes   = uuidToBytes32(contentUuid);
+  const tokenMintKey     = new PublicKey(tokenMintStr);
+  const listingPda       = deriveListingRecordPda(listingIdBytes);
+  const contentRecordPda = new PublicKey(contentRecordPdaStr);
 
   // Encode: discriminator(8) + listing_id(32) + content_id(32) + price_lamports(8) + token_mint(32)
   const priceBytes = encodeU64(priceLamports);
@@ -616,6 +724,7 @@ export async function createListingOnChain(
     programId: AMSETS_PROGRAM_ID,
     keys: [
       { pubkey: sellerPublicKey,         isSigner: true,  isWritable: true  },
+      { pubkey: contentRecordPda,        isSigner: false, isWritable: false }, // for min_royalty validation
       { pubkey: listingPda,              isSigner: false, isWritable: true  },
       { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
     ],
@@ -690,6 +799,8 @@ export async function executeSaleOnChain(
   const sellerKey            = new PublicKey(sellerWallet);
   const feeVaultPda          = deriveFeeVaultPda();
 
+  const registryPda = deriveRegistryStatePda();
+
   const ix = new TransactionInstruction({
     programId: AMSETS_PROGRAM_ID,
     keys: [
@@ -699,6 +810,7 @@ export async function executeSaleOnChain(
       { pubkey: feeVaultPda,             isSigner: false, isWritable: true  },
       { pubkey: royaltyRecipientKey,     isSigner: false, isWritable: true  },
       { pubkey: sellerKey,               isSigner: false, isWritable: true  },
+      { pubkey: registryPda,             isSigner: false, isWritable: true  }, // RegistryState
       { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
     ],
     data: Buffer.from(EXECUTE_SALE_DISCRIMINATOR),
