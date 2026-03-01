@@ -75,6 +75,7 @@ interface ActiveListing {
   price_lamports: string;
   mintAddress: string;
   tokenAccount?: string;
+  onChainListingPda?: string;
   status: string;
   createdAt: string;
 }
@@ -383,12 +384,18 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
       const royaltyBps        = content.royaltyBps        ?? 0;
       const minRoyaltyLamports = content.minRoyaltyLamports ?? 0;
 
+      // The on-chain listing PDA was stored when the listing was created.
+      // We use it directly — Anchor reads the listing_id seeds from account data.
+      if (!listing.onChainListingPda) {
+        throw new Error("This listing has no on-chain record. It may have been created before on-chain listings were enabled. Please ask the seller to re-list.");
+      }
+
       // Execute on-chain SOL distribution via smart contract.
       // This MUST succeed before the backend is called — no fallback allowed.
       // If this throws (insufficient SOL, user rejection, tx failure), we stop here
       // and the listing remains active so the seller is not harmed.
       const result = await executeSaleOnChain(
-        listing.id,
+        listing.onChainListingPda,
         royaltyBps,
         minRoyaltyLamports,
         royaltyRecipient,
