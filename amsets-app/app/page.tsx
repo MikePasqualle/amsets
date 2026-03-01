@@ -66,7 +66,7 @@ export default async function HomePage() {
               </div>
             )}
 
-            {latestItems.length === 4 && (
+            {latestItems.length > 0 && (
               <div className="flex justify-center mt-10">
                 <Link
                   href="/marketplace"

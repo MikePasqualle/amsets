@@ -32,11 +32,12 @@ const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3001";
 interface ContentViewerProps {
   contentId:  string;
   storageUri: string;
-  accessMint: string;
-  mimeType:   string;
-  encryptedKey?:       string;
-  litConditionsHash?:  string;
   isAuthor?: boolean;
+  /** Legacy props kept for API compatibility — not used by current HLS player */
+  accessMint?: string;
+  mimeType?: string;
+  encryptedKey?: string;
+  litConditionsHash?: string;
 }
 
 type AssetStatus = "ready" | "transcoding" | "not_found";
@@ -152,7 +153,14 @@ export function ContentViewer({
             if (!data.fatal) return;
             console.error("[ContentViewer] HLS fatal:", data.type, data.details);
             if (data.type === "networkError") {
-              setViewerState("not_found");
+              // 404 from CDN = video not found; other network errors = connectivity
+              const statusCode = data.response?.code ?? data.networkDetails?.response?.code;
+              if (statusCode === 404) {
+                setViewerState("not_found");
+              } else {
+                setErrorText("Network error — check your connection and try again");
+                setViewerState("error");
+              }
             } else {
               setErrorText("Playback error — try refreshing the page");
               setViewerState("error");
