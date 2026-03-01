@@ -97,6 +97,12 @@ export function Navbar() {
             >
               My Works
             </Link>
+            <Link
+              href="/my/wallet"
+              className="text-[#EDE8F5]/70 hover:text-[#F7FF88] text-sm font-medium transition-colors"
+            >
+              My Wallet
+            </Link>
           </div>
 
           {/* Actions */}
