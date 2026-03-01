@@ -386,19 +386,14 @@ pub struct MintAccessToken<'info> {
 /// Create a secondary market listing for an access token.
 /// Seller signs to create the ListingRecord PDA.
 /// Backend (PermanentDelegate) moves the token to escrow ATA after this tx.
+///
+/// Royalty parameters are passed as instruction args (not read from ContentRecord) to support
+/// legacy ContentRecord PDAs that have different account layouts and cannot be safely deserialized.
 #[derive(Accounts)]
 #[instruction(listing_id: [u8; 32])]
 pub struct CreateListing<'info> {
     #[account(mut)]
     pub seller: Signer<'info>,
-
-    /// Content record — read-only; used to validate min_royalty_lamports at listing time.
-    /// The seller passes this so the on-chain validation is fully decentralised.
-    #[account(
-        seeds = [b"content", content_record.primary_author.as_ref(), &content_record.content_id],
-        bump = content_record.bump,
-    )]
-    pub content_record: Account<'info, ContentRecord>,
 
     #[account(
         init,
@@ -432,6 +427,10 @@ pub struct CancelListing<'info> {
 /// Execute a secondary market sale.
 /// Buyer pays SOL; distribution: 2.5% → fee_vault, royalty_bps → royalty_recipient, rest → seller.
 /// Backend moves the escrowed access token to buyer after this tx.
+///
+/// Royalty parameters are passed as instruction args rather than read from ContentRecord.
+/// ContentRecord PDAs may exist in multiple legacy formats (different account sizes) that
+/// cannot be safely deserialized. The values are validated client-side and bounded on-chain.
 #[derive(Accounts)]
 pub struct ExecuteSale<'info> {
     #[account(mut)]
@@ -445,17 +444,6 @@ pub struct ExecuteSale<'info> {
         constraint = listing_record.seller != buyer.key() @ AmsetsError::CannotBuyOwnListing,
     )]
     pub listing_record: Account<'info, ListingRecord>,
-
-    /// Content record — read-only, used to get royalty_bps.
-    #[account(
-        seeds = [
-            b"content",
-            content_record.primary_author.as_ref(),
-            &content_record.content_id,
-        ],
-        bump = content_record.bump,
-    )]
-    pub content_record: Account<'info, ContentRecord>,
 
     /// CHECK: Protocol fee vault
     #[account(mut, seeds = [b"fee_vault"], bump)]
@@ -699,29 +687,33 @@ pub mod amsets_registry {
 
     /// Create a secondary market listing. Seller signs to create the ListingRecord PDA.
     /// After this tx, backend (PermanentDelegate) moves seller's token to escrow ATA.
+    /// royalty_bps:           Content royalty in basis points (0–5000). Bounded on-chain.
+    /// min_royalty_lamports:  Minimum absolute royalty floor; 0 = percentage-only.
+    /// Both are passed by the seller (who read them from their ContentRecord off-chain) to
+    /// avoid deserializing legacy ContentRecord PDAs with different account layouts.
     pub fn create_listing(
         ctx: Context<CreateListing>,
-        listing_id:     [u8; 32],
-        content_id:     [u8; 32],
-        price_lamports: u64,
-        token_mint:     Pubkey,
+        listing_id:           [u8; 32],
+        content_id:           [u8; 32],
+        price_lamports:       u64,
+        token_mint:           Pubkey,
+        royalty_bps:          u16,
+        min_royalty_lamports: u64,
     ) -> Result<()> {
         require!(price_lamports > 0, AmsetsError::InvalidPrice);
+        require!(royalty_bps <= 5000, AmsetsError::Overflow);
 
         // On-chain minimum royalty validation — fully decentralised.
         // The actual royalty the author earns is max(royalty_bps%, min_royalty_lamports).
-        // We reject listings where the seller's price doesn't cover that plus the protocol fee.
+        // Reject listings where price doesn't cover royalty plus protocol fee.
         {
-            let record      = &ctx.accounts.content_record;
-            let min_royalty = record.min_royalty_lamports;
-            let royalty_bps = record.royalty_bps as u64;
-            let pct_royalty     = price_lamports
-                .checked_mul(royalty_bps)
+            let pct_royalty = price_lamports
+                .checked_mul(royalty_bps as u64)
                 .ok_or(AmsetsError::Overflow)?
                 .checked_div(BPS_DENOMINATOR)
                 .ok_or(AmsetsError::Overflow)?;
-            let actual_royalty  = pct_royalty.max(min_royalty);
-            let platform_fee    = price_lamports
+            let actual_royalty = pct_royalty.max(min_royalty_lamports);
+            let platform_fee   = price_lamports
                 .checked_mul(PROTOCOL_FEE_BPS)
                 .ok_or(AmsetsError::Overflow)?
                 .checked_div(BPS_DENOMINATOR)
@@ -775,9 +767,20 @@ pub mod amsets_registry {
     ///
     /// After this tx, backend (PermanentDelegate) delivers access token
     /// from escrow ATA to buyer.
-    pub fn execute_sale(ctx: Context<ExecuteSale>) -> Result<()> {
-        let price      = ctx.accounts.listing_record.price_lamports;
-        let royalty_bps = ctx.accounts.content_record.royalty_bps as u64;
+    /// royalty_bps:           0–5000 (0%–50%), validated on-chain.
+    /// min_royalty_lamports:  minimum absolute royalty floor; 0 = percentage-only.
+    /// Both are passed as instruction args to avoid deserializing legacy ContentRecord PDAs
+    /// that may exist in multiple account-layout versions.
+    pub fn execute_sale(
+        ctx: Context<ExecuteSale>,
+        royalty_bps:           u16,
+        min_royalty_lamports:  u64,
+    ) -> Result<()> {
+        // Validate royalty bounds (max 50%)
+        require!(royalty_bps <= 5000, AmsetsError::Overflow);
+
+        let price       = ctx.accounts.listing_record.price_lamports;
+        let royalty_bps = royalty_bps as u64;
 
         require!(
             ctx.accounts.buyer.lamports() >= price + 5_000_000,
@@ -797,7 +800,7 @@ pub mod amsets_registry {
             .checked_div(BPS_DENOMINATOR)
             .ok_or(AmsetsError::Overflow)?;
 
-        let royalty = pct_royalty.max(ctx.accounts.content_record.min_royalty_lamports);
+        let royalty = pct_royalty.max(min_royalty_lamports);
 
         let seller_amount = price
             .checked_sub(platform_fee)
