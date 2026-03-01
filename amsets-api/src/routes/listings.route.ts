@@ -277,6 +277,36 @@ listingsRouter.post(
     if (listing.sellerWallet.toLowerCase() === buyerWallet.toLowerCase())
       return c.json({ error: "Cannot buy your own listing" }, 400);
 
+    // ── Verify the on-chain transaction actually succeeded ────────────────────
+    // This is the critical safety check: the frontend must not be able to trigger
+    // token delivery without a real confirmed SOL payment on Solana.
+    const txSig = body.tx_signature;
+    if (!txSig || txSig === "offchain" || txSig.length < 40) {
+      return c.json({
+        error: "A valid Solana transaction signature is required. The on-chain SOL payment must be confirmed before token delivery.",
+      }, 400);
+    }
+    try {
+      const txInfo = await solanaConnection.getTransaction(txSig, {
+        commitment:                    "confirmed",
+        maxSupportedTransactionVersion: 0,
+      });
+      if (!txInfo) {
+        return c.json({
+          error: "Transaction not found on Solana. It may not be confirmed yet — please wait a moment and try again.",
+        }, 400);
+      }
+      if (txInfo.meta?.err) {
+        return c.json({
+          error: `On-chain transaction failed: ${JSON.stringify(txInfo.meta.err)}. No SOL was transferred — the listing remains active.`,
+        }, 400);
+      }
+    } catch (verifyErr: any) {
+      console.error("[fulfill] tx verify error:", verifyErr?.message);
+      return c.json({ error: "Could not verify transaction on Solana — please try again." }, 500);
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     // Load content for mint address and Author NFT
     const [contentRow] = await db
       .select({

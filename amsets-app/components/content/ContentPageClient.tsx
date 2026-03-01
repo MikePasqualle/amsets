@@ -357,6 +357,22 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
     setResaleError(null);
 
     try {
+      // ── Pre-flight SOL balance check ────────────────────────────────────────
+      // Reject early if the buyer clearly cannot afford the listing.
+      // 5000 lamports = typical tx fee; add small buffer for rent.
+      const TX_FEE_BUFFER = 10_000; // lamports
+      const buyerBalance = await connection.getBalance(publicKey);
+      const required = listing.price_lamports + TX_FEE_BUFFER;
+      if (buyerBalance < required) {
+        const have = (buyerBalance / 1e9).toFixed(4);
+        const need = (listing.price_lamports / 1e9).toFixed(4);
+        throw new Error(
+          `Insufficient SOL balance. You have ${have} SOL but the listing costs ${need} SOL. ` +
+          `Please top up your wallet and try again.`
+        );
+      }
+      // ────────────────────────────────────────────────────────────────────────
+
       // Resolve current royalty holder (current Author NFT holder)
       const royaltyRecipient = royaltyHolder ?? listing.sellerWallet;
 
@@ -365,33 +381,29 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
       const authorPubkey     = new PublicKey(content.authorWallet);
       const contentRecordPda = deriveContentRecordPda(authorPubkey, contentIdBytes);
 
-      // Execute on-chain SOL distribution via smart contract
-      // The contract handles: 2.5% platform fee + royaltyBps to NFT holder + remainder to seller
-      let saleSignature: string | undefined;
-      try {
-        const result = await executeSaleOnChain(
-          listing.id,
-          contentRecordPda.toBase58(),
-          royaltyRecipient,
-          listing.sellerWallet,
-          publicKey,
-          sendTransaction,
-          connection
-        );
-        saleSignature = result.signature;
-        console.log(`[buy-resale] On-chain sale executed, txSig: ${saleSignature.slice(0, 12)}…`);
-      } catch (onChainErr: any) {
-        // Contract may not be deployed to devnet yet — log and continue
-        console.warn("[buy-resale] executeSaleOnChain skipped:", onChainErr?.message?.slice(0, 80));
-      }
+      // Execute on-chain SOL distribution via smart contract.
+      // This MUST succeed before the backend is called — no fallback allowed.
+      // If this throws (insufficient SOL, user rejection, tx failure), we stop here
+      // and the listing remains active so the seller is not harmed.
+      const result = await executeSaleOnChain(
+        listing.id,
+        contentRecordPda.toBase58(),
+        royaltyRecipient,
+        listing.sellerWallet,
+        publicKey,
+        sendTransaction,
+        connection
+      );
+      const saleSignature = result.signature;
+      console.log(`[buy-resale] On-chain sale executed, txSig: ${saleSignature.slice(0, 12)}…`);
 
-      // Backend moves token from escrow to buyer and records the purchase
+      // Backend verifies the tx on Solana, moves token from escrow to buyer, records purchase.
       const fulfillRes = await fetch(`${API_URL}/api/v1/listings/${listing.id}/fulfill`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
         body: JSON.stringify({
           buyer_wallet:  publicKey.toBase58(),
-          tx_signature:  saleSignature ?? "offchain",
+          tx_signature:  saleSignature,
           amount_paid:   listing.price_lamports,
         }),
       });
@@ -413,6 +425,12 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
         msg = err;
       } else {
         try { msg = JSON.stringify(err); } catch { msg = "Resale purchase failed"; }
+      }
+      // Translate common Solana error codes to human-readable messages
+      if (msg.includes("0x1") || msg.toLowerCase().includes("insufficient")) {
+        msg = "Insufficient SOL balance. Please top up your wallet and try again.";
+      } else if (msg.toLowerCase().includes("rejected") || msg.toLowerCase().includes("cancelled")) {
+        msg = "Transaction cancelled. The listing is still active — you can try again.";
       }
       setResaleError(msg.slice(0, 300));
     } finally {
@@ -484,6 +502,22 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
     setPurchaseError(null);
 
     try {
+      // ── Pre-flight SOL balance check ────────────────────────────────────────
+      if (content.basePrice) {
+        const TX_FEE_BUFFER = 10_000; // lamports (~tx fee)
+        const buyerBalance = await connection.getBalance(publicKey);
+        const required = Number(content.basePrice) + TX_FEE_BUFFER;
+        if (buyerBalance < required) {
+          const have = (buyerBalance / 1e9).toFixed(4);
+          const need = (Number(content.basePrice) / 1e9).toFixed(4);
+          throw new Error(
+            `Insufficient SOL balance. You have ${have} SOL but this content costs ${need} SOL. ` +
+            `Please top up your wallet and try again.`
+          );
+        }
+      }
+      // ────────────────────────────────────────────────────────────────────────
+
       // Use stored PDA if available, otherwise derive it from content ID + author
       let contentRecordPda: PublicKey;
       if (content.onChainPda && content.onChainPda !== "pending") {

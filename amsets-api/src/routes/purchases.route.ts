@@ -43,12 +43,38 @@ const createPurchaseSchema = z.object({
  */
 purchasesRouter.post(
   "/",
+  async (c, next) => {
+    if (!extractWallet(c.req.header("Authorization"))) return c.json({ error: "Unauthorized" }, 401);
+    await next();
+  },
   zValidator("json", createPurchaseSchema),
   async (c) => {
-    const buyerWallet = extractWallet(c.req.header("Authorization"));
-    if (!buyerWallet) return c.json({ error: "Unauthorized" }, 401);
+    const buyerWallet = extractWallet(c.req.header("Authorization"))!;
 
     const body = c.req.valid("json");
+
+    // ── Verify the on-chain transaction actually succeeded ────────────────────
+    // Reject any attempt to record a purchase without a real confirmed Solana tx.
+    try {
+      const txInfo = await solanaConnection.getTransaction(body.tx_signature, {
+        commitment:                    "confirmed",
+        maxSupportedTransactionVersion: 0,
+      });
+      if (!txInfo) {
+        return c.json({
+          error: "Transaction not found on Solana. It may not be confirmed yet — please wait a moment and retry.",
+        }, 400);
+      }
+      if (txInfo.meta?.err) {
+        return c.json({
+          error: `On-chain transaction failed: ${JSON.stringify(txInfo.meta.err)}. No SOL was transferred — please try your purchase again.`,
+        }, 400);
+      }
+    } catch (verifyErr: any) {
+      console.error("[purchases] tx verify error:", verifyErr?.message);
+      return c.json({ error: "Could not verify transaction on Solana — please try again." }, 500);
+    }
+    // ─────────────────────────────────────────────────────────────────────────
 
     // Idempotency check
     const [existing] = await db
