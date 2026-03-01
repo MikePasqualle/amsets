@@ -471,6 +471,21 @@ export function UploadSteps() {
       setPublishSteps([...steps]);
       await new Promise((r) => setTimeout(r, 300));
 
+      // Pre-flight balance check: publishing requires ~0.002 SOL for account rent + tx fees.
+      if (deployMode !== "draft" && registeredContentId && connected && publicKey) {
+        const MIN_PUBLISH_LAMPORTS = 2_500_000; // ~0.0025 SOL for ContentRecord rent + fees
+        const authorBalance = await connection.getBalance(publicKey).catch(() => 0);
+        if (authorBalance < MIN_PUBLISH_LAMPORTS) {
+          steps[3] = {
+            ...steps[3],
+            status: "error",
+            detail: `Insufficient SOL. You have ${(authorBalance / 1e9).toFixed(4)} SOL but need at least 0.0025 SOL for on-chain registration fees. Content saved as draft — top up your wallet and deploy from My Works.`,
+          };
+          setPublishSteps([...steps]);
+          return;
+        }
+      }
+
       if (deployMode === "draft" || !registeredContentId) {
         steps[3] = {
           ...steps[3],
