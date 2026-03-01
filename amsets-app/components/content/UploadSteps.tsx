@@ -45,6 +45,7 @@ interface UploadData {
   royalty: string;  // royalty percentage on resale (0–50%)
   license: string;
   previewFile: File | null;
+  isPrivate: boolean; // if true — hidden from marketplace, accessible via link + token only
 }
 
 interface PublishStep {
@@ -79,6 +80,7 @@ export function UploadSteps() {
     royalty: "10",
     license: "personal",
     previewFile: null,
+    isPrivate: false,
   });
   const [isProcessing, setIsProcessing] = useState(false);
   const [publishError, setPublishError] = useState<string | null>(null);
@@ -166,11 +168,11 @@ export function UploadSteps() {
     setIsProcessing(true);
 
     const steps: PublishStep[] = [
-      { label: "Uploading video to Livepeer",               status: "pending" },
-      { label: "Uploading preview to IPFS",                 status: "pending" },
-      { label: "Registering content in backend",            status: "pending" },
-      { label: "Registering on Solana blockchain",          status: "pending" },
-      { label: "Creating access token mint (SPL Token-2022)", status: "pending" },
+      { label: "Uploading video",             status: "pending" },
+      { label: "Uploading preview image",     status: "pending" },
+      { label: "Registering content",         status: "pending" },
+      { label: "Publishing on blockchain",    status: "pending" },
+      { label: "Minting access token",        status: "pending" },
     ];
     setPublishSteps(steps);
     goToStep(5);
@@ -390,6 +392,7 @@ export function UploadSteps() {
             total_supply:  supplyVal,
             royalty_bps:   royaltyVal,
             mime_type:     data.file?.type ?? "application/octet-stream",
+            is_private:    data.isPrivate,
           };
 
           // Livepeer: no client-side encryption — access is controlled via JWT gating.
@@ -456,7 +459,7 @@ export function UploadSteps() {
           ...steps[3],
           status: "skipped",
           detail: deployMode === "draft"
-            ? "Saved as Draft — deploy from My Content whenever you're ready"
+            ? "Saved as Draft — deploy from My Works whenever you're ready"
             : "Saved as Draft (registration step failed)",
         };
       } else if (!connected || !publicKey) {
@@ -838,6 +841,46 @@ export function UploadSteps() {
                 </div>
               </div>
 
+              {/* ── Privacy mode ─────────────────────────────────────── */}
+              <div className="mt-2">
+                <p className="text-sm text-[#EDE8F5] font-medium mb-2">Visibility</p>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <button
+                    onClick={() => setData((d) => ({ ...d, isPrivate: false }))}
+                    className={`flex flex-col gap-1 p-4 rounded-xl border text-left transition-all ${
+                      !data.isPrivate
+                        ? "border-[#F7FF88] bg-[#F7FF88]/10"
+                        : "border-[#3D2F5A] bg-[#221533] hover:border-[#7A6E8E]"
+                    }`}
+                  >
+                    <div className="flex items-center gap-2">
+                      <span className="text-lg">🌐</span>
+                      <span className={`text-sm font-semibold ${!data.isPrivate ? "text-[#F7FF88]" : "text-[#EDE8F5]"}`}>
+                        Public
+                      </span>
+                    </div>
+                    <p className="text-xs text-[#7A6E8E]">Listed on the marketplace. Anyone can discover and purchase.</p>
+                  </button>
+
+                  <button
+                    onClick={() => setData((d) => ({ ...d, isPrivate: true }))}
+                    className={`flex flex-col gap-1 p-4 rounded-xl border text-left transition-all ${
+                      data.isPrivate
+                        ? "border-[#81D0B5] bg-[#81D0B5]/10"
+                        : "border-[#3D2F5A] bg-[#221533] hover:border-[#7A6E8E]"
+                    }`}
+                  >
+                    <div className="flex items-center gap-2">
+                      <span className="text-lg">🔒</span>
+                      <span className={`text-sm font-semibold ${data.isPrivate ? "text-[#81D0B5]" : "text-[#EDE8F5]"}`}>
+                        Private
+                      </span>
+                    </div>
+                    <p className="text-xs text-[#7A6E8E]">Hidden from marketplace. Share via link. Buyers access via token.</p>
+                  </button>
+                </div>
+              </div>
+
               <div className="flex gap-3">
                 <GlowButton variant="ghost" size="md" onClick={() => goToStep(2)}>← Back</GlowButton>
                 <GlowButton variant="primary" size="md" onClick={() => goToStep(4)}>Continue →</GlowButton>
@@ -880,7 +923,7 @@ export function UploadSteps() {
                       </span>
                     </div>
                     <p className="text-xs text-[#7A6E8E]">
-                      Register on Solana right now. Requires Phantom or Solflare wallet.
+                      Register on blockchain right now. Requires a Solana wallet (Phantom or Solflare).
                     </p>
                     {deployMode === "auto" && !connected && (
                       <p className="text-xs text-amber-400 mt-1">
@@ -906,7 +949,7 @@ export function UploadSteps() {
                       </span>
                     </div>
                     <p className="text-xs text-[#7A6E8E]">
-                      Save now, deploy on Solana later from My Content.
+                      Save now, deploy on blockchain later from My Works.
                     </p>
                   </button>
                 </div>
@@ -990,50 +1033,52 @@ export function UploadSteps() {
 
                                 <h3 className="text-xl font-bold text-[#F7FF88]">
                                   {tokenDone
-                                    ? "Fully Published! Token Minted 🎉"
+                                    ? "Published! Access token minted 🎉"
                                     : onChainDone
-                                    ? "Published on Solana"
+                                    ? "Published on blockchain"
                                     : savedInDB
                                     ? "Saved as Draft"
-                                    : "Content Encrypted"}
+                                    : "Something went wrong"}
                                 </h3>
 
                                 <p className="text-[#7A6E8E] text-sm max-w-sm text-center">
                                   {tokenDone
-                                    ? "Your content is live on Solana. Author token minted to your wallet. Buyers can now purchase access tokens."
+                                    ? `Your content is live${data.isPrivate ? " (private — share via link)" : " on the marketplace"}. Author token minted to your wallet.`
                                     : onChainDone
-                                    ? "Registered on Solana devnet. Token mint step pending — you can retry from My Content."
+                                    ? "Registered on blockchain. Access token creation pending — retry from My Works."
                                     : savedInDB
-                                    ? "Saved as draft. Complete on-chain registration to publish to the marketplace."
-                                    : "Your file is encrypted locally. Sign in and try again."}
+                                    ? "Saved as draft. Complete on-chain registration to publish."
+                                    : "Sign in with your wallet and try again."}
                                 </p>
 
                                 <div className="flex gap-2 flex-wrap justify-center">
                                   {publishSteps[0]?.status === "done" && (
-                                    <NeonBadge variant="primary">Livepeer Video ✓</NeonBadge>
+                                    <NeonBadge variant="primary">Video uploaded ✓</NeonBadge>
                                   )}
                                   {publishSteps[1]?.status === "done" && (
-                                    <NeonBadge variant="secondary">Preview on IPFS ✓</NeonBadge>
+                                    <NeonBadge variant="secondary">Preview uploaded ✓</NeonBadge>
                                   )}
                                   {savedInDB && (
-                                    <NeonBadge variant="primary">Saved in AMSETS ✓</NeonBadge>
+                                    <NeonBadge variant="primary">Registered ✓</NeonBadge>
                                   )}
                                   {onChainDone && (
                                     <NeonBadge variant="primary">On-chain ✓</NeonBadge>
                                   )}
                                   {tokenDone && (
-                                    <NeonBadge variant="secondary">SPL Token-2022 ✓</NeonBadge>
+                                    <NeonBadge variant="secondary">Access token ✓</NeonBadge>
+                                  )}
+                                  {data.isPrivate && savedInDB && (
+                                    <NeonBadge variant="muted">🔒 Private</NeonBadge>
                                   )}
                                 </div>
 
                                 {savedInDB && !onChainDone && (
                                   <div className="w-full max-w-sm bg-amber-400/10 border border-amber-400/30 rounded-xl p-4 text-left">
                                     <p className="text-amber-300 text-xs font-semibold mb-1">
-                                      ⚠ On-chain deployment pending
+                                      ⚠ Blockchain deployment pending
                                     </p>
                                     <p className="text-[#7A6E8E] text-xs">
-                                      Smart contract must be deployed to Solana devnet first.
-                                      Your draft is saved — complete deployment from My Content when ready.
+                                      Your draft is saved. Connect a Solana wallet and complete deployment from My Works.
                                     </p>
                                   </div>
                                 )}
@@ -1042,12 +1087,12 @@ export function UploadSteps() {
                           })()}
 
                           <div className="flex gap-3 flex-wrap justify-center">
-                            <GlowButton variant="primary" size="md" onClick={() => window.location.href = "/"}>
+                            <GlowButton variant="primary" size="md" onClick={() => window.location.href = "/marketplace"}>
                               View Marketplace
                             </GlowButton>
                             {publishSteps[2]?.status === "done" && (
-                              <GlowButton variant="ghost" size="md" onClick={() => window.location.href = "/my/library"}>
-                                My Content
+                              <GlowButton variant="ghost" size="md" onClick={() => window.location.href = "/my/content"}>
+                                My Works
                               </GlowButton>
                             )}
                           </div>

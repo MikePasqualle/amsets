@@ -74,7 +74,7 @@ export function Navbar() {
           {/* Navigation links */}
           <div className="hidden md:flex items-center gap-8">
             <Link
-              href="/"
+              href="/marketplace"
               className="text-[#EDE8F5]/70 hover:text-[#F7FF88] text-sm font-medium transition-colors"
             >
               Marketplace

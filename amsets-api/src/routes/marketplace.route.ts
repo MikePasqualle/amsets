@@ -101,9 +101,9 @@ marketplaceRouter.get(
     }
 
     // ── PostgreSQL fallback ───────────────────────────────────────────────────
-    // Only show published (active) content on the public marketplace.
-    // Drafts are visible only in the author's own /my/content page.
-    const conditions = [eq(content.status, "active")];
+    // Only show published (active), non-private content on the public marketplace.
+    // Drafts and private content are only visible to the author.
+    const conditions = [eq(content.status, "active"), eq(content.isPrivate, false)];
     if (category) conditions.push(eq(content.category, category));
     if (search)   conditions.push(ilike(content.title, `%${search}%`));
 

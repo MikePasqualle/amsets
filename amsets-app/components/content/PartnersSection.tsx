@@ -26,19 +26,6 @@ const PARTNERS: Partner[] = [
     ),
   },
   {
-    name: "Lit Protocol",
-    role: "Decentralized Key Management",
-    url: "https://litprotocol.com",
-    accent: "#F7FF88",
-    icon: (
-      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-        <path d="M12 2L2 7l10 5 10-5-10-5z"/>
-        <path d="M2 17l10 5 10-5"/>
-        <path d="M2 12l10 5 10-5"/>
-      </svg>
-    ),
-  },
-  {
     name: "Livepeer",
     role: "Decentralized Video Network",
     url: "https://livepeer.studio",
@@ -88,14 +75,15 @@ const PARTNERS: Partner[] = [
     ),
   },
   {
-    name: "Pinata",
-    role: "IPFS Pinning Service",
-    url: "https://pinata.cloud",
-    accent: "#EDE8F5",
+    name: "Neon",
+    role: "Serverless PostgreSQL",
+    url: "https://neon.tech",
+    accent: "#00EB88",
     icon: (
       <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-        <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/>
-        <circle cx="12" cy="10" r="3"/>
+        <ellipse cx="12" cy="5" rx="9" ry="3"/>
+        <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/>
+        <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>
       </svg>
     ),
   },

@@ -98,6 +98,7 @@ export const content = pgTable(
     mintAddress:  text("mint_address"),   // SPL Token-2022 mint pubkey (set after mint creation)
     soldCount:    integer("sold_count").notNull().default(0),
     mimeType:     text("mime_type"),      // original file MIME type
+    isPrivate:    boolean("is_private").notNull().default(false), // hidden from public marketplace
     createdAt: timestamp("created_at").notNull().defaultNow(),
     updatedAt: timestamp("updated_at").notNull().defaultNow(),
   },

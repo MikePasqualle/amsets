@@ -2,7 +2,7 @@ import Image from "next/image";
 import Link from "next/link";
 
 const PRODUCT_LINKS = [
-  { label: "Marketplace",  href: "/" },
+  { label: "Marketplace",  href: "/marketplace" },
   { label: "Publish",      href: "/upload" },
   { label: "My Library",   href: "/my/library" },
   { label: "My Works",     href: "/my/content" },

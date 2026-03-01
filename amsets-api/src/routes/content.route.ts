@@ -72,6 +72,8 @@ const registerSchema = z.object({
   total_supply: z.number().int().min(1).default(1),
   royalty_bps: z.number().int().min(0).max(5000).default(1000),
   mime_type: z.string().optional(),
+  // Privacy: if true, content is hidden from public marketplace (author + link-share only)
+  is_private: z.boolean().default(false),
 });
 
 contentRouter.post(
@@ -113,6 +115,7 @@ contentRouter.post(
         totalSupply: body.total_supply,
         royaltyBps: body.royalty_bps,
         mimeType: body.mime_type ?? null,
+        isPrivate: body.is_private ?? false,
       })
       .returning({ id: contentTable.id, contentId: contentTable.contentId });
 
