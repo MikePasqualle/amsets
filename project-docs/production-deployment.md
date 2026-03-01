@@ -1,265 +1,473 @@
-# AMSETS — Production Deployment Plan
+# AMSETS — Розгортання на Продакшн (Mainnet)
 
-> **Target**: Solana Mainnet-Beta + production cloud infrastructure  
-> **Stack**: Next.js (Vercel) · Hono API (Railway/Fly.io) · PostgreSQL · Redis · Anchor smart contract
-
----
-
-## 1. Pre-Deployment Checklist
-
-### 1.1 Smart Contract Audit
-- [ ] Complete third-party security audit (Sec3, OtterSec, or Neodyme)
-- [ ] Resolve all critical/high findings before mainnet deploy
-- [ ] Set upgrade authority to **3-of-5 multisig** (Squads Protocol)
-- [ ] Prepare freeze/pause mechanism for emergency response
-
-### 1.2 Environment Secrets
-All secrets must be rotated from devnet values before mainnet:
-
-| Secret | Where to get | Where to set |
-|--------|-------------|--------------|
-| `DEPLOYER_KEYPAIR` | New dedicated deployer wallet | Never in code; use CI secret |
-| `JWT_SECRET` | `openssl rand -hex 64` | Backend env |
-| `HELIUS_API_KEY` | helius.dev (production tier) | Backend + Frontend env |
-| `PINATA_JWT` | pinata.cloud (paid plan) | Frontend env |
-| `WEB3AUTH_CLIENT_ID` | dashboard.web3auth.io (mainnet verifier) | Frontend env |
-| `DATABASE_URL` | Managed PostgreSQL (Neon/Supabase/RDS) | Backend env |
-| `REDIS_URL` | Managed Redis (Upstash) | Backend env |
-
-### 1.3 New Web3Auth Verifier for Mainnet
-- Log in to https://dashboard.web3auth.io
-- Create a **new verifier** (Sapphire Mainnet, not Devnet)
-- Update `NEXT_PUBLIC_WEB3AUTH_CLIENT_ID` with the mainnet client ID
-- Change `web3AuthNetwork: "sapphire_mainnet"` in `useAuth.ts`
+> **Повний покроковий гайд для новачків**  
+> Мережа: **Solana Mainnet-Beta** · Хостинг: **Vercel + Railway** · БД: **Neon** · Кеш: **Upstash**
 
 ---
 
-## 2. Smart Contract Deployment (Mainnet)
+## Загальна архітектура продакшн
 
-### 2.1 Prerequisites
-```bash
-# Switch CLI to mainnet
-solana config set --url https://api.mainnet-beta.solana.com
-
-# Fund the deployer wallet (need ~5 SOL for deployment rent)
-# Transfer SOL manually to the deployer wallet address
-solana balance <deployer-address>
 ```
-
-### 2.2 Build & Deploy
-```bash
-cd amsets-contracts
-
-# Build with optimized sbpf target
-cargo build-sbf --manifest-path programs/amsets-registry/Cargo.toml
-
-# Deploy to mainnet (keep program keypair OFFLINE and SECRET)
-solana program deploy \
-  target/sbpf-solana-solana/release/amsets_registry.so \
-  --program-id deploy/amsets-registry-keypair.json \
-  --keypair ~/.config/solana/deployer.json \
-  --url https://api.mainnet-beta.solana.com
-
-# Record the deployed program ID
-echo "PROGRAM_ID=$(solana address -k deploy/amsets-registry-keypair.json)"
+Користувач
+    ↓
+Vercel (Frontend — Next.js)           ← amsets-app
+    ↓
+Railway (Backend API — Hono/Node.js)  ← amsets-api
+    ↓
+Neon (PostgreSQL)                     ← база даних
+Upstash (Redis)                       ← кеш
+    ↓
+Livepeer Studio                       ← відео хостинг
+Pinata / IPFS                         ← превью та метадані
+Solana Mainnet-Beta                   ← блокчейн
 ```
-
-### 2.3 Post-Deploy: Initialize Fee Vault
-```bash
-# Run the initialization script (one-time only)
-cd amsets-contracts
-node scripts/initialize-vault.js --url https://api.mainnet-beta.solana.com
-```
-
-### 2.4 Transfer Upgrade Authority to Multisig
-```bash
-# Replace <MULTISIG_ADDRESS> with Squads multisig address
-solana program set-upgrade-authority <PROGRAM_ID> \
-  --new-upgrade-authority <MULTISIG_ADDRESS> \
-  --keypair ~/.config/solana/deployer.json
-```
-
-### 2.5 Update Program ID in Code
-After deployment, update:
-- `amsets-app/.env.local` → `NEXT_PUBLIC_PROGRAM_ID=<new-id>`
-- `amsets-api/.env` → `PROGRAM_ID=<new-id>`
-- `amsets-contracts/Anchor.toml` → `[programs.mainnet]`
 
 ---
 
-## 3. Backend API Deployment
+## Підготовка: що потрібно перед початком
 
-### 3.1 Recommended Platform: Railway
-1. Go to https://railway.app → New Project → Deploy from GitHub
-2. Select the `amsets-api` root directory
-3. Set **Start Command**: `npm start`
-4. Set all environment variables (see section 1.2)
+### Сервіси які потрібно зареєструвати (всі безкоштовно на старті)
 
-**Production `.env` values to change:**
+| Сервіс | Для чого | Посилання |
+|---|---|---|
+| GitHub | Зберігання коду | https://github.com |
+| Vercel | Хостинг фронтенду | https://vercel.com |
+| Railway | Хостинг бекенду | https://railway.app |
+| Neon | PostgreSQL хмарна БД | https://neon.tech |
+| Upstash | Redis хмарний кеш | https://upstash.com |
+| Helius | Solana RPC + індексатор | https://helius.xyz |
+| Livepeer Studio | Відео хостинг | https://livepeer.studio |
+| Pinata | IPFS зберігання | https://pinata.cloud |
+| Web3Auth | Login по email/соцмережах | https://dashboard.web3auth.io |
+
+### Гаманці які потрібно створити
+
+Тобі знадобляться **два окремих гаманці**:
+
+1. **Deployer Wallet** — для деплою смарт-контракту на mainnet (потрібно ~3 SOL)
+2. **Mint Authority Wallet** — бекенд-гаманець що підписує SPL токени (потрібно ~0.5 SOL)
+
+> ⚠️ **Ніколи не використовуй один і той самий гаманець для двох ролей!**  
+> ⚠️ **Зберігай seed phrases у безпечному місці — вони не відновлюються!**
+
+---
+
+## Частина 1 — Підготовка ключів та сервісів
+
+### 1.1 Встановлення Solana CLI (якщо ще немає)
+
+```bash
+# macOS / Linux
+sh -c "$(curl -sSfL https://release.solana.com/stable/install)"
+
+# Перезапусти термінал, потім перевір:
+solana --version
+```
+
+### 1.2 Створення Deployer Wallet
+
+```bash
+# Генерує новий гаманець
+solana-keygen new --outfile ~/amsets-deployer.json --no-bip39-passphrase
+
+# Покаже публічний ключ (адресу гаманця)
+solana-keygen pubkey ~/amsets-deployer.json
+```
+
+Запиши публічний ключ — він знадобиться для поповнення SOL.
+
+Поповни цей гаманець **щонайменше 3 SOL** на mainnet через будь-яку біржу (Binance, Coinbase, OKX) або через Phantom.
+
+### 1.3 Створення Mint Authority Wallet
+
+```bash
+solana-keygen new --outfile ~/amsets-mint-authority.json --no-bip39-passphrase
+solana-keygen pubkey ~/amsets-mint-authority.json
+```
+
+Поповни цей гаманець **0.5 SOL** — він витрачається при мінтингу кожного токена (~0.002 SOL за токен).
+
+### 1.4 Конвертація Mint Authority ключа у base58 рядок
+
+```bash
+# Встанови Node.js якщо немає
+node -e "
+const fs = require('fs');
+const bytes = JSON.parse(fs.readFileSync(process.env.HOME + '/amsets-mint-authority.json', 'utf-8'));
+const base58chars = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+let n = BigInt('0x' + Buffer.from(bytes).toString('hex'));
+let result = '';
+while (n > 0n) { result = base58chars[Number(n % 58n)] + result; n = n / 58n; }
+console.log('MINT_AUTHORITY_SECRET=' + result);
+"
+```
+
+Збережи цей рядок — він піде у `MINT_AUTHORITY_SECRET` у налаштуваннях Railway.
+
+---
+
+## Частина 2 — Деплой смарт-контракту на Mainnet
+
+### 2.1 Встановлення Anchor
+
+```bash
+cargo install --git https://github.com/coral-xyz/anchor avm --locked
+avm install latest
+avm use latest
+anchor --version
+```
+
+### 2.2 Переключення на Mainnet
+
+```bash
+solana config set --url mainnet-beta
+solana config set --keypair ~/amsets-deployer.json
+solana balance  # перевір що є SOL
+```
+
+### 2.3 Клонування та збірка контракту
+
+```bash
+git clone https://github.com/MikePasqualle/amsets.git
+cd amsets/amsets-contracts
+
+# Встановити залежності та зібрати
+anchor build
+```
+
+### 2.4 Деплой на Mainnet-Beta
+
+```bash
+anchor deploy --provider.cluster mainnet-beta --provider.wallet ~/amsets-deployer.json
+```
+
+Після успішного деплою в терміналі з'явиться:
+```
+Program Id: НОВИЙ_PROGRAM_ID
+Deploy success
+```
+
+**Запиши цей Program ID** — він потрібен для всіх конфігів!
+
+### 2.5 Ініціалізація Fee Vault
+
+```bash
+# Після деплою потрібно ініціалізувати платіжне сховище
+# Це робиться один раз через адмін-сторінку після запуску фронту
+# або через Anchor CLI:
+anchor run initialize-vault --provider.cluster mainnet-beta
+```
+
+---
+
+## Частина 3 — База даних (Neon)
+
+### 3.1 Реєстрація та створення БД
+
+1. Зайди на https://neon.tech
+2. Натисни **Sign Up** → зареєструйся через GitHub
+3. Натисни **Create Project**
+4. Вкажи:
+   - Project name: `amsets-prod`
+   - Region: вибери найближчий до твоїх користувачів (EU Frankfurt або US East)
+   - PostgreSQL version: `15`
+5. Натисни **Create Project**
+
+### 3.2 Отримання рядка підключення
+
+1. На сторінці проекту знайди розділ **Connection Details**
+2. Вибери **Connection string** → скопіюй рядок виду:
+   ```
+   postgresql://user:password@ep-xxx.eu-central-1.aws.neon.tech/neondb?sslmode=require
+   ```
+3. Збережи — це твій `DATABASE_URL`
+
+---
+
+## Частина 4 — Redis (Upstash)
+
+### 4.1 Реєстрація та створення Redis
+
+1. Зайди на https://upstash.com
+2. **Sign Up** → зареєструйся через GitHub
+3. Натисни **Create Database**
+4. Вкажи:
+   - Name: `amsets-prod`
+   - Region: той самий що і Neon
+   - Type: `Regional`
+5. Натисни **Create**
+
+### 4.2 Отримання URL
+
+1. Відкрий щойно створену БД
+2. Знайди **REST URL** або **Redis URL** → скопіюй рядок виду:
+   ```
+   rediss://default:password@xxx.upstash.io:6379
+   ```
+3. Збережи — це твій `REDIS_URL`
+
+---
+
+## Частина 5 — Зовнішні сервіси
+
+### 5.1 Helius (Solana RPC)
+
+1. Зайди на https://helius.xyz → **Get API Key**
+2. Зареєструйся → Dashboard → **Create API Key**
+3. Скопіюй API Key
+4. Твій RPC URL для mainnet: `https://mainnet.helius-rpc.com/?api-key=ТВІЙ_КЛЮЧ`
+
+### 5.2 Livepeer Studio (відео)
+
+1. Зайди на https://livepeer.studio → **Sign Up**
+2. Dashboard → **Developers** → **API Keys** → **Create API Key**
+3. Скопіюй API Key → це `LIVEPEER_API_KEY`
+
+### 5.3 Pinata (IPFS для превью)
+
+1. Зайди на https://pinata.cloud → **Sign Up**
+2. Dashboard → **API Keys** → **New Key**
+3. Дай назву: `amsets-prod`, вибери **Admin**
+4. Натисни **Generate Key** → скопіюй **JWT** (довгий рядок)
+5. Це `PINATA_JWT`
+6. Також скопіюй **Gateway URL** (вигляд: `https://твій-id.mypinata.cloud`)
+
+### 5.4 Web3Auth (email/Google login)
+
+1. Зайди на https://dashboard.web3auth.io
+2. **Sign In** → **Create Project**
+3. Вибери:
+   - Product: **Plug and Play**
+   - Platform: **Web**
+   - SDK: **Web3Auth Modal**
+4. Скопіюй **Client ID**
+
+**Важливо**: Для mainnet потрібно окремий верифікатор:
+1. У проекті знайди **Verifiers** → **Create Verifier**
+2. Додай домен свого сайту у **Whitelist URLs**
+3. Змінних у `useAuth.ts`:
+   ```typescript
+   web3AuthNetwork: "sapphire_mainnet"  // замість "sapphire_devnet"
+   ```
+
+---
+
+## Частина 6 — Деплой Backend (Railway)
+
+### 6.1 Реєстрація та підключення репо
+
+1. Зайди на https://railway.app → **Login** → через GitHub
+2. Натисни **New Project** → **Deploy from GitHub repo**
+3. Вибери репозиторій `amsets`
+4. Railway запропонує вибрати папку — вибери `amsets-api`
+
+### 6.2 Налаштування змінних середовища
+
+У Railway відкрий свій сервіс → вкладка **Variables** → додай всі змінні:
+
 ```env
 NODE_ENV=production
 PORT=3001
-SOLANA_RPC_URL=https://mainnet.helius-rpc.com/?api-key=<KEY>
-PROGRAM_ID=<mainnet-program-id>
+
+DATABASE_URL=postgresql://...  (з Neon)
+REDIS_URL=rediss://...          (з Upstash)
+
+JWT_SECRET=згенеруй_64_символи  # openssl rand -hex 64
+JWT_EXPIRES_IN=7d
+
+SOLANA_RPC_URL=https://mainnet.helius-rpc.com/?api-key=ТВІЙ_HELIUS_KEY
+HELIUS_API_KEY=ТВІЙ_HELIUS_KEY
+PROGRAM_ID=ТВІЙ_PROGRAM_ID_З_ДЕПЛОЮ_КОНТРАКТУ
+
+PINATA_JWT=ТВІЙ_PINATA_JWT
+PINATA_GATEWAY=https://ТВІЙ_ПІННЕР.mypinata.cloud
+
+LIVEPEER_API_KEY=ТВІЙ_LIVEPEER_KEY
+
+MINT_AUTHORITY_SECRET=BASE58_РЯДОК_З_КРОКУ_1.4
+
+ADMIN_SECRET=ПРИДУМАЙ_СКЛАДНИЙ_ПАРОЛЬ
 ```
 
-### 3.2 PostgreSQL (Neon recommended)
+> Щоб згенерувати JWT_SECRET відкрий термінал і виконай:  
+> `openssl rand -hex 64`
+
+### 6.3 Налаштування команд запуску
+
+У Railway → **Settings** → **Build & Deploy**:
+- **Root Directory**: `amsets-api`
+- **Build Command**: `npm install && npm run build`
+- **Start Command**: `npm start`
+
+### 6.4 Міграція БД
+
+Після першого деплою потрібно застосувати схему до Neon:
+
+1. У Railway відкрий **Shell** (або **Run Command**)
+2. Виконай:
+   ```bash
+   npm run db:push
+   ```
+
+### 6.5 Отримання URL бекенду
+
+Після деплою Railway покаже URL виду:
+```
+https://amsets-api-production.up.railway.app
+```
+Збережи — це твій `NEXT_PUBLIC_API_URL`.
+
+---
+
+## Частина 7 — Деплой Frontend (Vercel)
+
+### 7.1 Реєстрація та підключення репо
+
+1. Зайди на https://vercel.com → **Sign Up** → через GitHub
+2. **Add New Project** → вибери репозиторій `amsets`
+3. Vercel запитає Root Directory → вкажи `amsets-app`
+4. **Framework Preset**: Next.js (визначиться автоматично)
+
+### 7.2 Налаштування змінних середовища
+
+До натискання Deploy — натисни **Environment Variables** і додай:
+
+```env
+NEXT_PUBLIC_API_URL=https://amsets-api-production.up.railway.app
+
+NEXT_PUBLIC_SOLANA_RPC_URL=https://mainnet.helius-rpc.com/?api-key=ТВІЙ_HELIUS_KEY
+NEXT_PUBLIC_PROGRAM_ID=ТВІЙ_PROGRAM_ID
+
+NEXT_PUBLIC_WEB3AUTH_CLIENT_ID=ТВІЙ_WEB3AUTH_CLIENT_ID
+
+NEXT_PUBLIC_PINATA_JWT=ТВІЙ_PINATA_JWT
+NEXT_PUBLIC_PINATA_GATEWAY=https://ТВІЙ_ПІННЕР.mypinata.cloud
+
+NEXT_PUBLIC_MINT_AUTHORITY_PUBKEY=ПУБЛІЧНИЙ_КЛЮЧ_MINT_AUTHORITY
+```
+
+### 7.3 Деплой
+
+1. Натисни **Deploy**
+2. Vercel збере і задеплоїть — займе 2-3 хвилини
+3. Після завершення отримаєш URL виду: `https://amsets.vercel.app`
+
+### 7.4 Налаштування власного домену (опційно)
+
+1. У Vercel → твій проект → **Domains** → **Add Domain**
+2. Введи свій домен (наприклад `amsets.space`)
+3. Vercel покаже DNS записи які потрібно додати у твого реєстратора
+4. Додай їх і зачекай 5-30 хвилин
+
+---
+
+## Частина 8 — Оновлення коду та повторний деплой
+
+### Оновлення коду
+
 ```bash
-# Create managed PostgreSQL on neon.tech
-# Copy the connection string to DATABASE_URL
-
-# Run migrations on first deploy
-cd amsets-api
-npx drizzle-kit push
+git add .
+git commit -m "опис змін"
+git push origin main
 ```
 
-### 3.3 Redis (Upstash recommended)
-- Create a database at https://upstash.com
-- Copy `REDIS_URL` (TLS-enabled connection string)
-
-### 3.4 Custom Domain
-- Point `api.amsets.xyz` → Railway deployment via CNAME
-- Enable HTTPS (automatic on Railway)
+**Vercel і Railway деплоять автоматично** при кожному push в `main` гілку.
 
 ---
 
-## 4. Frontend Deployment
+## Частина 9 — Фінальна перевірка після деплою
 
-### 4.1 Vercel (recommended)
+Пройди по чек-листу після деплою:
+
+- [ ] Сайт відкривається за продакшн URL
+- [ ] Login через Web3Auth (email) працює
+- [ ] Login через Phantom/Solflare працює
+- [ ] Завантаження відео проходить успішно
+- [ ] Відео з'являється на Marketplace
+- [ ] Відео відтворюється після купівлі
+- [ ] Транзакція проходить на Mainnet
+- [ ] Платформа отримує комісію
+- [ ] `/health` endpoint бекенду повертає `{ status: "ok" }`
+
+---
+
+## Частина 10 — Моніторинг та підтримка
+
+### Логи
+
+- **Frontend (Vercel)**: Dashboard → твій проект → **Functions** → **View Logs**
+- **Backend (Railway)**: твій сервіс → вкладка **Logs**
+
+### Сповіщення про помилки
+
+Рекомендується підключити [Sentry](https://sentry.io) для відстеження помилок:
+
 ```bash
-# Install Vercel CLI
-npm i -g vercel
-
-cd amsets-app
-vercel --prod
+# У amsets-api та amsets-app
+npm install @sentry/nextjs @sentry/node
 ```
 
-Or connect GitHub repo at https://vercel.com/new:
-- Root directory: `amsets-app`
-- Framework: Next.js
-- Build command: `npm run build`
-- Output: `.next`
+### Бекап бази даних
 
-### 4.2 Environment Variables on Vercel
-Set all `NEXT_PUBLIC_*` variables in Vercel dashboard → Settings → Environment Variables:
-
-```
-NEXT_PUBLIC_API_URL=https://api.amsets.xyz
-NEXT_PUBLIC_SOLANA_RPC_URL=https://mainnet.helius-rpc.com/?api-key=<KEY>
-NEXT_PUBLIC_PROGRAM_ID=<mainnet-program-id>
-NEXT_PUBLIC_WEB3AUTH_CLIENT_ID=<mainnet-client-id>
-NEXT_PUBLIC_PINATA_JWT=<jwt>
-NEXT_PUBLIC_PINATA_GATEWAY=https://amsets.mypinata.cloud
-NEXT_PUBLIC_IRYS_NETWORK=mainnet
-```
-
-### 4.3 Lit Protocol: Switch to Mainnet
-In `amsets-app/lib/lit.ts`, change:
-```typescript
-// dev:
-litNodeClient = new LitNodeClient({ litNetwork: "datil-dev" });
-// production:
-litNodeClient = new LitNodeClient({ litNetwork: "datil" });
-```
-
-### 4.4 Domain
-- Point `amsets.xyz` and `www.amsets.xyz` → Vercel via DNS CNAME/A records
-- Enable HTTPS (automatic on Vercel)
+Neon робить автоматичні бекапи. Додатково:
+- Dashboard → **Branches** → **Create Branch** — створи точку відновлення перед кожним великим оновленням
 
 ---
 
-## 5. Helius Webhook (Production)
+## Розрахунок вартості (приблизно, per місяць)
 
-Register a webhook in Helius dashboard to keep the marketplace cache fresh:
-
-- **Account addresses**: `[<PROGRAM_ID>]`
-- **Transaction types**: `["TRANSACTION"]`
-- **Webhook URL**: `https://api.amsets.xyz/api/v1/webhook/helius`
-- **Auth header**: set `HELIUS_WEBHOOK_SECRET` in backend env
-
----
-
-## 6. Pinata Production Setup
-
-1. Go to https://app.pinata.cloud
-2. Create a dedicated gateway: `amsets.mypinata.cloud`
-3. Generate a new API key with `pinFileToIPFS` permission
-4. Set `NEXT_PUBLIC_PINATA_JWT` in Vercel env
-5. Enable "Content Addressable" gateway for public preview access
+| Сервіс | Безкоштовний план | Платний (при зростанні) |
+|---|---|---|
+| Vercel | $0 (до 100GB bandwidth) | $20/міс |
+| Railway | $5/міс (starter) | $20+/міс |
+| Neon | $0 (до 0.5 GB storage) | $19/міс |
+| Upstash | $0 (до 10K команд/день) | $10/міс |
+| Helius | $0 (до 100K запитів/міс) | $49/міс |
+| Livepeer | $0 (до 1000 хв/міс) | залежить від трафіку |
+| Pinata | $0 (до 1 GB) | $20/міс |
+| **Всього** | **~$5/міс** | **$100-200/міс** |
 
 ---
 
-## 7. Monitoring & Alerting
+## Безпека — обов'язкові заходи
 
-| Tool | Purpose | Setup |
-|------|---------|-------|
-| Helius webhooks | Real-time on-chain events | Section 5 above |
-| Railway metrics | CPU/RAM/error rate | Built-in to Railway dashboard |
-| Vercel Analytics | Frontend performance | Enable in Vercel dashboard |
-| UptimeRobot | Uptime monitoring | Monitor `api.amsets.xyz/api/v1/marketplace` |
-| Sentry | Error tracking | `npm i @sentry/nextjs @sentry/node` → configure DSN |
+1. **Ніколи** не комітти `.env` файли у git (перевір `.gitignore`)
+2. **Ротуй** JWT_SECRET та ADMIN_SECRET кожні 90 днів
+3. **Зберігай** seed phrases гаманців у KeePass або 1Password, НІКОЛИ у хмарі
+4. **Заблокуй** адмін-роути за IP або Basic Auth у продакшн
+5. **Увімкни** 2FA на всіх сервісах (Vercel, Railway, GitHub)
+6. **Обмеж** CORS у `amsets-api/src/middleware/cors.middleware.ts` тільки своїм доменом:
+   ```typescript
+   origin: ["https://amsets.space", "https://www.amsets.space"]
+   ```
+7. **Встанови** rate limiting — вже налаштований у бекенді, перевір ліміти
+8. **Аудит** смарт-контракту перед великим запуском (Sec3, OtterSec)
 
 ---
 
-## 8. Security Hardening (Production)
+## Rollback (відкат у разі проблем)
 
-### 8.1 Backend
+### Frontend (Vercel)
+1. Vercel → проект → **Deployments**
+2. Знайди попередній успішний деплой
+3. **⋮** → **Promote to Production**
+
+### Backend (Railway)
+1. Railway → сервіс → **Deployments**
+2. Вибери попередній деплой → **Rollback**
+
+### Смарт-контракт
+Якщо контракт upgradeable — через Anchor:
 ```bash
-# Rate limiting — add to Hono middleware
-import { rateLimiter } from "hono-rate-limiter";
-app.use("/api/v1/auth/*", rateLimiter({ windowMs: 60_000, limit: 10 }));
-
-# CORS — restrict to production domain only
-app.use("/*", cors({ origin: "https://amsets.xyz" }));
+anchor upgrade target/deploy/amsets_registry.so \
+  --program-id PROGRAM_ID \
+  --provider.cluster mainnet-beta
 ```
-
-### 8.2 JWT Rotation
-- Set JWT expiry to 24h: `expiresIn: "24h"`
-- Implement refresh token flow before launch
-
-### 8.3 Database
-- Enable SSL connections for PostgreSQL
-- Restrict DB access to API server IP only (Neon/Supabase firewall rules)
-- Daily automated backups
-
-### 8.4 Program Keypair Security
-- Store program keypair in hardware wallet (Ledger) or HSM
-- After multisig transfer (section 2.4), the keypair should be taken offline
-- **Never commit the keypair to Git**
+Якщо НЕ upgradeable — доведеться задеплоїти нову версію і мігрувати дані.
 
 ---
 
-## 9. Launch Sequence
+## Контакти та підтримка
 
-```
-Day -7:  Security audit complete → all critical findings resolved
-Day -5:  Deploy to mainnet devnet-fork for final testing
-Day -3:  Deploy smart contract to mainnet → initialize fee vault
-Day -2:  Deploy backend API to Railway (production env)
-Day -2:  Deploy frontend to Vercel (production env)
-Day -1:  DNS cutover → amsets.xyz → Vercel, api.amsets.xyz → Railway
-Day  0:  Enable Helius webhook → verify marketplace populates
-Day  0:  Announce launch (Twitter/Discord)
-Day +1:  Monitor error rates, RPC costs, Pinata usage
-```
-
----
-
-## 10. Cost Estimates (Monthly)
-
-| Service | Tier | Estimated Cost |
-|---------|------|---------------|
-| Vercel | Pro | $20/mo |
-| Railway (API) | Hobby+ | $5–20/mo |
-| Neon (PostgreSQL) | Launch | $19/mo |
-| Upstash (Redis) | Pay-as-you-go | $0–10/mo |
-| Helius | Developer | $49/mo (or pay-per-RPC) |
-| Pinata | Picante | $20/mo |
-| Domain (amsets.xyz) | Annual | ~$12/yr |
-| **Total** | | **~$115–140/mo** |
-
-Solana mainnet transaction costs (at current fees): ~$0.000025 per registration (effectively free for users if sponsored).
-
----
-
-*Last updated: February 2026*
+- GitHub Issues: https://github.com/MikePasqualle/amsets/issues
+- Founder: Michael Patsan
