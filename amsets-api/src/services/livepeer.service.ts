@@ -1,20 +1,17 @@
 /**
- * Livepeer Studio service — video upload and JWT-gated playback.
+ * Livepeer Studio service — video upload and application-gated playback.
  *
  * ENV required:
- *   LIVEPEER_API_KEY        — Studio API key (server-side only)
- *   LIVEPEER_SIGNING_KEY_ID — ID of the signing key created in Studio
- *   LIVEPEER_PRIVATE_KEY    — Base64-encoded PEM private key for ES256 JWT signing
+ *   LIVEPEER_API_KEY — Studio API key (server-side only)
  *
- * Flow:
- *   1. createAsset()        → backend requests TUS upload URL from Livepeer Studio
- *   2. Frontend uploads video directly to TUS URL (no API key exposed)
- *   3. storageUri stored as "livepeer://{playbackId}"
- *   4. signPlaybackJwt()    → backend signs ES256 JWT for authorized viewers
- *   5. Frontend passes JWT to Livepeer Player
+ * Security model:
+ *   - Livepeer assets use "public" playback policy (no CDN-level JWT)
+ *   - Access control is enforced at our API layer:
+ *       GET /livepeer/playback-jwt/:contentId checks wallet auth + purchase records
+ *       and returns the HLS URL only to authorized callers
+ *   - The playback ID is never exposed in the frontend bundle or HTML;
+ *     it is served only via authenticated API responses
  */
-
-import jwt from "jsonwebtoken";
 
 const LIVEPEER_API_BASE = "https://livepeer.studio/api";
 
@@ -43,8 +40,8 @@ export async function createLivepeerAsset(name: string): Promise<LivepeerAsset> 
     },
     body: JSON.stringify({
       name,
-      // Gate playback with signed JWTs — only authorized viewers can watch
-      playbackPolicy: { type: "jwt" },
+      // Public Livepeer policy — access is enforced at our API layer, not CDN layer
+      playbackPolicy: { type: "public" },
     }),
   });
 
@@ -86,42 +83,12 @@ export async function getAssetStatus(assetId: string): Promise<{ status: string;
 }
 
 /**
- * Signs an ES256 JWT that allows an authorized viewer to play the gated asset.
- * The JWT is valid for 1 hour and is passed to the Livepeer Player component.
- *
- * JWT claims required by Livepeer Studio:
- *   sub    — playback ID of the asset
- *   action — "pull"
- *   pub    — signing key ID from Studio
- *   iss    — "Livepeer"
- *   exp    — Unix timestamp (1 hour from now)
+ * Builds the HLS playback URL for a Livepeer asset.
+ * The URL is only returned to callers who have passed our application-level
+ * auth check (see livepeer.route.ts GET /playback-jwt/:contentId).
  */
-export function signPlaybackJwt(playbackId: string): string {
-  const signingKeyId  = process.env.LIVEPEER_SIGNING_KEY_ID;
-  const privateKeyB64 = process.env.LIVEPEER_PRIVATE_KEY;
-
-  if (!signingKeyId || !privateKeyB64) {
-    throw new Error("LIVEPEER_SIGNING_KEY_ID or LIVEPEER_PRIVATE_KEY is not set");
-  }
-
-  // Decode base64-encoded PEM private key stored in env
-  const privateKey = Buffer.from(privateKeyB64, "base64").toString("utf-8");
-
-  const token = jwt.sign(
-    {
-      sub:    playbackId,
-      action: "pull",
-      pub:    signingKeyId,
-      iss:    "Livepeer",
-    },
-    privateKey,
-    {
-      algorithm: "ES256",
-      expiresIn: "1h",
-    }
-  );
-
-  return token;
+export function getPlaybackUrl(playbackId: string): string {
+  return `https://playback.livepeer.studio/asset/hls/${playbackId}/index.m3u8`;
 }
 
 /**

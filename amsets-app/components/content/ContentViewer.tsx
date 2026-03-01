@@ -1,12 +1,15 @@
 "use client";
 
 /**
- * ContentViewer — native HLS video player with JWT-gated access.
+ * ContentViewer — native HLS video player with application-level access control.
  *
  * Flow:
  *   storageUri = "livepeer://{playbackId}"
- *   → backend issues signed JWT + returns assetStatus
- *   → HLS.js (Chrome/Firefox) or native <video> (Safari) plays the stream
+ *   → backend verifies auth + purchase → returns hlsUrl + assetStatus
+ *   → HLS.js (Chrome/Firefox/Edge) or native <video> (Safari iOS) plays the stream
+ *
+ * Security: the playbackId / HLS URL is never embedded in the page source;
+ *           it is fetched only after the backend confirms access rights.
  *
  * Legacy Arweave/Lit code is commented out at the bottom for rollback reference.
  */
@@ -25,7 +28,6 @@ import { GlowButton } from "@/components/ui/GlowButton";
 import { useSession } from "@/hooks/useSession";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3001";
-const LIVEPEER_CDN = "https://livepeercdn.studio/hls";
 
 interface ContentViewerProps {
   contentId:  string;
@@ -83,7 +85,7 @@ export function ContentViewer({
 
       const data = await res.json();
       const pid         = data.playbackId as string;
-      const jwt         = data.jwt as string | null;
+      const hlsUrlRaw   = data.hlsUrl as string | null;
       const assetStatus = (data.assetStatus as AssetStatus) ?? "ready";
 
       setPlaybackId(pid);
@@ -98,9 +100,8 @@ export function ContentViewer({
         return;
       }
 
-      const url = jwt
-        ? `${LIVEPEER_CDN}/${pid}/index.m3u8?jwt=${jwt}`
-        : `${LIVEPEER_CDN}/${pid}/index.m3u8`;
+      // Use the HLS URL returned by the backend (access already verified server-side)
+      const url = hlsUrlRaw ?? `https://playback.livepeer.studio/asset/hls/${pid}/index.m3u8`;
 
       setHlsUrl(url);
       setViewerState("ready");
@@ -119,11 +120,11 @@ export function ContentViewer({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [storageUri, token]);
 
-  // Set up HLS.js player — runs when viewerState becomes "ready" and video element is in DOM
+  // Set up HLS player — runs when viewerState becomes "ready" and <video> is in DOM
   useEffect(() => {
     if (viewerState !== "ready" || !hlsUrl) return;
 
-    // Wait one tick for the <video> element to be in the DOM after state change
+    // Small defer ensures React has committed the <video> element to the DOM
     const timer = setTimeout(() => {
       const video = videoRef.current;
       if (!video) return;
@@ -134,59 +135,49 @@ export function ContentViewer({
         hlsRef.current = null;
       }
 
-      // Safari / iOS — native HLS support
-      if (video.canPlayType("application/vnd.apple.mpegurl")) {
-        video.src = hlsUrl;
-        video.load();
-        video.onerror = () => {
-          console.error("[ContentViewer] Safari native HLS error", video.error);
-          setViewerState("not_found");
-        };
-        return;
-      }
-
-      // Chrome / Firefox — HLS.js
       import("hls.js").then((mod) => {
         const Hls = mod.default;
-        if (!Hls.isSupported()) {
-          // Ultimate fallback: try native src (won't work for HLS on old Chrome)
+
+        // Prefer HLS.js on all browsers (Chrome, Firefox, Edge, desktop Safari)
+        // Falls back to native <video> only when HLS.js MSE is unavailable (e.g. Safari iOS)
+        if (Hls.isSupported()) {
+          const hls = new Hls({
+            enableWorker: true,
+            lowLatencyMode: false,
+          });
+
+          hlsRef.current = hls;
+
+          hls.on(Hls.Events.ERROR, (_: any, data: any) => {
+            if (!data.fatal) return;
+            console.error("[ContentViewer] HLS fatal:", data.type, data.details);
+            if (data.type === "networkError") {
+              setViewerState("not_found");
+            } else {
+              setErrorText("Playback error — try refreshing the page");
+              setViewerState("error");
+            }
+            hls.destroy();
+            hlsRef.current = null;
+          });
+
+          hls.loadSource(hlsUrl);
+          hls.attachMedia(video);
+
+        } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
+          // Safari native HLS (when HLS.js MSE is unavailable)
           video.src = hlsUrl;
           video.load();
-          return;
-        }
-
-        const hls = new Hls({
-          enableWorker: true,
-          lowLatencyMode: false,
-          // Include JWT on every sub-request (manifest, segments, keys)
-          xhrSetup: (xhr: XMLHttpRequest, url: string) => {
-            if (hlsUrl.includes("?jwt=") && !url.includes("jwt=")) {
-              const jwt = hlsUrl.split("?jwt=")[1];
-              xhr.open("GET", `${url}${url.includes("?") ? "&" : "?"}jwt=${jwt}`, true);
-            }
-          },
-        });
-
-        hlsRef.current = hls;
-
-        hls.on(Hls.Events.ERROR, (_: any, data: any) => {
-          if (!data.fatal) return;
-          console.error("[ContentViewer] HLS fatal error:", data.type, data.details);
-          if (data.type === "networkError") {
-            // Manifest 404/403 → video doesn't exist or access denied
+          video.addEventListener("error", () => {
             setViewerState("not_found");
-          } else {
-            setErrorText("Playback error — try refreshing");
-            setViewerState("error");
-          }
-          hls.destroy();
-          hlsRef.current = null;
-        });
+          }, { once: true });
 
-        hls.loadSource(hlsUrl);
-        hls.attachMedia(video);
+        } else {
+          setErrorText("Your browser does not support this video format.");
+          setViewerState("error");
+        }
       });
-    }, 50); // small delay ensures DOM is committed after React state update
+    }, 50);
 
     return () => {
       clearTimeout(timer);
@@ -195,7 +186,6 @@ export function ContentViewer({
         hlsRef.current = null;
       }
     };
-  // viewerState drives the mount; hlsUrl carries the URL — both needed
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [viewerState, hlsUrl]);
 

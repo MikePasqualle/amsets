@@ -1,5 +1,5 @@
 /**
- * Livepeer routes — video upload & JWT-gated playback.
+ * Livepeer routes — video upload & application-gated playback.
  *
  * POST /api/v1/livepeer/request-upload
  *   Auth: Bearer JWT (any registered user)
@@ -8,7 +8,8 @@
  *
  * GET /api/v1/livepeer/playback-jwt/:contentId
  *   Auth: Bearer JWT (buyer or author)
- *   Returns: { jwt } — ES256 token for Livepeer Player
+ *   Returns: { hlsUrl, playbackId, assetStatus }
+ *   Access control: enforced here — playbackId never exposed without auth + purchase check
  *
  * GET /api/v1/livepeer/asset-status/:assetId
  *   Auth: Bearer JWT
@@ -24,7 +25,7 @@ import { content as contentTable, purchases } from "../db/schema";
 import { verifyUserJwt } from "../services/jwt.service";
 import {
   createLivepeerAsset,
-  signPlaybackJwt,
+  getPlaybackUrl,
   getAssetStatus,
 } from "../services/livepeer.service";
 
@@ -123,7 +124,7 @@ livepeerRouter.get("/playback-jwt/:contentId", async (c) => {
     }
   }
 
-  // Check if the Livepeer asset actually exists and is ready
+  // Verify the Livepeer asset status via Studio API
   let assetStatus: "ready" | "transcoding" | "not_found" = "ready";
   try {
     const apiKey = process.env.LIVEPEER_API_KEY;
@@ -141,19 +142,11 @@ livepeerRouter.get("/playback-jwt/:contentId", async (c) => {
       }
     }
   } catch {
-    // Non-fatal: if we can't check, proceed optimistically
+    // Non-fatal — proceed optimistically
   }
 
-  try {
-    const token = signPlaybackJwt(playbackId);
-    return c.json({ jwt: token, playbackId, assetStatus });
-  } catch (err: any) {
-    console.error("[livepeer] JWT signing error:", err?.message);
-    if (err?.message?.includes("not set")) {
-      return c.json({ jwt: null, playbackId, assetStatus });
-    }
-    return c.json({ error: "JWT signing failed" }, 500);
-  }
+  const hlsUrl = assetStatus === "ready" ? getPlaybackUrl(playbackId) : null;
+  return c.json({ hlsUrl, playbackId, assetStatus });
 });
 
 // ─── GET /asset-status/:assetId ──────────────────────────────────────────────
