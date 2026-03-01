@@ -53,6 +53,8 @@ export function ContentViewer({
   const [errorText,   setErrorText]   = useState("");
   const [hlsUrl,      setHlsUrl]      = useState<string | null>(null);
   const [playbackId,  setPlaybackId]  = useState<string | null>(null);
+  // Destroy HLS.js instance reference so we can clean up on re-mount
+  const hlsRef = useRef<any>(null);
 
   const isLivepeer = storageUri.startsWith("livepeer://");
   const isArweave  = storageUri.startsWith("ar://");
@@ -117,38 +119,85 @@ export function ContentViewer({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [storageUri, token]);
 
-  // Set up HLS.js player when hlsUrl is ready
+  // Set up HLS.js player — runs when viewerState becomes "ready" and video element is in DOM
   useEffect(() => {
-    if (!hlsUrl || !videoRef.current) return;
-    const video = videoRef.current;
+    if (viewerState !== "ready" || !hlsUrl) return;
 
-    // Safari supports HLS natively
-    if (video.canPlayType("application/vnd.apple.mpegurl")) {
-      video.src = hlsUrl;
-      return;
-    }
+    // Wait one tick for the <video> element to be in the DOM after state change
+    const timer = setTimeout(() => {
+      const video = videoRef.current;
+      if (!video) return;
 
-    // Chrome / Firefox — use HLS.js
-    let Hls: any;
-    let hls: any;
+      // Clean up any previous HLS.js instance
+      if (hlsRef.current) {
+        hlsRef.current.destroy();
+        hlsRef.current = null;
+      }
 
-    import("hls.js").then((mod) => {
-      Hls = mod.default;
-      if (!Hls.isSupported()) return;
-      hls = new Hls({ enableWorker: false });
-      hls.loadSource(hlsUrl);
-      hls.attachMedia(video);
-      hls.on(Hls.Events.ERROR, (_: any, data: any) => {
-        if (data.fatal) {
-          console.error("[ContentViewer] HLS fatal error:", data.type, data.details);
+      // Safari / iOS — native HLS support
+      if (video.canPlayType("application/vnd.apple.mpegurl")) {
+        video.src = hlsUrl;
+        video.load();
+        video.onerror = () => {
+          console.error("[ContentViewer] Safari native HLS error", video.error);
+          setViewerState("not_found");
+        };
+        return;
+      }
+
+      // Chrome / Firefox — HLS.js
+      import("hls.js").then((mod) => {
+        const Hls = mod.default;
+        if (!Hls.isSupported()) {
+          // Ultimate fallback: try native src (won't work for HLS on old Chrome)
+          video.src = hlsUrl;
+          video.load();
+          return;
         }
+
+        const hls = new Hls({
+          enableWorker: true,
+          lowLatencyMode: false,
+          // Include JWT on every sub-request (manifest, segments, keys)
+          xhrSetup: (xhr: XMLHttpRequest, url: string) => {
+            if (hlsUrl.includes("?jwt=") && !url.includes("jwt=")) {
+              const jwt = hlsUrl.split("?jwt=")[1];
+              xhr.open("GET", `${url}${url.includes("?") ? "&" : "?"}jwt=${jwt}`, true);
+            }
+          },
+        });
+
+        hlsRef.current = hls;
+
+        hls.on(Hls.Events.ERROR, (_: any, data: any) => {
+          if (!data.fatal) return;
+          console.error("[ContentViewer] HLS fatal error:", data.type, data.details);
+          if (data.type === "networkError") {
+            // Manifest 404/403 → video doesn't exist or access denied
+            setViewerState("not_found");
+          } else {
+            setErrorText("Playback error — try refreshing");
+            setViewerState("error");
+          }
+          hls.destroy();
+          hlsRef.current = null;
+        });
+
+        hls.loadSource(hlsUrl);
+        hls.attachMedia(video);
       });
-    });
+    }, 50); // small delay ensures DOM is committed after React state update
 
     return () => {
-      hls?.destroy();
+      clearTimeout(timer);
+      if (hlsRef.current) {
+        hlsRef.current.destroy();
+        hlsRef.current = null;
+      }
     };
-  }, [hlsUrl]);
+  // viewerState drives the mount; hlsUrl carries the URL — both needed
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [viewerState, hlsUrl]);
 
   // Auto-refresh transcoding state every 15 seconds
   useEffect(() => {

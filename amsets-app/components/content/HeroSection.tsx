@@ -144,8 +144,8 @@ export function HeroSection() {
           </p>
 
           <p className="text-[#7A6E8E] text-base max-w-lg">
-            Register your work, set a price, share a link. Buyers get a token-gated access NFT.
-            All protected by end-to-end encryption and Lit Protocol.
+            Register your work on-chain, set a price, share a link. Buyers receive an
+            access token that proves ownership and grants streaming rights — enforced by smart contract.
           </p>
 
           <div ref={ctaRef} className="flex gap-4 mt-6 opacity-0">
