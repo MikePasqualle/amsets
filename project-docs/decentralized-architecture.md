@@ -1,4 +1,4 @@
-# AMSETS — Decentralized Architecture (Phase 1-4 Implemented)
+# AMSETS — Decentralized Architecture (Phase 1-5 Implemented)
 
 ## Architecture Overview
 
@@ -243,6 +243,40 @@ NEXT_PUBLIC_WEB3AUTH_CLIENT_ID=your_web3auth_client_id
 ### Phase 4 ✅
 - `LibraryClient.tsx`: reads AccessReceipt PDAs from Solana + backend cache merge
 - `purchases.route.ts`: POST /purchases (idempotent cache write)
+
+### Phase 5 ✅ — Minimum Royalty Feature (2026-02-21)
+**Smart Contract (`lib.rs`):**
+- New `min_royalty_lamports: u64` field in `ContentRecord` (Borsh offset: after `royalty_bps`)
+- `register_content` instruction now accepts `min_royalty_lamports` parameter (default 0)
+- `create_listing` validates `price > max(royalty_bps%, min_royalty_lamports) + platform_fee`; rejects with `PriceBelowMinRoyalty` error if too low — fully decentralized, no trusted middleman
+- `execute_sale` computes `royalty = max(pct_royalty, min_royalty_lamports)` — author always receives the higher of the two
+- `ContentRecord.MAX_SIZE` updated to 614 bytes (+8 for new u64 field)
+- New error variant: `PriceBelowMinRoyalty`
+- Deployed to Devnet: `B2gRbiHAfn7sZo8Kyecoc8xbkMzbgA7f7oJvBVjJxatG`
+
+**Frontend (`anchor.ts`):**
+- `RegisterContentArgs.minRoyaltyLamports: bigint` added
+- `buildRegisterContentData` appends 8-byte u64 LE at end of instruction data
+- `PublishOnChainParams.minRoyaltyLamports?: bigint` added
+- `createListingOnChain` now requires `contentRecordPdaStr` (3rd arg) and passes it as the `content_record` account key for on-chain validation
+
+**Upload Wizard (`UploadSteps.tsx`):**
+- New "Min. Royalty (SOL)" input field in Step 3 (Pricing), default "0"
+- Converted to lamports and passed to `publishOnChain` as `minRoyaltyLamports`
+- Help text explains the floor is enforced on-chain
+
+**Content Page (`ContentPageClient.tsx`):**
+- `ContentItem.minRoyaltyLamports?: number` added
+- Shows author's minimum royalty + computed minimum listing price when floor > 0
+- Live payout preview uses `max(royalty_bps%, min_royalty_lamports)` for royalty display
+- "Confirm Listing" button disabled if entered price is below minimum
+- Resale listing fee breakdown correctly reflects the floor royalty
+- `createListingOnChain` called with `content.onChainPda` as 3rd argument
+
+**Backend:**
+- `helius.service.ts`: `OnChainContentRecord.minRoyaltyLamports: bigint` added; deserialized from last 8 bytes of ContentRecord
+- `marketplace.route.ts`: `minRoyaltyLamports` included in `EnrichedRecord` and marketplace response
+- `content.route.ts`: `registerSchema` accepts `min_royalty_lamports`; `GET /:id` enriches with on-chain `minRoyaltyLamports`
 
 ---
 

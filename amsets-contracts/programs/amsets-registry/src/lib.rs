@@ -50,6 +50,9 @@ pub struct ContentRecord {
     pub total_supply:     u32,    // maximum access tokens to ever mint
     pub available_supply: u32,    // tokens remaining (decremented on each primary purchase)
     pub royalty_bps:      u16,    // 0-5000 (50%); NFT holder earns this on every secondary sale
+    /// Minimum absolute royalty in lamports the author must receive per secondary sale.
+    /// 0 = percentage-only (no floor). When > 0, actual royalty = max(royalty_bps%, this value).
+    pub min_royalty_lamports: u64,
 }
 
 impl ContentRecord {
@@ -57,8 +60,8 @@ impl ContentRecord {
     // + storage_uri(4+200) + preview_uri(4+200)
     // + primary_author(32) + access_mint(32) + author_nft_mint(32)
     // + base_price(8) + payment_token(1) + license(1) + is_active(1) + bump(1)
-    // + total_supply(4) + available_supply(4) + royalty_bps(2)
-    pub const MAX_SIZE: usize = 8 + 32 + 32 + 204 + 204 + 32 + 32 + 32 + 8 + 1 + 1 + 1 + 1 + 4 + 4 + 2;
+    // + total_supply(4) + available_supply(4) + royalty_bps(2) + min_royalty_lamports(8)
+    pub const MAX_SIZE: usize = 8 + 32 + 32 + 204 + 204 + 32 + 32 + 32 + 8 + 1 + 1 + 1 + 1 + 4 + 4 + 2 + 8;
 }
 
 /// Per-buyer access receipt. PDA seeds: [b"access", content_record.key(), buyer.key()]
@@ -97,6 +100,24 @@ impl ListingRecord {
     pub const MAX_SIZE: usize = 8 + 32 + 32 + 32 + 8 + 32 + 1 + 8 + 1;
 }
 
+/// Global registry state — singleton PDA tracking aggregated protocol metrics.
+/// PDA seeds: [b"registry"]
+/// Incremented atomically by register_content, purchase_access_sol, execute_sale.
+/// Any frontend can derive this PDA and read real-time stats without a backend.
+#[account]
+pub struct RegistryState {
+    pub total_content:         u64,  // total content registered (ever)
+    pub total_purchases:       u64,  // total primary purchases
+    pub total_secondary_sales: u64,  // total secondary market sales completed
+    pub total_sol_volume:      u64,  // cumulative SOL volume in lamports
+    pub bump:                  u8,
+}
+
+impl RegistryState {
+    // discriminator(8) + 4×u64(32) + bump(1)
+    pub const MAX_SIZE: usize = 8 + 8 + 8 + 8 + 8 + 1;
+}
+
 // ─── Errors ───────────────────────────────────────────────────────────────────
 
 #[error_code]
@@ -127,6 +148,8 @@ pub enum AmsetsError {
     CannotBuyOwnListing,
     #[msg("Only the listing seller can cancel")]
     InvalidListingSeller,
+    #[msg("Price too low to cover minimum royalty + platform fee — raise your listing price")]
+    PriceBelowMinRoyalty,
 }
 
 // ─── Events ───────────────────────────────────────────────────────────────────
@@ -208,6 +231,10 @@ pub struct RegisterContent<'info> {
     )]
     pub content_record: Account<'info, ContentRecord>,
 
+    /// Global registry — incremented to track total content count.
+    #[account(mut, seeds = [b"registry"], bump = registry_state.bump)]
+    pub registry_state: Account<'info, RegistryState>,
+
     pub system_program: Program<'info, System>,
 }
 
@@ -219,6 +246,24 @@ pub struct InitializeVault<'info> {
     /// CHECK: Fee vault PDA — receives 2.5% of every purchase.
     #[account(mut, seeds = [b"fee_vault"], bump)]
     pub fee_vault: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+/// Initialize the singleton RegistryState PDA. Call once after deploying the program.
+#[derive(Accounts)]
+pub struct InitializeRegistry<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    #[account(
+        init,
+        payer = payer,
+        space = RegistryState::MAX_SIZE,
+        seeds = [b"registry"],
+        bump,
+    )]
+    pub registry_state: Account<'info, RegistryState>,
 
     pub system_program: Program<'info, System>,
 }
@@ -306,6 +351,10 @@ pub struct PurchaseAccessSol<'info> {
     #[account(mut, seeds = [b"fee_vault"], bump)]
     pub fee_vault: UncheckedAccount<'info>,
 
+    /// Global registry — incremented to track total purchases and SOL volume.
+    #[account(mut, seeds = [b"registry"], bump = registry_state.bump)]
+    pub registry_state: Account<'info, RegistryState>,
+
     pub system_program: Program<'info, System>,
 }
 
@@ -342,6 +391,14 @@ pub struct MintAccessToken<'info> {
 pub struct CreateListing<'info> {
     #[account(mut)]
     pub seller: Signer<'info>,
+
+    /// Content record — read-only; used to validate min_royalty_lamports at listing time.
+    /// The seller passes this so the on-chain validation is fully decentralised.
+    #[account(
+        seeds = [b"content", content_record.primary_author.as_ref(), &content_record.content_id],
+        bump = content_record.bump,
+    )]
+    pub content_record: Account<'info, ContentRecord>,
 
     #[account(
         init,
@@ -412,6 +469,10 @@ pub struct ExecuteSale<'info> {
     #[account(mut, address = listing_record.seller)]
     pub seller: UncheckedAccount<'info>,
 
+    /// Global registry — incremented to track total secondary sales and SOL volume.
+    #[account(mut, seeds = [b"registry"], bump = registry_state.bump)]
+    pub registry_state: Account<'info, RegistryState>,
+
     pub system_program: Program<'info, System>,
 }
 
@@ -420,6 +481,17 @@ pub struct ExecuteSale<'info> {
 #[program]
 pub mod amsets_registry {
     use super::*;
+
+    /// Initialize the singleton RegistryState PDA. Call once after program deployment.
+    pub fn initialize_registry(ctx: Context<InitializeRegistry>) -> Result<()> {
+        let registry = &mut ctx.accounts.registry_state;
+        registry.total_content         = 0;
+        registry.total_purchases       = 0;
+        registry.total_secondary_sales = 0;
+        registry.total_sol_volume      = 0;
+        registry.bump                  = ctx.bumps.registry_state;
+        Ok(())
+    }
 
     /// Initialise the fee vault PDA. Idempotent — safe to call multiple times.
     pub fn initialize_vault(ctx: Context<InitializeVault>, lamports: u64) -> Result<()> {
@@ -445,15 +517,16 @@ pub mod amsets_registry {
     /// Register IP content on-chain. Creates the ContentRecord PDA.
     pub fn register_content(
         ctx: Context<RegisterContent>,
-        content_id:    [u8; 32],
-        content_hash:  [u8; 32],
-        storage_uri:   String,
-        preview_uri:   String,
-        base_price:    u64,
-        payment_token: PaymentToken,
-        license:       LicenseTerms,
-        total_supply:  u32,
-        royalty_bps:   u16,
+        content_id:           [u8; 32],
+        content_hash:         [u8; 32],
+        storage_uri:          String,
+        preview_uri:          String,
+        base_price:           u64,
+        payment_token:        PaymentToken,
+        license:              LicenseTerms,
+        total_supply:         u32,
+        royalty_bps:          u16,
+        min_royalty_lamports: u64,
     ) -> Result<()> {
         require!(base_price > 0, AmsetsError::InvalidPrice);
         require!(!storage_uri.is_empty(), AmsetsError::InvalidStorageUri);
@@ -462,21 +535,22 @@ pub mod amsets_registry {
         require!(royalty_bps <= 5000, AmsetsError::Overflow);
 
         let record = &mut ctx.accounts.content_record;
-        record.content_id       = content_id;
-        record.content_hash     = content_hash;
-        record.storage_uri      = storage_uri;
-        record.preview_uri      = preview_uri;
-        record.primary_author   = ctx.accounts.author.key();
-        record.access_mint      = Pubkey::default();
-        record.author_nft_mint  = Pubkey::default();
-        record.base_price       = base_price;
-        record.payment_token    = payment_token;
-        record.license          = license;
-        record.is_active        = true;
-        record.bump             = ctx.bumps.content_record;
-        record.total_supply     = total_supply;
-        record.available_supply = total_supply;
-        record.royalty_bps      = royalty_bps;
+        record.content_id            = content_id;
+        record.content_hash          = content_hash;
+        record.storage_uri           = storage_uri;
+        record.preview_uri           = preview_uri;
+        record.primary_author        = ctx.accounts.author.key();
+        record.access_mint           = Pubkey::default();
+        record.author_nft_mint       = Pubkey::default();
+        record.base_price            = base_price;
+        record.payment_token         = payment_token;
+        record.license               = license;
+        record.is_active             = true;
+        record.bump                  = ctx.bumps.content_record;
+        record.total_supply          = total_supply;
+        record.available_supply      = total_supply;
+        record.royalty_bps           = royalty_bps;
+        record.min_royalty_lamports  = min_royalty_lamports;
 
         emit!(ContentRegistered {
             content_id,
@@ -485,6 +559,10 @@ pub mod amsets_registry {
             total_supply,
             royalty_bps,
         });
+
+        // Increment global registry counter
+        let registry = &mut ctx.accounts.registry_state;
+        registry.total_content = registry.total_content.saturating_add(1);
 
         Ok(())
     }
@@ -598,6 +676,11 @@ pub mod amsets_registry {
             available_supply:  available_after,
         });
 
+        // Increment global registry counters
+        let registry = &mut ctx.accounts.registry_state;
+        registry.total_purchases  = registry.total_purchases.saturating_add(1);
+        registry.total_sol_volume = registry.total_sol_volume.saturating_add(price);
+
         Ok(())
     }
 
@@ -624,6 +707,30 @@ pub mod amsets_registry {
         token_mint:     Pubkey,
     ) -> Result<()> {
         require!(price_lamports > 0, AmsetsError::InvalidPrice);
+
+        // On-chain minimum royalty validation — fully decentralised.
+        // The actual royalty the author earns is max(royalty_bps%, min_royalty_lamports).
+        // We reject listings where the seller's price doesn't cover that plus the protocol fee.
+        {
+            let record      = &ctx.accounts.content_record;
+            let min_royalty = record.min_royalty_lamports;
+            let royalty_bps = record.royalty_bps as u64;
+            let pct_royalty     = price_lamports
+                .checked_mul(royalty_bps)
+                .ok_or(AmsetsError::Overflow)?
+                .checked_div(BPS_DENOMINATOR)
+                .ok_or(AmsetsError::Overflow)?;
+            let actual_royalty  = pct_royalty.max(min_royalty);
+            let platform_fee    = price_lamports
+                .checked_mul(PROTOCOL_FEE_BPS)
+                .ok_or(AmsetsError::Overflow)?
+                .checked_div(BPS_DENOMINATOR)
+                .ok_or(AmsetsError::Overflow)?;
+            require!(
+                price_lamports > actual_royalty.saturating_add(platform_fee),
+                AmsetsError::PriceBelowMinRoyalty
+            );
+        }
 
         let listing = &mut ctx.accounts.listing_record;
         listing.listing_id     = listing_id;
@@ -677,18 +784,20 @@ pub mod amsets_registry {
             AmsetsError::InsufficientPayment
         );
 
-        // Compute splits
+        // Compute splits — royalty = max(royalty_bps%, min_royalty_lamports).
         let platform_fee = price
             .checked_mul(PROTOCOL_FEE_BPS)
             .ok_or(AmsetsError::Overflow)?
             .checked_div(BPS_DENOMINATOR)
             .ok_or(AmsetsError::Overflow)?;
 
-        let royalty = price
+        let pct_royalty = price
             .checked_mul(royalty_bps)
             .ok_or(AmsetsError::Overflow)?
             .checked_div(BPS_DENOMINATOR)
             .ok_or(AmsetsError::Overflow)?;
+
+        let royalty = pct_royalty.max(ctx.accounts.content_record.min_royalty_lamports);
 
         let seller_amount = price
             .checked_sub(platform_fee)
@@ -752,6 +861,11 @@ pub mod amsets_registry {
             price_lamports:    price,
             royalty_recipient: royalty_recip_key,
         });
+
+        // Increment global registry counters
+        let registry = &mut ctx.accounts.registry_state;
+        registry.total_secondary_sales = registry.total_secondary_sales.saturating_add(1);
+        registry.total_sol_volume      = registry.total_sol_volume.saturating_add(price);
 
         Ok(())
     }

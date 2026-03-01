@@ -53,10 +53,13 @@ const createListingSchema = z.object({
 
 listingsRouter.post(
   "/",
+  async (c, next) => {
+    if (!extractWallet(c.req.header("authorization"))) return c.json({ error: "Unauthorized" }, 401);
+    await next();
+  },
   zValidator("json", createListingSchema),
   async (c) => {
-    const sellerWallet = extractWallet(c.req.header("authorization"));
-    if (!sellerWallet) return c.json({ error: "Unauthorized" }, 401);
+    const sellerWallet = extractWallet(c.req.header("authorization"))!;
 
     const body = c.req.valid("json");
 
@@ -211,10 +214,13 @@ const soldSchema = z.object({ tx_signature: z.string().min(40) });
 
 listingsRouter.patch(
   "/:id/sold",
+  async (c, next) => {
+    if (!extractWallet(c.req.header("authorization"))) return c.json({ error: "Unauthorized" }, 401);
+    await next();
+  },
   zValidator("json", soldSchema),
   async (c) => {
-    const buyerWallet = extractWallet(c.req.header("authorization"));
-    if (!buyerWallet) return c.json({ error: "Unauthorized" }, 401);
+    const buyerWallet = extractWallet(c.req.header("authorization"))!;
 
     const { id } = c.req.param();
 
@@ -248,10 +254,13 @@ const fulfillSchema = z.object({
 
 listingsRouter.post(
   "/:id/fulfill",
+  async (c, next) => {
+    if (!extractWallet(c.req.header("authorization"))) return c.json({ error: "Unauthorized" }, 401);
+    await next();
+  },
   zValidator("json", fulfillSchema),
   async (c) => {
-    const buyerWallet = extractWallet(c.req.header("authorization"));
-    if (!buyerWallet) return c.json({ error: "Unauthorized" }, 401);
+    const buyerWallet = extractWallet(c.req.header("authorization"))!;
 
     const { id } = c.req.param();
     const body   = c.req.valid("json");
