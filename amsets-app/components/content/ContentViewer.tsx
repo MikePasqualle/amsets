@@ -1,14 +1,14 @@
 "use client";
 
 /**
- * ContentViewer — Livepeer video player with JWT-gated access.
+ * ContentViewer — native HLS video player with JWT-gated access.
  *
- * Current mode (Livepeer):
+ * Flow:
  *   storageUri = "livepeer://{playbackId}"
- *   → backend issues a signed JWT → @livepeer/react Player renders the video
+ *   → backend issues signed JWT + returns assetStatus
+ *   → HLS.js (Chrome/Firefox) or native <video> (Safari) plays the stream
  *
  * Legacy Arweave/Lit code is commented out at the bottom for rollback reference.
- * To restore: see the commented section at the end of this file.
  */
 
 // ── Arweave/Lit imports commented out — restore if switching back ─────────────
@@ -19,12 +19,10 @@
 // import bs58 from "bs58";
 // ──────────────────────────────────────────────────────────────────────────────
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import { NeonBadge } from "@/components/ui/NeonBadge";
 import { GlowButton } from "@/components/ui/GlowButton";
 import { useSession } from "@/hooks/useSession";
-// @livepeer/react Player imported only as type reference (composable player for future use)
-// import * as Player from "@livepeer/react/player";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3001";
 const LIVEPEER_CDN = "https://livepeercdn.studio/hls";
@@ -34,15 +32,13 @@ interface ContentViewerProps {
   storageUri: string;
   accessMint: string;
   mimeType:   string;
-  /** Legacy: encryptedKey from PostgreSQL (Phase 0 Arweave content) */
   encryptedKey?:       string;
-  /** Legacy: litConditionsHash from PostgreSQL (Phase 0 Arweave content) */
   litConditionsHash?:  string;
-  /** When true, bypass access checks — author always has access */
   isAuthor?: boolean;
 }
 
-type ViewerState = "idle" | "loading" | "ready" | "error";
+type AssetStatus = "ready" | "transcoding" | "not_found";
+type ViewerState = "idle" | "loading" | "ready" | "transcoding" | "not_found" | "error";
 
 export function ContentViewer({
   contentId,
@@ -50,17 +46,18 @@ export function ContentViewer({
   isAuthor = false,
 }: ContentViewerProps) {
   const { token } = useSession();
+  const videoRef = useRef<HTMLVideoElement>(null);
 
-  const [viewerState, setViewerState]   = useState<ViewerState>("idle");
-  const [statusText,  setStatusText]    = useState("");
-  const [errorText,   setErrorText]     = useState("");
-  const [playerSrc,   setPlayerSrc]     = useState<string | null>(null);
-  const [livePlaybackId, setLivePlaybackId] = useState<string | null>(null);
+  const [viewerState, setViewerState] = useState<ViewerState>("idle");
+  const [statusText,  setStatusText]  = useState("");
+  const [errorText,   setErrorText]   = useState("");
+  const [hlsUrl,      setHlsUrl]      = useState<string | null>(null);
+  const [playbackId,  setPlaybackId]  = useState<string | null>(null);
 
   const isLivepeer = storageUri.startsWith("livepeer://");
   const isArweave  = storageUri.startsWith("ar://");
 
-  const fetchPlaybackJwt = useCallback(async () => {
+  const fetchPlaybackAccess = useCallback(async () => {
     const authToken = token ?? localStorage.getItem("amsets_token");
     if (!authToken) {
       setErrorText("Connect your wallet to view this content.");
@@ -83,17 +80,27 @@ export function ContentViewer({
       }
 
       const data = await res.json();
-      const pid = data.playbackId as string;
-      const jwt = data.jwt as string | null;
+      const pid         = data.playbackId as string;
+      const jwt         = data.jwt as string | null;
+      const assetStatus = (data.assetStatus as AssetStatus) ?? "ready";
 
-      setLivePlaybackId(pid);
+      setPlaybackId(pid);
 
-      // Build HLS URL — append JWT as query param if available (Livepeer JWT-gate)
-      const hlsUrl = jwt
-        ? `${LIVEPEER_CDN}/${pid}/index.m3u8?jwt=${encodeURIComponent(jwt)}`
+      if (assetStatus === "not_found") {
+        setViewerState("not_found");
+        return;
+      }
+
+      if (assetStatus === "transcoding") {
+        setViewerState("transcoding");
+        return;
+      }
+
+      const url = jwt
+        ? `${LIVEPEER_CDN}/${pid}/index.m3u8?jwt=${jwt}`
         : `${LIVEPEER_CDN}/${pid}/index.m3u8`;
 
-      setPlayerSrc(hlsUrl);
+      setHlsUrl(url);
       setViewerState("ready");
       setStatusText("");
     } catch (err: any) {
@@ -106,13 +113,53 @@ export function ContentViewer({
   useEffect(() => {
     if (!isLivepeer) return;
     const authToken = token ?? (typeof window !== "undefined" ? localStorage.getItem("amsets_token") : null);
-    if (authToken) {
-      fetchPlaybackJwt();
-    }
+    if (authToken) fetchPlaybackAccess();
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [storageUri, token]);
 
-  // ─── Render: Livepeer Player ──────────────────────────────────────────────
+  // Set up HLS.js player when hlsUrl is ready
+  useEffect(() => {
+    if (!hlsUrl || !videoRef.current) return;
+    const video = videoRef.current;
+
+    // Safari supports HLS natively
+    if (video.canPlayType("application/vnd.apple.mpegurl")) {
+      video.src = hlsUrl;
+      return;
+    }
+
+    // Chrome / Firefox — use HLS.js
+    let Hls: any;
+    let hls: any;
+
+    import("hls.js").then((mod) => {
+      Hls = mod.default;
+      if (!Hls.isSupported()) return;
+      hls = new Hls({ enableWorker: false });
+      hls.loadSource(hlsUrl);
+      hls.attachMedia(video);
+      hls.on(Hls.Events.ERROR, (_: any, data: any) => {
+        if (data.fatal) {
+          console.error("[ContentViewer] HLS fatal error:", data.type, data.details);
+        }
+      });
+    });
+
+    return () => {
+      hls?.destroy();
+    };
+  }, [hlsUrl]);
+
+  // Auto-refresh transcoding state every 15 seconds
+  useEffect(() => {
+    if (viewerState !== "transcoding") return;
+    const interval = setInterval(() => {
+      fetchPlaybackAccess();
+    }, 15_000);
+    return () => clearInterval(interval);
+  }, [viewerState, fetchPlaybackAccess]);
+
+  // ─── Render: Livepeer content ─────────────────────────────────────────────
 
   if (isLivepeer) {
     if (viewerState === "idle") {
@@ -129,7 +176,7 @@ export function ContentViewer({
           <p className="text-[#7A6E8E] text-sm max-w-xs">
             Your access token grants you viewing rights. Connect to verify.
           </p>
-          <GlowButton variant="primary" size="sm" onClick={fetchPlaybackJwt}>
+          <GlowButton variant="primary" size="sm" onClick={fetchPlaybackAccess}>
             Verify Access
           </GlowButton>
         </div>
@@ -141,6 +188,36 @@ export function ContentViewer({
         <div className="w-full aspect-video rounded-xl bg-[#0D0A14] border border-[#3D2F5A] flex flex-col items-center justify-center gap-3">
           <span className="inline-block w-8 h-8 border-2 border-[#F7FF88] border-t-transparent rounded-full animate-spin" />
           <p className="text-[#7A6E8E] text-sm">{statusText}</p>
+        </div>
+      );
+    }
+
+    if (viewerState === "transcoding") {
+      return (
+        <div className="w-full aspect-video rounded-xl bg-[#0D0A14] border border-[#3D2F5A] flex flex-col items-center justify-center gap-4 px-6 text-center">
+          <span className="inline-block w-10 h-10 border-2 border-[#F7FF88] border-t-transparent rounded-full animate-spin" />
+          <p className="text-[#EDE8F5] font-semibold">Processing video…</p>
+          <p className="text-[#7A6E8E] text-sm max-w-xs">
+            Your video is being processed. This usually takes 1–5 minutes. The player will refresh automatically.
+          </p>
+          <GlowButton variant="ghost" size="sm" onClick={fetchPlaybackAccess}>
+            Check Now
+          </GlowButton>
+        </div>
+      );
+    }
+
+    if (viewerState === "not_found") {
+      return (
+        <div className="w-full aspect-video rounded-xl bg-[#0D0A14] border border-amber-500/30 flex flex-col items-center justify-center gap-4 px-6 text-center">
+          <span className="text-4xl">⚠️</span>
+          <p className="text-amber-400 font-semibold">Video not available</p>
+          <p className="text-[#7A6E8E] text-sm max-w-xs">
+            This video could not be found in the storage network. The content may need to be re-uploaded.
+          </p>
+          {isAuthor && (
+            <NeonBadge variant="muted">Re-upload in My Works to fix</NeonBadge>
+          )}
         </div>
       );
     }
@@ -157,43 +234,32 @@ export function ContentViewer({
       );
     }
 
-    if (viewerState === "ready" && playerSrc) {
-      // Use Livepeer's embed player (lvpr.tv) — simplest integration, no SDK config needed.
-      // The embed URL supports the JWT param natively for gated content.
-      const embedUrl = playerSrc; // already has jwt appended if available
-      // Convert HLS URL → Livepeer embed iframe URL
-      const pid = livePlaybackId ?? storageUri.replace("livepeer://", "");
-      const jwtParam = playerSrc.includes("?jwt=") ? `&jwt=${playerSrc.split("?jwt=")[1]}` : "";
-      const iframeUrl = `https://lvpr.tv?v=${pid}${jwtParam}`;
-
+    if (viewerState === "ready" && hlsUrl) {
       return (
         <div className="w-full rounded-xl overflow-hidden bg-black border border-[#3D2F5A]">
-          {/* Livepeer embed player — handles HLS, WebRTC, adaptive streaming */}
           <div className="relative w-full aspect-video bg-black">
-            <iframe
-              src={iframeUrl}
-              title="AMSETS Content Player"
+            <video
+              ref={videoRef}
               className="w-full h-full"
-              allow="autoplay; fullscreen; picture-in-picture; encrypted-media"
-              allowFullScreen
-              style={{ border: "none" }}
+              controls
+              playsInline
+              preload="metadata"
+              style={{ display: "block" }}
             />
           </div>
-
-          <div className="px-4 py-2 bg-[#0D0A14] flex items-center gap-2 border-t border-[#3D2F5A]">
-            <div className="w-1.5 h-1.5 rounded-full bg-[#00EB88] animate-pulse" />
-            <span className="text-[#7A6E8E] text-xs">Delivered by Livepeer decentralized video network</span>
-            {pid && (
+          {playbackId && (
+            <div className="px-4 py-2 bg-[#0D0A14] flex items-center gap-2 border-t border-[#3D2F5A]">
+              <div className="w-1.5 h-1.5 rounded-full bg-[#00EB88] animate-pulse" />
+              <span className="text-[#7A6E8E] text-xs">Decentralized video network</span>
               <NeonBadge variant="muted" className="ml-auto text-[10px]">
-                {pid.slice(0, 12)}…
+                {playbackId.slice(0, 12)}…
               </NeonBadge>
-            )}
-          </div>
+            </div>
+          )}
         </div>
       );
     }
 
-    // Fallback (should not reach here normally)
     return (
       <div className="w-full aspect-video rounded-xl bg-[#0D0A14] border border-[#3D2F5A] flex items-center justify-center">
         <span className="inline-block w-8 h-8 border-2 border-[#F7FF88] border-t-transparent rounded-full animate-spin" />
@@ -207,10 +273,9 @@ export function ContentViewer({
     return (
       <div className="w-full rounded-xl overflow-hidden bg-[#0D0A14] border border-[#3D2F5A] flex flex-col items-center justify-center gap-4 py-16 px-6 text-center">
         <span className="text-4xl">📦</span>
-        <p className="text-[#EDE8F5] font-semibold">Legacy Arweave Content</p>
+        <p className="text-[#EDE8F5] font-semibold">Legacy Content</p>
         <p className="text-[#7A6E8E] text-sm max-w-xs">
-          This content was stored on Arweave. Decryption via Lit Protocol is temporarily
-          disabled while the platform migrates to Livepeer. Contact support if you need access.
+          This content was stored on an older network. Contact support if you need access.
         </p>
         <NeonBadge variant="muted">{storageUri.slice(0, 30)}…</NeonBadge>
       </div>
@@ -220,16 +285,14 @@ export function ContentViewer({
   // ─── Unknown storage type ──────────────────────────────────────────────────
   return (
     <div className="w-full rounded-xl bg-[#0D0A14] border border-[#3D2F5A] flex items-center justify-center py-12">
-      <p className="text-[#7A6E8E] text-sm">Unsupported storage URI: {storageUri.slice(0, 40)}</p>
+      <p className="text-[#7A6E8E] text-sm">Unsupported content format.</p>
     </div>
   );
 }
 
 // ── LEGACY ARWEAVE / LIT DECRYPTION BLOCK (commented out) ────────────────────
 //
-// To restore Arweave support, uncomment the imports at the top of this file
-// and implement the following handleDecrypt function:
-//
+// To restore Arweave support:
 // async function handleDecrypt() {
 //   setViewerState("loading");
 //   try {
@@ -244,7 +307,6 @@ export function ContentViewer({
 //       const decrypted = await decryptFile(key, ciphertext, iv);
 //       const blob = new Blob([decrypted], { type: bundle.metadata.mime_type });
 //       const url = URL.createObjectURL(blob);
-//       // set url to display content
 //     }
 //   } catch (err: any) {
 //     setErrorText(err?.message ?? "Decryption failed");

@@ -89,7 +89,6 @@ livepeerRouter.get("/playback-jwt/:contentId", async (c) => {
     .limit(1);
 
   if (!row) return c.json({ error: "Content not found" }, 404);
-  if (row.status !== "active") return c.json({ error: "Content not published" }, 403);
 
   // Verify storage type
   if (!row.storageUri.startsWith("livepeer://")) {
@@ -98,10 +97,15 @@ livepeerRouter.get("/playback-jwt/:contentId", async (c) => {
 
   const playbackId = row.storageUri.replace("livepeer://", "");
 
-  // Access check: author always has access
+  // Access check: author always has access (including for draft content)
   const isAuthor = row.authorWallet.toLowerCase() === wallet.toLowerCase();
 
   if (!isAuthor) {
+    // Non-authors can only access active (published) content
+    if (row.status !== "active") {
+      return c.json({ error: "Content not published" }, 403);
+    }
+
     // Check if user has a purchase record for this content
     const [purchase] = await db
       .select({ id: purchases.id })
@@ -119,16 +123,34 @@ livepeerRouter.get("/playback-jwt/:contentId", async (c) => {
     }
   }
 
+  // Check if the Livepeer asset actually exists and is ready
+  let assetStatus: "ready" | "transcoding" | "not_found" = "ready";
+  try {
+    const apiKey = process.env.LIVEPEER_API_KEY;
+    if (apiKey) {
+      const assetRes = await fetch(
+        `https://livepeer.studio/api/asset?playbackId=${playbackId}`,
+        { headers: { Authorization: `Bearer ${apiKey}` } }
+      );
+      const assets = await assetRes.json() as any[];
+      if (!Array.isArray(assets) || assets.length === 0) {
+        assetStatus = "not_found";
+      } else {
+        const phase = assets[0]?.status?.phase;
+        assetStatus = phase === "ready" ? "ready" : "transcoding";
+      }
+    }
+  } catch {
+    // Non-fatal: if we can't check, proceed optimistically
+  }
+
   try {
     const token = signPlaybackJwt(playbackId);
-    return c.json({ jwt: token, playbackId });
+    return c.json({ jwt: token, playbackId, assetStatus });
   } catch (err: any) {
     console.error("[livepeer] JWT signing error:", err?.message);
-    // If signing keys not configured, return playbackId without JWT
-    // (works for public/unprotected assets during development)
     if (err?.message?.includes("not set")) {
-      console.warn("[livepeer] No signing keys — returning playbackId without JWT (dev mode)");
-      return c.json({ jwt: null, playbackId });
+      return c.json({ jwt: null, playbackId, assetStatus });
     }
     return c.json({ error: "JWT signing failed" }, 500);
   }
