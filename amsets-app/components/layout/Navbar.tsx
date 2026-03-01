@@ -154,18 +154,33 @@ function ConnectButton({ onOpenAuth }: ConnectButtonProps) {
     if (hasAutoAuthed.current) return;
     hasAutoAuthed.current = true;
 
-    // Skip re-auth only if the stored token is still valid (not expired)
+    // Skip re-auth only if the stored token is still valid AND belongs to THIS wallet
     const storedToken = localStorage.getItem("amsets_token");
     if (storedToken) {
       try {
         const payload = JSON.parse(atob(storedToken.split(".")[1]));
-        const expiredAt = (payload.exp ?? 0) * 1000;
-        if (Date.now() < expiredAt) return; // token is still valid
+        const expiredAt   = (payload.exp ?? 0) * 1000;
+        const tokenWallet = (payload.sub as string | undefined)?.toLowerCase();
+        const thisWallet  = publicKey.toBase58().toLowerCase();
+
+        // If the token belongs to a DIFFERENT wallet, always force re-auth.
+        // This prevents the "cannot buy own listing" bug caused by a stale
+        // JWT from a previous user session being sent with a new wallet's requests.
+        if (tokenWallet && tokenWallet !== thisWallet) {
+          localStorage.removeItem("amsets_token");
+          window.dispatchEvent(new Event("amsets_session_changed"));
+          // Fall through to re-auth below
+        } else if (Date.now() < expiredAt) {
+          return; // same wallet, valid token — no re-auth needed
+        } else {
+          localStorage.removeItem("amsets_token");
+          window.dispatchEvent(new Event("amsets_session_changed"));
+        }
       } catch {
         // Malformed token — clear it and re-auth
+        localStorage.removeItem("amsets_token");
+        window.dispatchEvent(new Event("amsets_session_changed"));
       }
-      localStorage.removeItem("amsets_token");
-      window.dispatchEvent(new Event("amsets_session_changed"));
     }
 
     // Brief delay to ensure the wallet connection is fully established before signing

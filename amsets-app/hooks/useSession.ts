@@ -9,6 +9,13 @@ export interface SessionState {
   isAuthenticated: boolean;
   /** Wallet address string from either Wallet Adapter or Web3Auth */
   walletAddress: string | null;
+  /**
+   * The wallet address extracted from the JWT `sub` claim.
+   * This is the CANONICAL identity used for all API calls and
+   * ownership checks (e.g. "is this my listing?").
+   * It is always consistent with the token being sent to the backend.
+   */
+  tokenWallet: string | null;
   /** PublicKey object — only available for Wallet Adapter (Phantom/Solflare) sessions */
   publicKey: PublicKey | null;
   /** JWT token stored in localStorage after login */
@@ -81,6 +88,16 @@ export function useSession(): SessionState {
     return t;
   })();
 
+  // Canonical wallet from JWT sub — the single source of truth for API identity
+  const tokenWallet = (() => {
+    if (!validToken) return null;
+    try {
+      return (JSON.parse(atob(validToken.split(".")[1])).sub as string) ?? null;
+    } catch {
+      return null;
+    }
+  })();
+
   const walletAddress = publicKey?.toBase58() ?? web3authAddress;
   // isAuthenticated requires a valid non-expired token, not just a connected wallet
   const isAuthenticated = (connected || !!web3authAddress) && !!validToken;
@@ -88,6 +105,7 @@ export function useSession(): SessionState {
   return {
     isAuthenticated,
     walletAddress,
+    tokenWallet,
     publicKey: publicKey ?? null,
     token: validToken,
     mounted: true,

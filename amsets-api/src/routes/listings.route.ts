@@ -157,8 +157,8 @@ listingsRouter.delete("/:id", async (c) => {
     .limit(1);
 
   if (!row) return c.json({ error: "Listing not found" }, 404);
-  if (row.sellerWallet !== sellerWallet)
-    return c.json({ error: "Forbidden — not your listing" }, 403);
+  if (row.sellerWallet.toLowerCase() !== sellerWallet.toLowerCase())
+    return c.json({ error: "Forbidden — only the listing creator can cancel it" }, 403);
   if (row.status !== "active")
     return c.json({ error: "Listing is already closed" }, 400);
 
@@ -228,7 +228,9 @@ listingsRouter.post(
 
     if (!listing)                   return c.json({ error: "Listing not found" }, 404);
     if (listing.status !== "active") return c.json({ error: "Listing already closed" }, 400);
-    if (listing.sellerWallet === buyerWallet)
+    // Normalize to lowercase for comparison — Solana addresses are case-sensitive but
+    // Web3Auth and Phantom may return different cases in edge scenarios
+    if (listing.sellerWallet.toLowerCase() === buyerWallet.toLowerCase())
       return c.json({ error: "Cannot buy your own listing" }, 400);
 
     // Load content for mint address
