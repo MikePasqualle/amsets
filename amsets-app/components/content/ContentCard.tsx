@@ -19,6 +19,10 @@ interface ContentCardProps {
   category?: string;
   /** "draft" = registered but not yet on-chain; "active" = published on Solana */
   status?: "draft" | "active" | string;
+  /** Royalty in basis points (e.g. 500 = 5%) */
+  royaltyBps?: number;
+  /** Author NFT mint address — present means the 1-of-1 authorship token exists */
+  authorNftMint?: string;
 }
 
 const LICENSE_LABELS: Record<string, string> = {
@@ -43,6 +47,8 @@ export function ContentCard({
   license,
   category,
   status = "active",
+  royaltyBps,
+  authorNftMint,
 }: ContentCardProps) {
   const cardRef = useHoverGlow("rgba(247, 255, 136, 0.25)");
   const [imgError, setImgError] = useState(false);
@@ -116,10 +122,24 @@ export function ContentCard({
           )}
 
           <div className="flex items-center justify-between mt-2 pt-3 border-t border-[#3D2F5A]">
-            <span className="text-[#7A6E8E] text-xs font-mono">{shortAddress}</span>
-            <span className="text-[#F7FF88] font-bold text-sm">
-              {paymentToken === "SOL" ? `◎ ${priceSOL}` : `$${(Number(basePrice) / 1_000_000).toFixed(2)}`}
-            </span>
+            <div className="flex flex-col gap-0.5">
+              <span className="text-[#7A6E8E] text-xs font-mono">{shortAddress}</span>
+              {royaltyBps !== undefined && royaltyBps > 0 && (
+                <span className="text-[#B49FCC] text-[10px]">
+                  {(royaltyBps / 100).toFixed(1)}% royalty
+                </span>
+              )}
+            </div>
+            <div className="flex flex-col items-end gap-0.5">
+              <span className="text-[#F7FF88] font-bold text-sm">
+                {paymentToken === "SOL" ? `◎ ${priceSOL}` : `$${(Number(basePrice) / 1_000_000).toFixed(2)}`}
+              </span>
+              {authorNftMint && (
+                <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[9px] font-bold bg-[#F7FF88]/10 text-[#F7FF88] border border-[#F7FF88]/20">
+                  NFT ✓
+                </span>
+              )}
+            </div>
           </div>
         </div>
       </article>

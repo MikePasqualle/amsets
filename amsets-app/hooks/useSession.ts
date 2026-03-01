@@ -65,6 +65,7 @@ export function useSession(): SessionState {
     return {
       isAuthenticated: false,
       walletAddress: null,
+      tokenWallet: null,
       publicKey: null,
       token: null,
       mounted: false,

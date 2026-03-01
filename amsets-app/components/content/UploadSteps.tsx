@@ -18,8 +18,8 @@ import { uploadPreviewToIPFS } from "@/lib/storage";
 import * as tus from "tus-js-client";
 import {
   publishOnChain,
-  createMintForContent,
   setAccessMint,
+  setAuthorNftMint,
   deriveContentRecordPda,
   uuidToBytes32,
 } from "@/lib/anchor";
@@ -171,8 +171,9 @@ export function UploadSteps() {
       { label: "Uploading video",             status: "pending" },
       { label: "Uploading preview image",     status: "pending" },
       { label: "Registering content",         status: "pending" },
-      { label: "Publishing on blockchain",    status: "pending" },
-      { label: "Minting access token",        status: "pending" },
+      { label: "Publishing on Solana",        status: "pending" },
+      { label: "Creating Author NFT",         status: "pending" },
+      { label: "Creating access token",       status: "pending" },
     ];
     setPublishSteps(steps);
     goToStep(5);
@@ -492,64 +493,129 @@ export function UploadSteps() {
           steps[3] = { ...steps[3], status: "done", detail: `Tx: ${signature.slice(0, 12)}…` };
           setPublishSteps([...steps]);
 
-          // ── Step 5: Create SPL Token-2022 mint + mint 1 author token ─────
-          steps[4] = { ...steps[4], status: "running" };
+          const freshToken = localStorage.getItem("amsets_token") ?? token;
+          const contentIdBytes   = uuidToBytes32(registeredContentId);
+          const contentRecordPda = deriveContentRecordPda(publicKey, contentIdBytes);
+
+          // ── Step 5: Create Author NFT + link on-chain ─────────────────────
+          steps[4] = { ...steps[4], status: "running", detail: "Backend is creating Author NFT mint…" };
+          setPublishSteps([...steps]);
+
+          let authorNftMintAddress: string | null = null;
+
+          try {
+            // Backend creates the 1-of-1 Author NFT mint and mints it to the author
+            const authorNftRes = await fetch(`${API_URL}/api/v1/content/mint/author-token`, {
+              method:  "POST",
+              headers: { "Content-Type": "application/json", Authorization: `Bearer ${freshToken}` },
+              body:    JSON.stringify({ content_id: registeredContentId }),
+            });
+
+            if (!authorNftRes.ok) {
+              const errData = await authorNftRes.json().catch(() => ({}));
+              throw new Error((errData as any).error ?? `Author NFT creation failed (${authorNftRes.status})`);
+            }
+
+            const authorNftData = await authorNftRes.json();
+            authorNftMintAddress = authorNftData.author_nft_mint;
+
+            steps[4] = {
+              ...steps[4],
+              detail: `NFT: ${authorNftMintAddress!.slice(0, 8)}… — linking on-chain…`,
+            };
+            setPublishSteps([...steps]);
+
+            // Link Author NFT mint to ContentRecord on-chain (author signs)
+            await setAuthorNftMint(
+              contentRecordPda,
+              new (await import("@solana/web3.js")).PublicKey(authorNftMintAddress!),
+              publicKey,
+              sendTransaction,
+              connection
+            );
+
+            steps[4] = {
+              ...steps[4],
+              status: "done",
+              detail: `Author NFT: ${authorNftMintAddress!.slice(0, 12)}… | Minted to your wallet`,
+            };
+          } catch (nftErr: any) {
+            // Non-fatal: content is on-chain, author NFT can be minted later
+            steps[4] = {
+              ...steps[4],
+              status: "skipped",
+              detail: `Author NFT skipped: ${nftErr?.message?.slice(0, 80) ?? "unknown"}`,
+            };
+          }
+          setPublishSteps([...steps]);
+
+          // ── Step 6: Create access token mint + link on-chain ──────────────
+          steps[5] = { ...steps[5], status: "running", detail: "Backend is creating access token mint…" };
           setPublishSteps([...steps]);
 
           let mintAddress: string | null = null;
 
           try {
-            const royaltyBps = Math.round(parseFloat(data.royalty || "10") * 100);
-            const { mintKeypair } = await createMintForContent(
+            // Backend creates the access token mint (no TransferFeeConfig)
+            const mintRes = await fetch(`${API_URL}/api/v1/content/${registeredContentId}/create-mint`, {
+              method:  "POST",
+              headers: { "Content-Type": "application/json", Authorization: `Bearer ${freshToken}` },
+            });
+
+            if (!mintRes.ok) {
+              const errData = await mintRes.json().catch(() => ({}));
+              throw new Error((errData as any).error ?? `Mint creation failed (${mintRes.status})`);
+            }
+
+            const mintData = await mintRes.json();
+            mintAddress = mintData.mint_address;
+
+            steps[5] = {
+              ...steps[5],
+              detail: `Mint: ${mintAddress!.slice(0, 8)}… — linking on-chain…`,
+            };
+            setPublishSteps([...steps]);
+
+            // Link access mint to ContentRecord on-chain (author signs)
+            const { PublicKey: SolanaPublicKey } = await import("@solana/web3.js");
+            await setAccessMint(
+              contentRecordPda,
+              new SolanaPublicKey(mintAddress!),
               publicKey,
-              royaltyBps,
               sendTransaction,
               connection
             );
 
-            mintAddress = mintKeypair.publicKey.toBase58();
-
-            // Link the mint to the ContentRecord on-chain
-            const contentIdBytes   = uuidToBytes32(registeredContentId);
-            const contentRecordPda = deriveContentRecordPda(publicKey, contentIdBytes);
-            await setAccessMint(contentRecordPda, mintKeypair.publicKey, publicKey, sendTransaction, connection);
-
-            steps[4] = {
-              ...steps[4],
+            steps[5] = {
+              ...steps[5],
               status: "done",
-              // Backend will mint author token automatically after /publish is called
-              detail: `Mint: ${mintAddress.slice(0, 12)}… | Backend will mint author token`,
+              detail: `Access token: ${mintAddress!.slice(0, 12)}…`,
             };
           } catch (mintErr: any) {
-            // Non-fatal: content is already registered, token can be minted later
-            steps[4] = {
-              ...steps[4],
+            steps[5] = {
+              ...steps[5],
               status: "skipped",
-              detail: `Token mint skipped: ${mintErr?.message?.slice(0, 80) ?? "unknown error"}`,
+              detail: `Access token skipped: ${mintErr?.message?.slice(0, 80) ?? "unknown"}`,
             };
           }
           setPublishSteps([...steps]);
 
-          // Notify backend → update status to "active" + store PDA + mint address.
-          // Wrapped in its own try/catch so a network hiccup here does NOT corrupt
-          // the step-4 status (which already shows "done" at this point).
-          const freshToken = localStorage.getItem("amsets_token") ?? token;
+          // Notify backend → update status to "active" + store PDA + mint addresses.
           try {
             const patchRes = await fetch(`${API_URL}/api/v1/content/${registeredContentId}/publish`, {
               method: "PATCH",
               headers: { "Content-Type": "application/json", Authorization: `Bearer ${freshToken}` },
               body: JSON.stringify({
-                tx_signature: signature,
-                on_chain_pda: pdaAddress,
-                ...(mintAddress ? { mint_address: mintAddress } : {}),
+                tx_signature:   signature,
+                on_chain_pda:   pdaAddress,
+                ...(mintAddress        ? { mint_address:    mintAddress }        : {}),
+                ...(authorNftMintAddress ? { author_nft_mint: authorNftMintAddress } : {}),
               }),
             });
             if (!patchRes.ok) {
               console.error("[publish] backend PATCH failed:", patchRes.status, await patchRes.text().catch(() => ""));
-              // Non-fatal: blockchain is the source of truth; backend auto-sync will pick it up
             }
           } catch (patchErr: any) {
-            // Network error on PATCH — non-fatal, blockchain record exists, auto-sync will fix DB
             console.warn("[publish] PATCH network error (non-fatal):", patchErr?.message);
           }
         } catch (onChainErr: any) {
@@ -1015,13 +1081,15 @@ export function UploadSteps() {
                       ) : (
                         <>
                           {(() => {
-                            const onChainDone = publishSteps[3]?.status === "done";
-                            const savedInDB   = publishSteps[2]?.status === "done";
-                            const tokenDone   = publishSteps[4]?.status === "done";
+                            const onChainDone   = publishSteps[3]?.status === "done";
+                            const savedInDB     = publishSteps[2]?.status === "done";
+                            const authorNftDone = publishSteps[4]?.status === "done";
+                            const accessTokenDone = publishSteps[5]?.status === "done";
+                            const fullyDone     = onChainDone && authorNftDone && accessTokenDone;
                             return (
                               <>
                                 <div className={`w-16 h-16 rounded-full flex items-center justify-center border ${
-                                  tokenDone
+                                  fullyDone
                                     ? "bg-[#F7FF88]/20 border-[#F7FF88]"
                                     : onChainDone
                                     ? "bg-[#81D0B5]/20 border-[#81D0B5]"
@@ -1030,13 +1098,13 @@ export function UploadSteps() {
                                     : "bg-[#7A6E8E]/20 border-[#7A6E8E]"
                                 }`}>
                                   <span className="text-3xl">
-                                    {tokenDone ? "🎉" : onChainDone ? "✓" : "📝"}
+                                    {fullyDone ? "🎉" : onChainDone ? "✓" : "📝"}
                                   </span>
                                 </div>
 
                                 <h3 className="text-xl font-bold text-[#F7FF88]">
-                                  {tokenDone
-                                    ? "Published! Access token minted 🎉"
+                                  {fullyDone
+                                    ? "Published! Author NFT & access tokens ready 🎉"
                                     : onChainDone
                                     ? "Published on blockchain"
                                     : savedInDB
@@ -1045,10 +1113,10 @@ export function UploadSteps() {
                                 </h3>
 
                                 <p className="text-[#7A6E8E] text-sm max-w-sm text-center">
-                                  {tokenDone
-                                    ? `Your content is live${data.isPrivate ? " (private — share via link)" : " on the marketplace"}. Author token minted to your wallet.`
+                                  {fullyDone
+                                    ? `Your content is live${data.isPrivate ? " (private — share via link)" : " on the marketplace"}. Author NFT minted to your wallet — you receive all royalties.`
                                     : onChainDone
-                                    ? "Registered on blockchain. Access token creation pending — retry from My Works."
+                                    ? "Registered on blockchain. Token setup may be incomplete — retry from My Works."
                                     : savedInDB
                                     ? "Saved as draft. Complete on-chain registration to publish."
                                     : "Sign in with your wallet and try again."}
@@ -1067,7 +1135,10 @@ export function UploadSteps() {
                                   {onChainDone && (
                                     <NeonBadge variant="primary">On-chain ✓</NeonBadge>
                                   )}
-                                  {tokenDone && (
+                                  {authorNftDone && (
+                                    <NeonBadge variant="primary">Author NFT ✓</NeonBadge>
+                                  )}
+                                  {accessTokenDone && (
                                     <NeonBadge variant="secondary">Access token ✓</NeonBadge>
                                   )}
                                   {data.isPrivate && savedInDB && (
@@ -1093,7 +1164,7 @@ export function UploadSteps() {
                             <GlowButton variant="primary" size="md" onClick={() => window.location.href = "/marketplace"}>
                               View Marketplace
                             </GlowButton>
-                            {publishSteps[2]?.status === "done" && (
+                            {(publishSteps[2]?.status === "done" || publishSteps[3]?.status === "done") && (
                               <GlowButton variant="ghost" size="md" onClick={() => window.location.href = "/my/content"}>
                                 My Works
                               </GlowButton>

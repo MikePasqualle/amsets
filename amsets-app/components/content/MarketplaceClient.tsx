@@ -31,6 +31,8 @@ interface ContentItem {
   license: string;
   category?: string;
   status?: string;
+  royaltyBps?: number;
+  authorNftMint?: string;
 }
 
 interface MarketplaceClientProps {

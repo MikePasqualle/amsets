@@ -35,6 +35,7 @@ interface ContentItem {
   contentHash: string;
   onChainPda: string;
   mintAddress: string | null;
+  authorNftMint?: string | null;
   totalSupply: number;
   soldCount: number;
   royaltyBps: number;
@@ -428,6 +429,20 @@ function ContentManageCard({
             View →
           </Link>
         </div>
+
+        {/* Author NFT badge */}
+        {item.authorNftMint && (
+          <div className="flex items-center gap-2">
+            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-[#F7FF88]/10 text-[#F7FF88] border border-[#F7FF88]/20">
+              ✦ Author NFT
+            </span>
+            {item.royaltyBps > 0 && (
+              <span className="text-[#B49FCC] text-[10px]">
+                {(item.royaltyBps / 100).toFixed(1)}% royalty
+              </span>
+            )}
+          </div>
+        )}
 
         {/* Token supply info for active content */}
         {!isDraft && (

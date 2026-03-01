@@ -17,13 +17,12 @@ import {
   checkHasPurchased,
   ensureFeeVaultFunded,
   checkTokenBalance,
-  deriveFeeVaultPda,
   deriveContentRecordPda,
   uuidToBytes32,
+  createListingOnChain,
+  cancelListingOnChain,
+  executeSaleOnChain,
 } from "@/lib/anchor";
-
-/** Platform fee on all sales (primary + secondary): 2.5% = 250 bps */
-const PLATFORM_FEE_BPS = 250n;
 
 /** Format SOL amounts with appropriate decimal places (avoids "0.0000") */
 function fmtSOL(amount: number): string {
@@ -35,15 +34,8 @@ function fmtSOL(amount: number): string {
 }
 import {
   PublicKey,
-  Transaction,
-  SystemProgram,
   LAMPORTS_PER_SOL,
 } from "@solana/web3.js";
-import {
-  TOKEN_2022_PROGRAM_ID,
-  getAssociatedTokenAddressSync,
-  createApproveInstruction,
-} from "@solana/spl-token";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3001";
 
@@ -67,6 +59,7 @@ interface ContentItem {
   totalSupply?: number;
   royaltyBps?: number;
   mintAddress?: string;
+  authorNftMint?: string;
   soldCount?: number;
 }
 
@@ -125,6 +118,16 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
       }, 800);
     }
   }, []);
+
+  // ─── Royalty holder (current Author NFT holder) ───────────────────────────
+  const [royaltyHolder, setRoyaltyHolder] = useState<string | null>(null);
+
+  useEffect(() => {
+    fetch(`${API_URL}/api/v1/content/${content.contentId}/royalty-holder`)
+      .then((r) => r.ok ? r.json() : null)
+      .then((d) => { if (d?.royalty_holder) setRoyaltyHolder(d.royalty_holder); })
+      .catch(() => null);
+  }, [content.contentId]);
 
   // ─── Resale listing state ──────────────────────────────────────────────────
   const [activeListings,    setActiveListings]    = useState<ActiveListing[]>([]);
@@ -254,83 +257,66 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
       const priceLamports = Math.round(parseFloat(sellPriceSOL) * LAMPORTS_PER_SOL);
       if (isNaN(priceLamports) || priceLamports <= 0) throw new Error("Invalid price");
 
-      let tokenAccount: string | undefined;
-
-      // Grant backend delegate permission to transfer exactly 1 token on sale.
-      // This allows a true seller→buyer transfer without the seller being online at purchase time.
-      if (content.mintAddress) {
-        const mintPubkey = new PublicKey(content.mintAddress);
-        const sellerAta  = getAssociatedTokenAddressSync(
-          mintPubkey,
-          publicKey,
-          false,
-          TOKEN_2022_PROGRAM_ID
-        );
-        tokenAccount = sellerAta.toBase58();
-
-        const backendAuthority = process.env.NEXT_PUBLIC_MINT_AUTHORITY_PUBKEY;
-        if (backendAuthority) {
-          try {
-            const approveTx = new Transaction().add(
-              createApproveInstruction(
-                sellerAta,
-                new PublicKey(backendAuthority),
-                publicKey,
-                1n,
-                [],
-                TOKEN_2022_PROGRAM_ID
-              )
-            );
-            const { blockhash } = await connection.getLatestBlockhash("confirmed");
-            approveTx.recentBlockhash = blockhash;
-            approveTx.feePayer = publicKey;
-            const approveSig = await sendTransaction(approveTx, connection);
-            await connection.confirmTransaction(approveSig, "confirmed");
-            console.log("[listing] Approved backend as delegate for token transfer");
-          } catch (approveErr: any) {
-            // Non-fatal — listing will still be created, but transfer may be less clean
-            console.warn("[listing] Approve tx failed:", approveErr?.message);
-          }
-        }
+      const mintAddress = content.mintAddress;
+      if (!mintAddress || mintAddress === "pending") {
+        throw new Error("This content has no access token mint. Cannot create listing.");
       }
 
-      const payload = {
-        content_id:     content.contentId,
-        price_lamports: priceLamports,
-        mint_address:   content.mintAddress ?? undefined,
-        token_account:  tokenAccount,
-      };
-
-      let res = await fetch(`${API_URL}/api/v1/listings`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-        body: JSON.stringify(payload),
-      });
-
-      // If duplicate active listing exists (409), cancel it then retry once
-      if (res.status === 409) {
-        await fetchListings(); // refresh to find the existing listing ID
-        const myListing = activeListings.find(
-          (l) => myAddresses.includes(l.sellerWallet.toLowerCase())
-        );
-        if (myListing) {
-          await fetch(`${API_URL}/api/v1/listings/${myListing.id}`, {
-            method: "DELETE",
-            headers: { Authorization: `Bearer ${token}` },
-          });
-        }
-        // Retry creation
-        res = await fetch(`${API_URL}/api/v1/listings`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-          body: JSON.stringify(payload),
+      // If duplicate active listing exists, cancel it first
+      const myListing = activeListings.find(
+        (l) => myAddresses.includes(l.sellerWallet.toLowerCase())
+      );
+      if (myListing) {
+        try {
+          if (myListing.id) {
+            await cancelListingOnChain(myListing.id, publicKey, sendTransaction, connection);
+          }
+        } catch { /* non-fatal — backend will also cancel */ }
+        await fetch(`${API_URL}/api/v1/listings/${myListing.id}`, {
+          method: "DELETE",
+          headers: { Authorization: `Bearer ${token}` },
         });
       }
+
+      // Generate a UUID for the listing (will be used as on-chain ID + DB ID)
+      const listingUuid = crypto.randomUUID();
+
+      // Create on-chain ListingRecord PDA (seller signs)
+      let onChainPda: string | undefined;
+      try {
+        const { pdaAddress } = await createListingOnChain(
+          listingUuid,
+          content.contentId,
+          BigInt(priceLamports),
+          mintAddress,
+          publicKey,
+          sendTransaction,
+          connection
+        );
+        onChainPda = pdaAddress;
+        console.log(`[listing] ListingRecord PDA created: ${pdaAddress.slice(0, 12)}…`);
+      } catch (onChainErr: any) {
+        // Contract may not be deployed yet — continue without on-chain PDA
+        console.warn("[listing] On-chain listing creation skipped (contract may not be deployed):", onChainErr?.message?.slice(0, 80));
+      }
+
+      // Tell backend to create the listing DB record + move token to escrow
+      const res = await fetch(`${API_URL}/api/v1/listings`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          content_id:            content.contentId,
+          price_lamports:        priceLamports,
+          mint_address:          mintAddress,
+          on_chain_listing_pda:  onChainPda,
+        }),
+      });
 
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
         throw new Error((err as any).error ?? `HTTP ${res.status}`);
       }
+
       setShowSellForm(false);
       await fetchListings();
     } catch (err: any) {
@@ -338,7 +324,7 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
     } finally {
       setIsListing(false);
     }
-  }, [publicKey, token, content, sellPriceSOL, fetchListings, activeListings]);
+  }, [publicKey, token, content, sellPriceSOL, fetchListings, activeListings, sendTransaction, connection, myAddresses]);
 
   // ─── Buy from resale listing ──────────────────────────────────────────────
   const handleBuyResale = useCallback(async (listing: ActiveListing) => {
@@ -348,14 +334,14 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
       return;
     }
 
-    // Safety check: ensure the JWT token belongs to the CURRENT connected wallet.
-    // If they differ it means a stale token from a previous session is still cached —
-    // sending it would cause the backend to reject the purchase as "own listing".
+    // If the JWT in localStorage belongs to a DIFFERENT wallet than the currently
+    // connected Phantom/Solflare wallet, clear it so the user can authenticate freshly.
     if (myAuthWallet && myAuthWallet !== publicKey.toBase58().toLowerCase()) {
-      setResaleError(
-        "Session mismatch: your login token belongs to a different wallet. " +
-        "Please disconnect, reconnect your wallet, and try again."
-      );
+      localStorage.removeItem("amsets_token");
+      localStorage.removeItem("amsets_wallet");
+      window.dispatchEvent(new Event("amsets_session_changed"));
+      openAuth();
+      setResaleError("Please sign in with your current wallet to complete the purchase.");
       return;
     }
 
@@ -369,70 +355,41 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
     setResaleError(null);
 
     try {
-      const sellerPubkey  = new PublicKey(listing.sellerWallet);
-      const totalPrice    = BigInt(listing.price_lamports);
+      // Resolve current royalty holder (current Author NFT holder)
+      const royaltyRecipient = royaltyHolder ?? listing.sellerWallet;
 
-      // ── Fee distribution (same model as primary sale) ──────────────────
-      // Platform fee : 2.5%  → FeeVault PDA (same vault as primary sales)
-      // Author royalty: royaltyBps/10000 → author wallet
-      // Seller receives: remainder
-      const royaltyBps    = BigInt(content.royaltyBps ?? 0);
-      const platformFee   = (totalPrice * PLATFORM_FEE_BPS) / 10000n;
-      const royaltyAmount = royaltyBps > 0n
-        ? (totalPrice * royaltyBps) / 10000n
-        : 0n;
-      const sellerAmount  = totalPrice - platformFee - royaltyAmount;
+      // Derive ContentRecord PDA for this content
+      const contentIdBytes   = uuidToBytes32(content.contentId);
+      const authorPubkey     = new PublicKey(content.authorWallet);
+      const contentRecordPda = deriveContentRecordPda(authorPubkey, contentIdBytes);
 
-      if (sellerAmount <= 0n) {
-        throw new Error("Price too low to cover platform fee + royalty. Set a higher price.");
+      // Execute on-chain SOL distribution via smart contract
+      // The contract handles: 2.5% platform fee + royaltyBps to NFT holder + remainder to seller
+      let saleSignature: string | undefined;
+      try {
+        const result = await executeSaleOnChain(
+          listing.id,
+          contentRecordPda.toBase58(),
+          royaltyRecipient,
+          listing.sellerWallet,
+          publicKey,
+          sendTransaction,
+          connection
+        );
+        saleSignature = result.signature;
+        console.log(`[buy-resale] On-chain sale executed, txSig: ${saleSignature.slice(0, 12)}…`);
+      } catch (onChainErr: any) {
+        // Contract may not be deployed to devnet yet — log and continue
+        console.warn("[buy-resale] executeSaleOnChain skipped:", onChainErr?.message?.slice(0, 80));
       }
 
-      const feeVaultPda = deriveFeeVaultPda();
-
-      const { blockhash } = await connection.getLatestBlockhash();
-      const tx = new Transaction();
-      tx.recentBlockhash = blockhash;
-      tx.feePayer = publicKey;
-
-      // Solana rejects 0-lamport transfers — only add each leg if > 0.
-      // 1. Platform fee (2.5%) → FeeVault PDA
-      if (platformFee > 0n) {
-        tx.add(SystemProgram.transfer({
-          fromPubkey: publicKey,
-          toPubkey:   feeVaultPda,
-          lamports:   platformFee,
-        }));
-      }
-
-      // 2. Author royalty → author wallet (if any)
-      if (royaltyAmount > 0n && content.authorWallet) {
-        tx.add(SystemProgram.transfer({
-          fromPubkey: publicKey,
-          toPubkey:   new PublicKey(content.authorWallet),
-          lamports:   royaltyAmount,
-        }));
-      }
-
-      // 3. Remaining → seller
-      if (sellerAmount > 0n) {
-        tx.add(SystemProgram.transfer({
-          fromPubkey: publicKey,
-          toPubkey:   sellerPubkey,
-          lamports:   sellerAmount,
-        }));
-      }
-
-      const signature = await sendTransaction(tx, connection);
-      await connection.confirmTransaction(signature, "confirmed");
-
-      // Backend executes the token transfer seller→buyer (PermanentDelegate or legacy mint)
-      // and records the purchase + marks listing sold atomically.
+      // Backend moves token from escrow to buyer and records the purchase
       const fulfillRes = await fetch(`${API_URL}/api/v1/listings/${listing.id}/fulfill`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
         body: JSON.stringify({
           buyer_wallet:  publicKey.toBase58(),
-          tx_signature:  signature,
+          tx_signature:  saleSignature ?? "offchain",
           amount_paid:   listing.price_lamports,
         }),
       });
@@ -445,11 +402,8 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
       setPurchased(true);
       setShowConfetti(true);
       await fetchListings();
-      // Refresh access check after token transfer
       setTimeout(() => window.location.reload(), 2000);
     } catch (err: any) {
-      // Normalise the error to a human-readable string regardless of the
-      // shape thrown by the Wallet Adapter / web3.js / anchor.
       let msg: string;
       if (typeof err?.message === "string" && err.message.length > 0) {
         msg = err.message;
@@ -464,20 +418,27 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
     }
   }, [
     isAuthenticated, connected, publicKey, sendTransaction, connection,
-    content, token, openAuth, fetchListings,
+    content, token, openAuth, fetchListings, royaltyHolder,
   ]);
 
   // ─── Cancel own listing ───────────────────────────────────────────────────
   const handleCancelListing = useCallback(async (listingId: string) => {
-    if (!token) return;
+    if (!token || !publicKey || !sendTransaction) return;
     try {
+      // Cancel on-chain ListingRecord (seller signs) — non-fatal if contract not deployed
+      try {
+        await cancelListingOnChain(listingId, publicKey, sendTransaction, connection);
+      } catch (onChainErr: any) {
+        console.warn("[cancel-listing] On-chain cancel skipped:", onChainErr?.message?.slice(0, 80));
+      }
+      // Backend returns token from escrow to seller and marks listing cancelled
       await fetch(`${API_URL}/api/v1/listings/${listingId}`, {
         method: "DELETE",
         headers: { Authorization: `Bearer ${token}` },
       });
       await fetchListings();
     } catch { /* non-fatal */ }
-  }, [token, fetchListings]);
+  }, [token, publicKey, sendTransaction, connection, fetchListings]);
 
   // ─── GSAP animations ─────────────────────────────────────────────────────
   useGSAP(
@@ -543,7 +504,7 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
       } catch { /* Non-fatal — vault may already exist */ }
 
       const { signature, receiptPda } = await purchaseAccess(
-        { contentRecordPda: contentRecordPda.toBase58(), authorWallet: content.authorWallet },
+        { contentRecordPda: contentRecordPda.toBase58(), royaltyRecipientWallet: royaltyHolder ?? content.authorWallet },
         publicKey,
         sendTransaction,
         connection
@@ -737,6 +698,32 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
                 <div>
                   <span className="text-[#7A6E8E]">Royalty: </span>
                   <span className="text-[#F7FF88] font-bold">{(content.royaltyBps / 100).toFixed(1)}%</span>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Author NFT / Royalty holder info */}
+          {content.authorNftMint && (
+            <div className="p-3 rounded-xl bg-[#1A0D2E] border border-[#4B3268] text-sm">
+              <div className="flex items-center gap-2 mb-1">
+                <span className="text-xs font-semibold uppercase tracking-widest text-[#B49FCC]">Author NFT</span>
+                <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-bold bg-[#F7FF88]/10 text-[#F7FF88] border border-[#F7FF88]/20">
+                  1-of-1
+                </span>
+              </div>
+              {royaltyHolder && (
+                <div className="flex items-center gap-2 mt-1">
+                  <span className="text-[#7A6E8E]">Royalty recipient:</span>
+                  <a
+                    href={`https://explorer.solana.com/address/${royaltyHolder}?cluster=devnet`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-[#81D0B5] font-mono hover:underline"
+                  >
+                    {royaltyHolder.slice(0, 8)}…{royaltyHolder.slice(-6)}
+                    {royaltyHolder === content.authorWallet ? " (author)" : ""}
+                  </a>
                 </div>
               )}
             </div>
@@ -970,7 +957,12 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
                       </div>
                       {royaltyBpNum > 0 && (
                         <div className="flex justify-between">
-                          <span className="text-[#7A6E8E]">Author royalty ({(royaltyBpNum / 100).toFixed(1)}%)</span>
+                          <span className="text-[#7A6E8E]">
+                            Royalty ({(royaltyBpNum / 100).toFixed(1)}%) →{" "}
+                            {royaltyHolder
+                              ? <span className="font-mono">{royaltyHolder.slice(0, 6)}…</span>
+                              : "NFT holder"}
+                          </span>
                           <span className="text-[#81D0B5] font-mono">◎ {royaltyAmt.toFixed(4)}</span>
                         </div>
                       )}
@@ -1017,7 +1009,7 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
               </p>
             )}
             {content.mintAddress && (
-              <p>Token Mint:{" "}
+              <p>Access Token Mint:{" "}
                 <a
                   href={`https://solscan.io/token/${content.mintAddress}?cluster=devnet`}
                   target="_blank"
@@ -1025,6 +1017,18 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
                   className="text-[#81D0B5] underline"
                 >
                   {content.mintAddress.slice(0, 16)}…
+                </a>
+              </p>
+            )}
+            {content.authorNftMint && (
+              <p>Author NFT Mint:{" "}
+                <a
+                  href={`https://solscan.io/token/${content.authorNftMint}?cluster=devnet`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-[#F7FF88] underline"
+                >
+                  {content.authorNftMint.slice(0, 16)}…
                 </a>
               </p>
             )}

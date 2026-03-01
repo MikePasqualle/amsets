@@ -1,10 +1,12 @@
 /**
  * Listings Route — secondary market for AMSETS access tokens.
  *
- * POST   /api/v1/listings               — create a new listing (JWT auth)
- * GET    /api/v1/listings/:contentId    — get active listings for a content item (public)
- * DELETE /api/v1/listings/:id           — cancel a listing (JWT auth, seller only)
- * PATCH  /api/v1/listings/:id/sold      — mark a listing as sold (JWT auth, buyer)
+ * POST   /api/v1/listings               — create listing, move token to escrow
+ * GET    /api/v1/listings/:contentId    — active listings (public)
+ * GET    /check-sold/:contentId?wallet  — was wallet a seller who sold?
+ * DELETE /api/v1/listings/:id           — cancel listing, return token from escrow
+ * PATCH  /api/v1/listings/:id/sold      — mark sold (legacy compatibility)
+ * POST   /api/v1/listings/:id/fulfill   — deliver token from escrow to buyer
  */
 
 import { Hono } from "hono";
@@ -15,7 +17,13 @@ import { Connection } from "@solana/web3.js";
 import { db } from "../db/index";
 import { listings, content as contentTable, purchases } from "../db/schema";
 import { verifyUserJwt } from "../services/jwt.service";
-import { transferTokenFromSeller } from "../services/mint.service";
+import {
+  moveTokenToEscrow,
+  moveTokenFromEscrow,
+  returnTokenFromEscrow,
+  transferTokenFromSeller,
+  resolveAuthorNftHolder,
+} from "../services/mint.service";
 
 const solanaConnection = new Connection(
   `https://devnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY}`,
@@ -33,13 +41,14 @@ function extractWallet(authHeader: string | undefined): string | null {
   }
 }
 
-// ─── POST / — create listing ──────────────────────────────────────────────────
+// ─── POST / — create listing, move token to backend escrow ───────────────────
 
 const createListingSchema = z.object({
-  content_id:     z.string().min(1),
-  price_lamports: z.number().int().positive(),
-  mint_address:   z.string().optional(),   // Optional — content may not have SPL mint yet
-  token_account:  z.string().optional(),
+  content_id:         z.string().min(1),
+  price_lamports:     z.number().int().positive(),
+  mint_address:       z.string().optional(),
+  token_account:      z.string().optional(),
+  on_chain_listing_pda: z.string().optional(), // ListingRecord PDA from on-chain tx
 });
 
 listingsRouter.post(
@@ -51,9 +60,13 @@ listingsRouter.post(
 
     const body = c.req.valid("json");
 
-    // Verify content exists and has the given mint
+    // Verify content exists
     const [row] = await db
-      .select({ mintAddress: contentTable.mintAddress, status: contentTable.status })
+      .select({
+        mintAddress:   contentTable.mintAddress,
+        authorNftMint: contentTable.authorNftMint,
+        status:        contentTable.status,
+      })
       .from(contentTable)
       .where(eq(contentTable.contentId, body.content_id))
       .limit(1);
@@ -61,37 +74,48 @@ listingsRouter.post(
     if (!row) return c.json({ error: "Content not found" }, 404);
     if (row.status !== "active")
       return c.json({ error: "Cannot list draft content" }, 400);
-    // Only validate mint match when both the content record AND the request have a mint
-    if (row.mintAddress && body.mint_address && row.mintAddress !== body.mint_address)
-      return c.json({ error: "mint_address does not match content" }, 400);
 
-    // Prevent duplicate active listings from same seller
+    const effectiveMint = body.mint_address ?? row.mintAddress ?? null;
+    if (!effectiveMint || effectiveMint === "pending")
+      return c.json({ error: "Content has no SPL mint yet — cannot create listing" }, 400);
+
+    // Prevent duplicate active listings from same seller for same content
     const [existing] = await db
       .select({ id: listings.id })
       .from(listings)
       .where(
         and(
-          eq(listings.contentId, body.content_id),
+          eq(listings.contentId,    body.content_id),
           eq(listings.sellerWallet, sellerWallet),
-          eq(listings.status, "active")
+          eq(listings.status,       "active")
         )
       )
       .limit(1);
 
     if (existing) return c.json({ error: "You already have an active listing for this content" }, 409);
 
-    // Use content's mintAddress if the request omitted it
-    const effectiveMint = body.mint_address ?? row.mintAddress ?? null;
+    // Move seller's access token to backend escrow ATA (via PermanentDelegate)
+    let escrowAta: string | null = null;
+    try {
+      const result = await moveTokenToEscrow(effectiveMint, sellerWallet, solanaConnection);
+      escrowAta = result.escrowAta;
+      console.log(`[listings] Token moved to escrow ${escrowAta.slice(0, 8)}… for seller ${sellerWallet.slice(0, 8)}…`);
+    } catch (err: any) {
+      console.error(`[listings] Failed to move token to escrow: ${err?.message?.slice(0, 100)}`);
+      // Continue — listing is still created so seller can try again or cancel
+    }
 
     const [created] = await db
       .insert(listings)
       .values({
-        contentId:     body.content_id,
+        contentId:          body.content_id,
         sellerWallet,
-        priceLamports: BigInt(body.price_lamports),
-        mintAddress:   effectiveMint,
-        tokenAccount:  body.token_account ?? null,
-        status:        "active",
+        priceLamports:      BigInt(body.price_lamports),
+        mintAddress:        effectiveMint,
+        tokenAccount:       body.token_account ?? null,
+        onChainListingPda:  body.on_chain_listing_pda ?? null,
+        escrowAta,
+        status:             "active",
       })
       .returning();
 
@@ -100,7 +124,7 @@ listingsRouter.post(
   }
 );
 
-// ─── GET /:contentId — active listings ────────────────────────────────────────
+// ─── GET /:contentId — active listings for content ────────────────────────────
 
 listingsRouter.get("/:contentId", async (c) => {
   const { contentId } = c.req.param();
@@ -120,7 +144,6 @@ listingsRouter.get("/:contentId", async (c) => {
 });
 
 // ─── GET /check-sold/:contentId?wallet= — was this wallet a seller who sold? ──
-// Used by frontend access-check to revoke viewing rights after a successful sale.
 
 listingsRouter.get("/check-sold/:contentId", async (c) => {
   const { contentId } = c.req.param();
@@ -142,7 +165,7 @@ listingsRouter.get("/check-sold/:contentId", async (c) => {
   return c.json({ sold: !!row });
 });
 
-// ─── DELETE /:id — cancel listing ─────────────────────────────────────────────
+// ─── DELETE /:id — cancel listing, return token from escrow ──────────────────
 
 listingsRouter.delete("/:id", async (c) => {
   const sellerWallet = extractWallet(c.req.header("authorization"));
@@ -151,7 +174,12 @@ listingsRouter.delete("/:id", async (c) => {
   const { id } = c.req.param();
 
   const [row] = await db
-    .select({ sellerWallet: listings.sellerWallet, status: listings.status })
+    .select({
+      sellerWallet: listings.sellerWallet,
+      status:       listings.status,
+      mintAddress:  listings.mintAddress,
+      escrowAta:    listings.escrowAta,
+    })
     .from(listings)
     .where(eq(listings.id, id))
     .limit(1);
@@ -162,6 +190,13 @@ listingsRouter.delete("/:id", async (c) => {
   if (row.status !== "active")
     return c.json({ error: "Listing is already closed" }, 400);
 
+  // Return token from escrow to seller
+  if (row.mintAddress && row.escrowAta) {
+    returnTokenFromEscrow(row.mintAddress, sellerWallet, solanaConnection).catch((err) => {
+      console.error(`[listings] Failed to return token from escrow for listing ${id}:`, err?.message?.slice(0, 80));
+    });
+  }
+
   await db
     .update(listings)
     .set({ status: "cancelled", updatedAt: new Date() })
@@ -170,7 +205,7 @@ listingsRouter.delete("/:id", async (c) => {
   return c.json({ ok: true });
 });
 
-// ─── PATCH /:id/sold — mark listing sold (called by buyer after transfer) ─────
+// ─── PATCH /:id/sold — mark listing sold (legacy compatibility) ───────────────
 
 const soldSchema = z.object({ tx_signature: z.string().min(40) });
 
@@ -201,11 +236,13 @@ listingsRouter.patch(
   }
 );
 
-// ─── POST /:id/fulfill — execute token transfer seller→buyer (backend-mediated) ─
+// ─── POST /:id/fulfill — deliver escrowed token to buyer ──────────────────────
+// Called by frontend after execute_sale on-chain tx confirms.
+// Backend burns escrow token + mints fresh to buyer, records purchase.
 
 const fulfillSchema = z.object({
   buyer_wallet:  z.string().min(32),
-  tx_signature:  z.string().min(40), // SOL payment tx already confirmed by buyer
+  tx_signature:  z.string().min(1),
   amount_paid:   z.string().or(z.number()),
 });
 
@@ -216,8 +253,8 @@ listingsRouter.post(
     const buyerWallet = extractWallet(c.req.header("authorization"));
     if (!buyerWallet) return c.json({ error: "Unauthorized" }, 401);
 
-    const { id }  = c.req.param();
-    const body    = c.req.valid("json");
+    const { id } = c.req.param();
+    const body   = c.req.valid("json");
 
     // Load listing
     const [listing] = await db
@@ -228,14 +265,17 @@ listingsRouter.post(
 
     if (!listing)                   return c.json({ error: "Listing not found" }, 404);
     if (listing.status !== "active") return c.json({ error: "Listing already closed" }, 400);
-    // Normalize to lowercase for comparison — Solana addresses are case-sensitive but
-    // Web3Auth and Phantom may return different cases in edge scenarios
     if (listing.sellerWallet.toLowerCase() === buyerWallet.toLowerCase())
       return c.json({ error: "Cannot buy your own listing" }, 400);
 
-    // Load content for mint address
+    // Load content for mint address and Author NFT
     const [contentRow] = await db
-      .select({ mintAddress: contentTable.mintAddress, accessMint: contentTable.accessMint, authorWallet: contentTable.authorWallet })
+      .select({
+        mintAddress:   contentTable.mintAddress,
+        accessMint:    contentTable.accessMint,
+        authorWallet:  contentTable.authorWallet,
+        authorNftMint: contentTable.authorNftMint,
+      })
       .from(contentTable)
       .where(eq(contentTable.contentId, listing.contentId))
       .limit(1);
@@ -246,14 +286,28 @@ listingsRouter.post(
     if (!mintAddress || mintAddress === "pending")
       return c.json({ error: "Content has no SPL mint — contact support" }, 400);
 
+    // Resolve current Author NFT holder for royalty info (non-blocking)
+    let royaltyHolder: string | null = null;
+    if (contentRow.authorNftMint) {
+      royaltyHolder = await resolveAuthorNftHolder(contentRow.authorNftMint, solanaConnection)
+        .catch(() => null);
+    }
+    royaltyHolder ??= contentRow.authorWallet;
+
     try {
-      // Execute token transfer seller → buyer (or mint new if legacy)
-      const transferSig = await transferTokenFromSeller(
-        mintAddress,
-        listing.sellerWallet,
-        buyerWallet,
-        solanaConnection
-      );
+      // Deliver access token: burn from escrow + mint fresh to buyer
+      let transferSig: string;
+      if (listing.escrowAta) {
+        transferSig = await moveTokenFromEscrow(mintAddress, buyerWallet, solanaConnection);
+      } else {
+        // Fallback for legacy listings without escrow
+        transferSig = await transferTokenFromSeller(
+          mintAddress,
+          listing.sellerWallet,
+          buyerWallet,
+          solanaConnection
+        );
+      }
 
       // Mark listing as sold
       await db
@@ -261,7 +315,7 @@ listingsRouter.post(
         .set({ status: "sold", updatedAt: new Date() })
         .where(eq(listings.id, id));
 
-      // Record purchase for buyer (access record)
+      // Record purchase for buyer
       const amountPaid =
         typeof body.amount_paid === "string"
           ? BigInt(body.amount_paid)
@@ -277,9 +331,11 @@ listingsRouter.post(
         paymentToken: "SOL",
       }).onConflictDoNothing();
 
-      console.log(`[fulfill] Listing ${id} sold: ${listing.sellerWallet.slice(0, 8)} → ${buyerWallet.slice(0, 8)} | transfer: ${transferSig.slice(0, 12)}`);
+      console.log(
+        `[fulfill] Listing ${id} sold: ${listing.sellerWallet.slice(0, 8)} → ${buyerWallet.slice(0, 8)} | sig: ${transferSig.slice(0, 12)} | royalty→${royaltyHolder?.slice(0, 8)}`
+      );
 
-      return c.json({ ok: true, transfer_sig: transferSig });
+      return c.json({ ok: true, transfer_sig: transferSig, royalty_holder: royaltyHolder });
     } catch (err: any) {
       console.error(`[fulfill] Error for listing ${id}:`, err?.message);
       return c.json({ error: `Transfer failed: ${err?.message?.slice(0, 100) ?? "unknown"}` }, 500);

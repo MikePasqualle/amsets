@@ -1,17 +1,15 @@
 /**
- * Mint Service — SPL Token-2022 with PermanentDelegate + TokenMetadata.
+ * Mint Service — SPL Token-2022 operations for AMSETS.
  *
- * Every AMSETS access token mint has:
- *  - TransferFeeConfig : author royalty on every transfer (bps-based)
- *  - PermanentDelegate : backend keypair can transfer/burn without seller signature
- *  - MetadataPointer   : on-chain metadata (name, symbol, URI)
- *  - TokenMetadata     : title, "AMSETS", IPFS preview URI
+ * Two-token model per content item:
+ *  - Author NFT (1-of-1, no TransferFeeConfig): proves authorship, royalty rights.
+ *  - Access Token  (user-defined supply, no TransferFeeConfig): grants content viewing.
  *
- * Flow:
- *  1. Author publishes → createMintWithMetadata → 1 token minted to author.
- *  2. Buyer purchases primary → mintAccessTokenToUser (backend mints 1 to buyer).
- *  3. Seller lists → frontend sends approve tx (for old mints without PermanentDelegate).
- *  4. Buyer purchases secondary → transferTokenFromSeller (PermanentDelegate or delegated transfer).
+ * Both mints have PermanentDelegate (backend keypair) so the backend can
+ * move/burn tokens without requiring the owner's signature.
+ *
+ * Royalties are collected in SOL at transaction time via the smart contract,
+ * NOT via token transfer fees (TransferFeeConfig removed from all new mints).
  */
 
 import {
@@ -27,10 +25,8 @@ import {
   ExtensionType,
   createAssociatedTokenAccountIdempotentInstruction,
   createInitializeMintInstruction,
-  createInitializeTransferFeeConfigInstruction,
   createInitializePermanentDelegateInstruction,
   createInitializeMetadataPointerInstruction,
-  createTransferCheckedInstruction,
   createBurnInstruction,
   createMintToInstruction,
   getMintLen,
@@ -54,45 +50,35 @@ export function getMintAuthorityPubkey(): string {
   return getMintAuthorityKeypair().publicKey.toBase58();
 }
 
-// ─── Create mint with metadata ────────────────────────────────────────────────
+// ─── Metadata type ────────────────────────────────────────────────────────────
 
 export interface MintMetadata {
   name:   string; // content title
   symbol: string; // e.g. "AMSETS"
-  uri:    string; // IPFS/Arweave URL for content preview JSON
+  uri:    string; // IPFS preview URI (for wallet display)
 }
 
-/**
- * Creates a fully-featured SPL Token-2022 mint with:
- *  - TransferFeeConfig (royalties on every secondary transfer)
- *  - PermanentDelegate (backend can move/burn tokens without seller approval)
- *  - MetadataPointer + TokenMetadata (name, symbol, URI shown in wallets)
- */
-export async function createMintWithMetadata(
-  royaltyBps: number,
+// ─── Internal: create a SPL Token-2022 mint with no transfer fee ─────────────
+
+async function createToken2022Mint(
   metadata: MintMetadata,
   connection: Connection
 ): Promise<string> {
   const auth   = getMintAuthorityKeypair();
   const mintKp = Keypair.generate();
 
-  // Extension order for Token-2022:
-  // MetadataPointer MUST come first in getMintLen AND in initialization.
-  // PermanentDelegate and TransferFeeConfig follow.
-  // InitializeMint comes LAST (after all extensions).
+  // Extensions: MetadataPointer must be first, then PermanentDelegate.
+  // NO TransferFeeConfig — royalties collected in SOL at purchase time.
   const extensions = [
     ExtensionType.MetadataPointer,
     ExtensionType.PermanentDelegate,
-    ExtensionType.TransferFeeConfig,
   ];
-  // Allocate EXACTLY mintLen — no extra bytes.
-  // tokenMetadataInitialize reallocs the account when it adds metadata TLV data.
   const mintLen  = getMintLen(extensions);
   const lamports = await connection.getMinimumBalanceForRentExemption(mintLen);
 
   const tx = new Transaction();
 
-  // 1. Create account with exactly mintLen bytes
+  // 1. Create mint account
   tx.add(
     SystemProgram.createAccount({
       fromPubkey:       auth.publicKey,
@@ -104,7 +90,6 @@ export async function createMintWithMetadata(
   );
 
   // 2. Initialize extensions BEFORE InitializeMint (Token-2022 requirement)
-  // MetadataPointer must point to the mint itself (on-chain metadata pattern)
   tx.add(
     createInitializeMetadataPointerInstruction(
       mintKp.publicKey,
@@ -117,27 +102,16 @@ export async function createMintWithMetadata(
   tx.add(
     createInitializePermanentDelegateInstruction(
       mintKp.publicKey,
-      auth.publicKey,   // backend can burn/transfer anytime without seller signature
+      auth.publicKey,   // backend can burn/transfer without owner signature
       TOKEN_2022_PROGRAM_ID
     )
   );
 
-  tx.add(
-    createInitializeTransferFeeConfigInstruction(
-      mintKp.publicKey,
-      auth.publicKey,   // fee config authority
-      auth.publicKey,   // withdraw withheld authority
-      royaltyBps,
-      BigInt("18446744073709551615"), // u64::MAX — no per-transfer cap
-      TOKEN_2022_PROGRAM_ID
-    )
-  );
-
-  // 3. Initialize mint last (Token-2022 validates extension layout at this point)
+  // 3. Initialize mint (0 decimals — whole-token access passes)
   tx.add(
     createInitializeMintInstruction(
       mintKp.publicKey,
-      0,              // 0 decimals — whole-token access passes
+      0,              // 0 decimals
       auth.publicKey, // mint authority = backend keypair
       null,           // no freeze authority
       TOKEN_2022_PROGRAM_ID
@@ -151,76 +125,88 @@ export async function createMintWithMetadata(
 
   await sendAndConfirmTransaction(connection, tx, [auth, mintKp], { commitment: "confirmed" });
 
-  // 4. Initialize on-chain token metadata
-  // tokenMetadataInitialize is an async helper that sends its own transaction.
+  // 4. Initialize on-chain token metadata (reallocs the account with TLV data)
   try {
     await tokenMetadataInitialize(
       connection,
-      auth,                     // payer
-      mintKp.publicKey,         // mint
-      auth.publicKey,           // updateAuthority
-      auth,                     // mintAuthority (Signer)
+      auth,
+      mintKp.publicKey,
+      auth.publicKey,
+      auth,
       metadata.name.slice(0, 32),
       metadata.symbol.slice(0, 10),
       metadata.uri.slice(0, 200),
-      [],                       // multiSigners
+      [],
       { commitment: "confirmed" },
       TOKEN_2022_PROGRAM_ID
     );
     console.log(`[mint] Metadata initialized: "${metadata.name}"`);
   } catch (e: any) {
-    // Metadata init can fail if space is too tight — non-fatal, token still works
+    // Non-fatal: wallet still receives the token, just without rich metadata
     console.warn(`[mint] Metadata init warning (non-fatal): ${e?.message?.slice(0, 100)}`);
   }
 
-  console.log(`[mint] Created mint ${mintKp.publicKey.toBase58()} with PermanentDelegate`);
   return mintKp.publicKey.toBase58();
 }
 
+// ─── Create Access Token mint ─────────────────────────────────────────────────
+
 /**
- * Legacy: creates a mint WITHOUT metadata (for backwards compat / admin use).
- * New content should use createMintWithMetadata.
+ * Creates the access token mint for content.
+ * No TransferFeeConfig — royalties are collected in SOL on-chain.
+ * Has PermanentDelegate so backend can move tokens for escrow and burn for resale.
+ */
+export async function createMintWithMetadata(
+  _royaltyBps: number,   // kept for API compatibility — not used for fee config
+  metadata: MintMetadata,
+  connection: Connection
+): Promise<string> {
+  const address = await createToken2022Mint(metadata, connection);
+  console.log(`[mint] Created access token mint ${address}`);
+  return address;
+}
+
+/**
+ * Legacy alias — kept for backwards compatibility.
  */
 export async function createMintForExistingContent(
   royaltyBps: number,
   connection: Connection,
   metadata?: MintMetadata
 ): Promise<string> {
-  if (metadata) {
-    return createMintWithMetadata(royaltyBps, metadata, connection);
-  }
-  // Fallback — no metadata (for old code paths)
-  const auth   = getMintAuthorityKeypair();
-  const mintKp = Keypair.generate();
-  // PermanentDelegate BEFORE TransferFeeConfig, InitializeMint LAST
-  const extensions = [ExtensionType.PermanentDelegate, ExtensionType.TransferFeeConfig];
-  const mintLen    = getMintLen(extensions);
-  const lamports   = await connection.getMinimumBalanceForRentExemption(mintLen);
-
-  const tx = new Transaction();
-  tx.add(
-    SystemProgram.createAccount({
-      fromPubkey: auth.publicKey, newAccountPubkey: mintKp.publicKey,
-      space: mintLen, lamports, programId: TOKEN_2022_PROGRAM_ID,
-    }),
-    createInitializePermanentDelegateInstruction(mintKp.publicKey, auth.publicKey, TOKEN_2022_PROGRAM_ID),
-    createInitializeTransferFeeConfigInstruction(
-      mintKp.publicKey, auth.publicKey, auth.publicKey, royaltyBps,
-      BigInt("18446744073709551615"), TOKEN_2022_PROGRAM_ID
-    ),
-    createInitializeMintInstruction(mintKp.publicKey, 0, auth.publicKey, null, TOKEN_2022_PROGRAM_ID)
-  );
-
-  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
-  tx.recentBlockhash = blockhash; tx.lastValidBlockHeight = lastValidBlockHeight;
-  tx.feePayer = auth.publicKey;
-  await sendAndConfirmTransaction(connection, tx, [auth, mintKp], { commitment: "confirmed" });
-  console.log(`[mint] Created mint (no metadata): ${mintKp.publicKey.toBase58()}`);
-  return mintKp.publicKey.toBase58();
+  if (metadata) return createMintWithMetadata(royaltyBps, metadata, connection);
+  // Fallback — no metadata (old code paths)
+  return createToken2022Mint({ name: "AMSETS", symbol: "AMSETS", uri: "" }, connection);
 }
 
-// ─── Mint 1 token to a user ───────────────────────────────────────────────────
+// ─── Create Author NFT mint ───────────────────────────────────────────────────
 
+/**
+ * Creates a 1-of-1 Author NFT mint for a content item.
+ * This is a separate mint from the access token mint.
+ * The holder of this NFT receives all royalty payments.
+ */
+export async function createAuthorNftMint(
+  metadata: MintMetadata,
+  connection: Connection
+): Promise<string> {
+  const address = await createToken2022Mint(
+    {
+      name:   `${metadata.name} — Author`,
+      symbol: "AUT",
+      uri:    metadata.uri,
+    },
+    connection
+  );
+  console.log(`[mint] Created Author NFT mint ${address}`);
+  return address;
+}
+
+// ─── Mint tokens ──────────────────────────────────────────────────────────────
+
+/**
+ * Mints 1 token to a recipient wallet. Idempotent — skips if recipient already has ≥1.
+ */
 export async function mintAccessTokenToUser(
   mintAddress: string,
   recipientWallet: string,
@@ -237,7 +223,7 @@ export async function mintAccessTokenToUser(
       console.log(`[mint] ${recipient.toBase58().slice(0, 8)} already holds token`);
       return "already_minted";
     }
-  } catch { /* ATA doesn't exist yet */ }
+  } catch { /* ATA doesn't exist yet — proceed to mint */ }
 
   const tx = new Transaction();
   tx.add(
@@ -250,10 +236,24 @@ export async function mintAccessTokenToUser(
   tx.feePayer = auth.publicKey;
 
   const sig = await sendAndConfirmTransaction(connection, tx, [auth], { commitment: "confirmed" });
-  console.log(`[mint] Minted 1 → ${recipient.toBase58().slice(0, 8)}… sig: ${sig.slice(0, 12)}…`);
+  console.log(`[mint] Minted 1 token → ${recipient.toBase58().slice(0, 8)}… sig: ${sig.slice(0, 12)}…`);
   return sig;
 }
 
+/**
+ * Mints 1 Author NFT to the content author's wallet.
+ * Idempotent — skips if the author already holds the NFT.
+ */
+export async function mintAuthorNft(
+  authorNftMintAddress: string,
+  authorWallet: string,
+  connection: Connection
+): Promise<string> {
+  console.log(`[mint] Minting Author NFT to ${authorWallet.slice(0, 8)}…`);
+  return mintAccessTokenToUser(authorNftMintAddress, authorWallet, connection);
+}
+
+/** Alias kept for backward compatibility */
 export async function mintAuthorToken(
   mintAddress: string,
   authorWallet: string,
@@ -262,33 +262,198 @@ export async function mintAuthorToken(
   return mintAccessTokenToUser(mintAddress, authorWallet, connection);
 }
 
-// ─── Transfer token from seller to buyer (secondary market) ──────────────────
+// ─── Resolve Author NFT holder ────────────────────────────────────────────────
 
 /**
- * Transfers 1 access token from seller to buyer.
- *
- * Strategy:
- *  1. If mint has PermanentDelegate = backend → use it to transfer directly.
- *  2. Otherwise → mint a new token to buyer + burn seller's token if possible,
- *     else just mint to buyer (graceful degradation for legacy mints).
- *
- * @returns tx signature of the transfer (or mint) transaction
+ * Finds the current holder of the 1-of-1 Author NFT.
+ * Queries Helius DAS API first (most efficient), falls back to RPC scan.
+ * Returns the holder's wallet address, or null if not found.
  */
+export async function resolveAuthorNftHolder(
+  authorNftMintAddress: string,
+  connection: Connection
+): Promise<string | null> {
+  const heliusKey = process.env.HELIUS_API_KEY;
+  const cluster   = process.env.SOLANA_CLUSTER ?? "devnet";
+
+  // Try Helius DAS getTokenAccounts first
+  if (heliusKey) {
+    try {
+      const rpcUrl =
+        cluster === "mainnet-beta"
+          ? `https://mainnet.helius-rpc.com/?api-key=${heliusKey}`
+          : `https://devnet.helius-rpc.com/?api-key=${heliusKey}`;
+
+      const resp = await fetch(rpcUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id:      "amsets-royalty-resolve",
+          method:  "getTokenAccounts",
+          params: {
+            mint:  authorNftMintAddress,
+            limit: 10,
+          },
+        }),
+      });
+
+      if (resp.ok) {
+        const json: any = await resp.json();
+        const accounts: any[] = json?.result?.token_accounts ?? [];
+        // Find account with amount >= 1
+        const holder = accounts.find((a: any) => Number(a.amount) >= 1);
+        if (holder?.owner) {
+          console.log(`[mint] Author NFT holder resolved via DAS: ${holder.owner.slice(0, 8)}…`);
+          return holder.owner as string;
+        }
+      }
+    } catch (e: any) {
+      console.warn(`[mint] DAS lookup failed: ${e?.message?.slice(0, 60)} — falling back to RPC`);
+    }
+  }
+
+  // Fallback: RPC getParsedTokenAccountsByOwner is too slow for unknown owners.
+  // Use getTokenLargestAccounts to find who holds the mint.
+  try {
+    const mint    = new PublicKey(authorNftMintAddress);
+    const largest = await connection.getTokenLargestAccounts(mint, "confirmed");
+    if (!largest.value.length) return null;
+
+    // The Author NFT has supply of 1 — the largest account is the holder
+    const holderAta = largest.value[0].address;
+    const acctInfo  = await connection.getParsedAccountInfo(holderAta, "confirmed");
+    const parsed    = (acctInfo.value?.data as any)?.parsed?.info;
+    const owner: string | undefined = parsed?.owner;
+    if (owner) {
+      console.log(`[mint] Author NFT holder resolved via RPC: ${owner.slice(0, 8)}…`);
+      return owner;
+    }
+  } catch (e: any) {
+    console.warn(`[mint] RPC fallback failed: ${e?.message?.slice(0, 60)}`);
+  }
+
+  return null;
+}
+
+// ─── Escrow helpers ───────────────────────────────────────────────────────────
+
 /**
- * Transfers an access token from seller to buyer during a secondary sale.
- *
- * WHY burn+mint instead of transferChecked:
- *   AMSETS access tokens have 0 decimals. With a 10% TransferFeeConfig,
- *   ceil(1 × 10%) = 1 — the entire token becomes a fee and the buyer receives 0.
- *   To avoid this, we never use transferChecked for secondary sales.
- *   Instead: burn seller's token (no fee) + mint new token to buyer (no fee).
- *   SOL-level royalties (author % + platform %) are collected at payment time.
- *
- * Strategy:
- *  1. Burn seller's token via PermanentDelegate (preferred — no owner sig needed).
- *  2. If no PermanentDelegate: burn via seller's delegate approval set at listing time.
- *  3. Fallback: if neither works, still mint to buyer but log a warning about seller token.
- *  After burning: mint a fresh token to buyer via backend MintAuthority.
+ * Moves a seller's access token to the backend escrow ATA.
+ * Uses PermanentDelegate so no seller signature is needed.
+ * Called when a listing is created.
+ * Returns the escrow ATA address.
+ */
+export async function moveTokenToEscrow(
+  mintAddress: string,
+  sellerWallet: string,
+  connection: Connection
+): Promise<{ escrowAta: string; burnSig: string }> {
+  const auth      = getMintAuthorityKeypair();
+  const mint      = new PublicKey(mintAddress);
+  const seller    = new PublicKey(sellerWallet);
+  const sellerAta = getAssociatedTokenAddressSync(mint, seller, false, TOKEN_2022_PROGRAM_ID);
+  const escrowAta = getAssociatedTokenAddressSync(mint, auth.publicKey, false, TOKEN_2022_PROGRAM_ID);
+
+  // Check seller actually has the token
+  const sellerAcct = await getAccount(connection, sellerAta, "confirmed", TOKEN_2022_PROGRAM_ID).catch(() => null);
+  if (!sellerAcct || sellerAcct.amount < 1n) {
+    throw new Error(`Seller ${sellerWallet.slice(0, 8)} does not hold an access token for mint ${mintAddress.slice(0, 8)}`);
+  }
+
+  const tx = new Transaction();
+
+  // Create escrow ATA if it doesn't exist
+  tx.add(
+    createAssociatedTokenAccountIdempotentInstruction(
+      auth.publicKey, escrowAta, auth.publicKey, mint, TOKEN_2022_PROGRAM_ID
+    )
+  );
+
+  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
+  tx.recentBlockhash      = blockhash;
+  tx.lastValidBlockHeight = lastValidBlockHeight;
+  tx.feePayer             = auth.publicKey;
+
+  await sendAndConfirmTransaction(connection, tx, [auth], { commitment: "confirmed" });
+
+  // Burn from seller + mint to escrow (avoids TransferFeeConfig issues)
+  const burnTx = new Transaction();
+  burnTx.add(
+    createBurnInstruction(sellerAta, mint, auth.publicKey, 1n, [], TOKEN_2022_PROGRAM_ID)
+  );
+
+  const { blockhash: bh2, lastValidBlockHeight: lbh2 } = await connection.getLatestBlockhash("confirmed");
+  burnTx.recentBlockhash      = bh2;
+  burnTx.lastValidBlockHeight = lbh2;
+  burnTx.feePayer             = auth.publicKey;
+
+  const burnSig = await sendAndConfirmTransaction(connection, burnTx, [auth], { commitment: "confirmed" });
+  console.log(`[mint] Seller token moved to escrow | burn sig: ${burnSig.slice(0, 12)}…`);
+
+  // Mint fresh token to escrow
+  await mintAccessTokenToUser(mintAddress, auth.publicKey.toBase58(), connection);
+  console.log(`[mint] Minted replacement token to escrow ${escrowAta.toBase58().slice(0, 8)}…`);
+
+  return { escrowAta: escrowAta.toBase58(), burnSig };
+}
+
+/**
+ * Moves the escrowed access token from escrow ATA to the buyer.
+ * Burns the escrow token + mints fresh to buyer (avoids TransferFeeConfig).
+ * Called after execute_sale on-chain transaction confirms.
+ */
+export async function moveTokenFromEscrow(
+  mintAddress: string,
+  buyerWallet: string,
+  connection: Connection
+): Promise<string> {
+  const auth      = getMintAuthorityKeypair();
+  const mint      = new PublicKey(mintAddress);
+  const escrowAta = getAssociatedTokenAddressSync(mint, auth.publicKey, false, TOKEN_2022_PROGRAM_ID);
+
+  // Burn from escrow
+  const escrowAcct = await getAccount(connection, escrowAta, "confirmed", TOKEN_2022_PROGRAM_ID).catch(() => null);
+  if (escrowAcct && escrowAcct.amount >= 1n) {
+    const burnTx = new Transaction();
+    burnTx.add(
+      createBurnInstruction(escrowAta, mint, auth.publicKey, 1n, [], TOKEN_2022_PROGRAM_ID)
+    );
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
+    burnTx.recentBlockhash      = blockhash;
+    burnTx.lastValidBlockHeight = lastValidBlockHeight;
+    burnTx.feePayer             = auth.publicKey;
+
+    const burnSig = await sendAndConfirmTransaction(connection, burnTx, [auth], { commitment: "confirmed" });
+    console.log(`[mint] Escrow token burned | sig: ${burnSig.slice(0, 12)}…`);
+  } else {
+    console.warn(`[mint] Escrow ATA empty or missing — will still mint to buyer`);
+  }
+
+  // Mint fresh token to buyer
+  const mintSig = await mintAccessTokenToUser(mintAddress, buyerWallet, connection);
+  console.log(`[mint] Token delivered to buyer ${buyerWallet.slice(0, 8)}… | sig: ${mintSig.slice(0, 12)}…`);
+  return mintSig;
+}
+
+/**
+ * Returns an escrowed token back to the seller when a listing is cancelled.
+ * Burns from escrow + mints fresh to seller.
+ */
+export async function returnTokenFromEscrow(
+  mintAddress: string,
+  sellerWallet: string,
+  connection: Connection
+): Promise<string> {
+  console.log(`[mint] Returning escrowed token to seller ${sellerWallet.slice(0, 8)}…`);
+  return moveTokenFromEscrow(mintAddress, sellerWallet, connection);
+}
+
+// ─── Legacy: secondary transfer (kept for backward compatibility) ──────────────
+
+/**
+ * @deprecated Use moveTokenFromEscrow for new listings.
+ * Kept for backward compatibility with old listings that used delegate approval.
  */
 export async function transferTokenFromSeller(
   mintAddress: string,
@@ -301,7 +466,6 @@ export async function transferTokenFromSeller(
   const seller    = new PublicKey(sellerWallet);
   const sellerAta = getAssociatedTokenAddressSync(mint, seller, false, TOKEN_2022_PROGRAM_ID);
 
-  // ─── Resolve PermanentDelegate ────────────────────────────────────────────
   let permanentDelegate: PublicKey | null = null;
   try {
     const mintInfo = await getMint(connection, mint, "confirmed", TOKEN_2022_PROGRAM_ID);
@@ -309,55 +473,28 @@ export async function transferTokenFromSeller(
   } catch { /* non-fatal */ }
 
   const backendIsPD = permanentDelegate?.toBase58() === auth.publicKey.toBase58();
-
-  // ─── Step 1: Burn seller's token ─────────────────────────────────────────
-  // We NEVER use transferChecked because Token-2022 TransferFeeConfig charges
-  // ceil(amount × fee_bps / 10000). With 0-decimal tokens and any fee > 0%,
-  // the fee rounds up to 1 and the buyer receives 0. Burn + mint avoids fees.
-  const sellerAcct = await getAccount(connection, sellerAta, "confirmed", TOKEN_2022_PROGRAM_ID).catch(() => null);
+  const sellerAcct  = await getAccount(connection, sellerAta, "confirmed", TOKEN_2022_PROGRAM_ID).catch(() => null);
 
   if (sellerAcct && sellerAcct.amount > 0n) {
-    let canBurn = false;
-
-    if (backendIsPD) {
-      canBurn = true;
-      console.log(`[mint] Burning seller token via PermanentDelegate ${mintAddress.slice(0, 8)}`);
-    } else if (
+    let canBurn = backendIsPD || (
       sellerAcct.delegate?.toBase58() === auth.publicKey.toBase58() &&
       sellerAcct.delegatedAmount >= 1n
-    ) {
-      canBurn = true;
-      console.log(`[mint] Burning seller token via delegate approval ${mintAddress.slice(0, 8)}`);
-    }
+    );
 
     if (canBurn) {
       try {
         const burnTx = new Transaction();
-        burnTx.add(
-          createBurnInstruction(sellerAta, mint, auth.publicKey, 1n, [], TOKEN_2022_PROGRAM_ID)
-        );
+        burnTx.add(createBurnInstruction(sellerAta, mint, auth.publicKey, 1n, [], TOKEN_2022_PROGRAM_ID));
         const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
-        burnTx.recentBlockhash      = blockhash;
-        burnTx.lastValidBlockHeight = lastValidBlockHeight;
-        burnTx.feePayer             = auth.publicKey;
-        const burnSig = await sendAndConfirmTransaction(connection, burnTx, [auth], { commitment: "confirmed" });
-        console.log(`[mint] Seller token burned | sig: ${burnSig.slice(0, 12)}…`);
+        burnTx.recentBlockhash = blockhash; burnTx.lastValidBlockHeight = lastValidBlockHeight;
+        burnTx.feePayer = auth.publicKey;
+        const sig = await sendAndConfirmTransaction(connection, burnTx, [auth], { commitment: "confirmed" });
+        console.log(`[mint] Legacy: seller token burned | sig: ${sig.slice(0, 12)}…`);
       } catch (err: any) {
-        console.error(`[mint] Burn failed: ${err?.message?.slice(0, 80)} — proceeding to mint buyer token anyway`);
+        console.error(`[mint] Legacy burn failed: ${err?.message?.slice(0, 80)}`);
       }
-    } else {
-      console.warn(`[mint] Cannot burn seller token (no PD, no delegate) — will mint to buyer anyway`);
     }
-  } else {
-    console.log(`[mint] Seller ATA empty or missing — skipping burn`);
   }
 
-  // ─── Step 2: Mint fresh token to buyer ───────────────────────────────────
-  // Always mint a new token — avoids TransferFee and works regardless of
-  // whether the burn above succeeded.
-  console.log(`[mint] Minting fresh access token to buyer ${buyerWallet.slice(0, 8)}`);
-  const mintSig = await mintAccessTokenToUser(mintAddress, buyerWallet, connection);
-  console.log(`[mint] Buyer token minted | sig: ${mintSig.slice(0, 12)}…`);
-
-  return mintSig;
+  return mintAccessTokenToUser(mintAddress, buyerWallet, connection);
 }
