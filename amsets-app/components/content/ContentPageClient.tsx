@@ -138,15 +138,20 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
   const { publicKey, connected, sendTransaction } = useWallet();
   const { connection }  = useConnection();
   const { openAuth }    = useAuthModal();
-  const { isAuthenticated, walletAddress, token } = useSession();
+  const { isAuthenticated, walletAddress, tokenWallet, token } = useSession();
 
   const previewUrl = resolveIPFS(content.previewUri);
   const priceSOL   = (Number(content.basePrice) / 1_000_000_000).toFixed(3);
 
-  // All addresses for this user (Web3Auth + Phantom both checked)
-  const myAddresses = [walletAddress, publicKey?.toBase58()]
-    .filter(Boolean)
-    .map((a) => a!.toLowerCase());
+  // tokenWallet = the wallet from the JWT sub claim = what the backend sees.
+  // This is the single source of truth for ownership checks.
+  // walletAddress / publicKey are used only for signing transactions.
+  const myAuthWallet = tokenWallet?.toLowerCase() ?? null;
+
+  // For "is author" we also accept the Phantom publicKey as a fallback
+  // (in case the author is connected but hasn't obtained a JWT yet).
+  const myAddresses = [...new Set([myAuthWallet, walletAddress?.toLowerCase(), publicKey?.toBase58()?.toLowerCase()])]
+    .filter(Boolean) as string[];
 
   // Determine access rights
   const isAuthor  = !!(content.authorWallet &&
@@ -306,6 +311,23 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
     if (!isAuthenticated) { openAuth(); return; }
     if (!connected || !publicKey || !sendTransaction) {
       setResaleError("Connect Phantom or Solflare wallet to purchase.");
+      return;
+    }
+
+    // Safety check: ensure the JWT token belongs to the CURRENT connected wallet.
+    // If they differ it means a stale token from a previous session is still cached —
+    // sending it would cause the backend to reject the purchase as "own listing".
+    if (myAuthWallet && myAuthWallet !== publicKey.toBase58().toLowerCase()) {
+      setResaleError(
+        "Session mismatch: your login token belongs to a different wallet. " +
+        "Please disconnect, reconnect your wallet, and try again."
+      );
+      return;
+    }
+
+    // Double-check: the buyer must not be the seller (frontend guard mirrors backend)
+    if (myAuthWallet && myAuthWallet === listing.sellerWallet.toLowerCase()) {
+      setResaleError("You cannot buy your own listing.");
       return;
     }
 
@@ -883,7 +905,11 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
                 </div>
               )}
               {activeListings.map((listing) => {
-                const isOwnListing  = myAddresses.includes(listing.sellerWallet.toLowerCase());
+                // Compare against tokenWallet ONLY — the wallet the backend authenticates.
+                // Using myAddresses (which includes disconnected/cached wallets) caused
+                // "cannot buy own listing" errors when the JWT and Phantom wallet diverged.
+                const isOwnListing = !!(myAuthWallet &&
+                  listing.sellerWallet.toLowerCase() === myAuthWallet);
                 const priceSOLNum   = Number(listing.price_lamports) / LAMPORTS_PER_SOL;
                 const priceDisplay  = priceSOLNum.toFixed(3);
                 const royaltyBpNum  = content.royaltyBps ?? 0;
