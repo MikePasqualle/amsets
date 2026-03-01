@@ -697,38 +697,39 @@ export interface CreateListingResult {
 export async function createListingOnChain(
   listingUuid: string,
   contentUuid: string,
-  contentRecordPdaStr: string,
   priceLamports: bigint,
   tokenMintStr: string,
+  royaltyBps: number,
+  minRoyaltyLamports: number,
   sellerPublicKey: PublicKey,
   sendTransaction: (tx: Transaction, conn: Connection) => Promise<string>,
   connection: Connection
 ): Promise<CreateListingResult> {
-  const listingIdBytes   = uuidToBytes32(listingUuid);
-  const contentIdBytes   = uuidToBytes32(contentUuid);
-  const tokenMintKey     = new PublicKey(tokenMintStr);
-  const listingPda       = deriveListingRecordPda(listingIdBytes);
-  const contentRecordPda = new PublicKey(contentRecordPdaStr);
+  const listingIdBytes = uuidToBytes32(listingUuid);
+  const contentIdBytes = uuidToBytes32(contentUuid);
+  const tokenMintKey   = new PublicKey(tokenMintStr);
+  const listingPda     = deriveListingRecordPda(listingIdBytes);
 
-  // Encode: discriminator(8) + listing_id(32) + content_id(32) + price_lamports(8) + token_mint(32)
-  const priceBytes = encodeU64(priceLamports);
-  const data = new Uint8Array(8 + 32 + 32 + 8 + 32);
+  // Encode: disc(8) + listing_id(32) + content_id(32) + price_lamports(8) + token_mint(32)
+  //         + royalty_bps(u16 LE, 2) + min_royalty_lamports(u64 LE, 8) = 122 bytes total
+  const data = Buffer.alloc(122);
   let off = 0;
-  data.set(CREATE_LISTING_DISCRIMINATOR, off); off += 8;
-  data.set(listingIdBytes, off);               off += 32;
-  data.set(contentIdBytes, off);               off += 32;
-  data.set(priceBytes, off);                   off += 8;
-  data.set(tokenMintKey.toBytes(), off);
+  Buffer.from(CREATE_LISTING_DISCRIMINATOR).copy(data, off); off += 8;
+  data.set(listingIdBytes, off);                             off += 32;
+  data.set(contentIdBytes, off);                             off += 32;
+  data.set(encodeU64(priceLamports), off);                   off += 8;
+  data.set(tokenMintKey.toBytes(), off);                     off += 32;
+  data.writeUInt16LE(royaltyBps, off);                       off += 2;
+  data.writeBigUInt64LE(BigInt(minRoyaltyLamports), off);
 
   const ix = new TransactionInstruction({
     programId: AMSETS_PROGRAM_ID,
     keys: [
       { pubkey: sellerPublicKey,         isSigner: true,  isWritable: true  },
-      { pubkey: contentRecordPda,        isSigner: false, isWritable: false }, // for min_royalty validation
       { pubkey: listingPda,              isSigner: false, isWritable: true  },
       { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
     ],
-    data: Buffer.from(data),
+    data,
   });
 
   const tx = new Transaction().add(ix);
@@ -778,42 +779,51 @@ export interface ExecuteSaleResult {
  *   2.5% → fee_vault, royalty_bps% → royalty_recipient, remainder → seller.
  * After this tx, backend delivers access token from escrow to buyer.
  *
+ * Royalty values are passed as instruction args (not read from ContentRecord) to support
+ * legacy ContentRecord PDAs that have different account layouts and cannot be safely
+ * deserialized by the current Anchor struct.
+ *
  * @param listingUuid              UUID of the listing
- * @param contentRecordPdaStr      ContentRecord PDA (from content.onChainPda)
+ * @param royaltyBps               Royalty in basis points (0–5000, i.e. 0%–50%)
+ * @param minRoyaltyLamports       Minimum absolute royalty floor (0 = percentage-only)
  * @param royaltyRecipientWallet   Current Author NFT holder
  * @param sellerWallet             Listing seller
  */
 export async function executeSaleOnChain(
   listingUuid: string,
-  contentRecordPdaStr: string,
+  royaltyBps: number,
+  minRoyaltyLamports: number,
   royaltyRecipientWallet: string,
   sellerWallet: string,
   buyerPublicKey: PublicKey,
   sendTransaction: (tx: Transaction, conn: Connection) => Promise<string>,
   connection: Connection
 ): Promise<ExecuteSaleResult> {
-  const listingIdBytes       = uuidToBytes32(listingUuid);
-  const listingPda           = deriveListingRecordPda(listingIdBytes);
-  const contentRecordPda     = new PublicKey(contentRecordPdaStr);
-  const royaltyRecipientKey  = new PublicKey(royaltyRecipientWallet);
-  const sellerKey            = new PublicKey(sellerWallet);
-  const feeVaultPda          = deriveFeeVaultPda();
+  const listingIdBytes      = uuidToBytes32(listingUuid);
+  const listingPda          = deriveListingRecordPda(listingIdBytes);
+  const royaltyRecipientKey = new PublicKey(royaltyRecipientWallet);
+  const sellerKey           = new PublicKey(sellerWallet);
+  const feeVaultPda         = deriveFeeVaultPda();
+  const registryPda         = deriveRegistryStatePda();
 
-  const registryPda = deriveRegistryStatePda();
+  // Instruction data: discriminator(8) + royalty_bps(u16 LE, 2) + min_royalty_lamports(u64 LE, 8)
+  const data = Buffer.alloc(18);
+  Buffer.from(EXECUTE_SALE_DISCRIMINATOR).copy(data, 0);
+  data.writeUInt16LE(royaltyBps, 8);
+  data.writeBigUInt64LE(BigInt(minRoyaltyLamports), 10);
 
   const ix = new TransactionInstruction({
     programId: AMSETS_PROGRAM_ID,
     keys: [
       { pubkey: buyerPublicKey,          isSigner: true,  isWritable: true  },
       { pubkey: listingPda,              isSigner: false, isWritable: true  },
-      { pubkey: contentRecordPda,        isSigner: false, isWritable: false },
       { pubkey: feeVaultPda,             isSigner: false, isWritable: true  },
       { pubkey: royaltyRecipientKey,     isSigner: false, isWritable: true  },
       { pubkey: sellerKey,               isSigner: false, isWritable: true  },
-      { pubkey: registryPda,             isSigner: false, isWritable: true  }, // RegistryState
+      { pubkey: registryPda,             isSigner: false, isWritable: true  },
       { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
     ],
-    data: Buffer.from(EXECUTE_SALE_DISCRIMINATOR),
+    data,
   });
 
   const tx = new Transaction().add(ix);

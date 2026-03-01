@@ -283,14 +283,16 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
       const listingUuid = crypto.randomUUID();
 
       // Create on-chain ListingRecord PDA (seller signs)
+      // Royalty params are passed as instruction args (no ContentRecord deserialization needed)
       let onChainPda: string | undefined;
       try {
         const { pdaAddress } = await createListingOnChain(
           listingUuid,
           content.contentId,
-          content.onChainPda ?? "",   // ContentRecord PDA — for on-chain min_royalty validation
           BigInt(priceLamports),
           mintAddress,
+          content.royaltyBps        ?? 0,
+          content.minRoyaltyLamports ?? 0,
           publicKey,
           sendTransaction,
           connection
@@ -298,8 +300,7 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
         onChainPda = pdaAddress;
         console.log(`[listing] ListingRecord PDA created: ${pdaAddress.slice(0, 12)}…`);
       } catch (onChainErr: any) {
-        // Contract may not be deployed yet — continue without on-chain PDA
-        console.warn("[listing] On-chain listing creation skipped (contract may not be deployed):", onChainErr?.message?.slice(0, 80));
+        console.warn("[listing] On-chain listing creation skipped:", onChainErr?.message?.slice(0, 80));
       }
 
       // Tell backend to create the listing DB record + move token to escrow
@@ -376,10 +377,11 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
       // Resolve current royalty holder (current Author NFT holder)
       const royaltyRecipient = royaltyHolder ?? listing.sellerWallet;
 
-      // Derive ContentRecord PDA for this content
-      const contentIdBytes   = uuidToBytes32(content.contentId);
-      const authorPubkey     = new PublicKey(content.authorWallet);
-      const contentRecordPda = deriveContentRecordPda(authorPubkey, contentIdBytes);
+      // Royalty parameters come from content metadata (already in the page).
+      // They are passed as instruction args rather than read from ContentRecord on-chain
+      // to support legacy ContentRecord PDAs with different Borsh layouts.
+      const royaltyBps        = content.royaltyBps        ?? 0;
+      const minRoyaltyLamports = content.minRoyaltyLamports ?? 0;
 
       // Execute on-chain SOL distribution via smart contract.
       // This MUST succeed before the backend is called — no fallback allowed.
@@ -387,7 +389,8 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
       // and the listing remains active so the seller is not harmed.
       const result = await executeSaleOnChain(
         listing.id,
-        contentRecordPda.toBase58(),
+        royaltyBps,
+        minRoyaltyLamports,
         royaltyRecipient,
         listing.sellerWallet,
         publicKey,
