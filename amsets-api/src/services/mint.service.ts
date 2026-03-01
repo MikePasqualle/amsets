@@ -274,110 +274,144 @@ export async function mintAuthorToken(
  *
  * @returns tx signature of the transfer (or mint) transaction
  */
+/**
+ * Transfers an access token from seller to buyer during a secondary sale.
+ *
+ * Strategy (in order of preference):
+ *  1. PermanentDelegate  — backend transfers seller's token directly to buyer.
+ *                          Seller's ATA becomes empty. ✓ Cleanest — single token moves.
+ *  2. Delegate approval  — seller pre-approved backend at listing time; backend
+ *                          executes a transfer-checked on their behalf.
+ *  3. Fallback           — mint new token to buyer AND burn seller's token via
+ *                          PermanentDelegate (if available) or createBurnInstruction.
+ *                          Seller must end up with 0 tokens in ALL cases.
+ */
 export async function transferTokenFromSeller(
   mintAddress: string,
   sellerWallet: string,
   buyerWallet: string,
   connection: Connection
 ): Promise<string> {
-  const auth   = getMintAuthorityKeypair();
-  const mint   = new PublicKey(mintAddress);
-  const seller = new PublicKey(sellerWallet);
-  const buyer  = new PublicKey(buyerWallet);
-
+  const auth      = getMintAuthorityKeypair();
+  const mint      = new PublicKey(mintAddress);
+  const seller    = new PublicKey(sellerWallet);
+  const buyer     = new PublicKey(buyerWallet);
   const sellerAta = getAssociatedTokenAddressSync(mint, seller, false, TOKEN_2022_PROGRAM_ID);
   const buyerAta  = getAssociatedTokenAddressSync(mint, buyer,  false, TOKEN_2022_PROGRAM_ID);
 
-  // Check if this mint has PermanentDelegate = backend
-  let hasPermanentDelegate = false;
+  // ─── Resolve PermanentDelegate ────────────────────────────────────────────
+  let permanentDelegate: PublicKey | null = null;
   try {
     const mintInfo = await getMint(connection, mint, "confirmed", TOKEN_2022_PROGRAM_ID);
-    const pd = getPermanentDelegate(mintInfo);
-    hasPermanentDelegate = pd?.delegate?.toBase58() === auth.publicKey.toBase58();
-  } catch { /* ignore */ }
+    permanentDelegate = getPermanentDelegate(mintInfo)?.delegate ?? null;
+  } catch { /* non-fatal — proceed without */ }
 
-  if (hasPermanentDelegate) {
-    // ── Strategy 1: PermanentDelegate — transfer seller → buyer directly ──
-    console.log(`[mint] Using PermanentDelegate to transfer ${mintAddress.slice(0, 8)}`);
+  const backendIsDelegate = permanentDelegate?.toBase58() === auth.publicKey.toBase58();
 
+  // ─── Helper: burn seller's token using whatever authority we have ──────────
+  async function burnSellerToken(): Promise<void> {
+    try {
+      // Check seller's actual balance first
+      const sellerAcct = await getAccount(connection, sellerAta, "confirmed", TOKEN_2022_PROGRAM_ID).catch(() => null);
+      if (!sellerAcct || sellerAcct.amount === 0n) return; // already empty
+
+      const burnTx = new Transaction();
+
+      if (backendIsDelegate) {
+        // PermanentDelegate lets us burn without the owner's signature
+        burnTx.add(
+          createBurnInstruction(sellerAta, mint, auth.publicKey, 1n, [], TOKEN_2022_PROGRAM_ID)
+        );
+      } else if (
+        sellerAcct.delegate?.toBase58() === auth.publicKey.toBase58() &&
+        sellerAcct.delegatedAmount >= 1n
+      ) {
+        // Seller pre-approved backend as delegate — use that approval to burn
+        burnTx.add(
+          createBurnInstruction(sellerAta, mint, auth.publicKey, 1n, [], TOKEN_2022_PROGRAM_ID)
+        );
+      } else {
+        console.warn(`[mint] Cannot burn seller token — no authority (PD mismatch, no delegation)`);
+        return;
+      }
+
+      const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
+      burnTx.recentBlockhash = blockhash;
+      burnTx.lastValidBlockHeight = lastValidBlockHeight;
+      burnTx.feePayer = auth.publicKey;
+      const burnSig = await sendAndConfirmTransaction(connection, burnTx, [auth], { commitment: "confirmed" });
+      console.log(`[mint] Burned seller's token | sig: ${burnSig.slice(0, 12)}…`);
+    } catch (err: any) {
+      console.error(`[mint] Burn seller token failed: ${err?.message?.slice(0, 80)}`);
+    }
+  }
+
+  // ─── Strategy 1: PermanentDelegate — transfer seller → buyer ─────────────
+  if (backendIsDelegate) {
+    console.log(`[mint] Strategy 1 — PermanentDelegate transfer ${mintAddress.slice(0, 8)}`);
     const tx = new Transaction();
-    // Ensure buyer's ATA exists
     tx.add(
       createAssociatedTokenAccountIdempotentInstruction(
         auth.publicKey, buyerAta, buyer, mint, TOKEN_2022_PROGRAM_ID
       )
     );
-    // Transfer 1 token from seller to buyer (PermanentDelegate bypasses owner auth)
+    // PermanentDelegate moves the existing token; seller's ATA becomes 0.
     tx.add(
       createTransferCheckedInstruction(
-        sellerAta,
-        mint,
-        buyerAta,
-        auth.publicKey, // delegate authority = backend
-        1n,
-        0,             // decimals
-        [],
-        TOKEN_2022_PROGRAM_ID
+        sellerAta, mint, buyerAta, auth.publicKey, 1n, 0, [], TOKEN_2022_PROGRAM_ID
       )
     );
-
     const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
-    tx.recentBlockhash = blockhash; tx.lastValidBlockHeight = lastValidBlockHeight;
+    tx.recentBlockhash = blockhash;
+    tx.lastValidBlockHeight = lastValidBlockHeight;
     tx.feePayer = auth.publicKey;
-
     const sig = await sendAndConfirmTransaction(connection, tx, [auth], { commitment: "confirmed" });
-    console.log(`[mint] Transferred token seller→buyer | sig: ${sig.slice(0, 12)}…`);
+    console.log(`[mint] Strategy 1 done — seller→buyer | sig: ${sig.slice(0, 12)}…`);
     return sig;
-
-  } else {
-    // ── Strategy 2: Delegate-approved transfer (seller approved backend at listing time) ──
-    // Try to move seller's token using the approved delegation first.
-    // If the seller did not approve (old listing), fall back to minting a new token to buyer.
-    console.log(`[mint] No PermanentDelegate — trying delegate-approved transfer`);
-
-    try {
-      const sellerAcct = await getAccount(connection, sellerAta, "confirmed", TOKEN_2022_PROGRAM_ID);
-      const delegateMatch =
-        sellerAcct.delegate?.toBase58() === auth.publicKey.toBase58() &&
-        sellerAcct.delegatedAmount >= 1n;
-
-      if (delegateMatch) {
-        // Seller approved backend as delegate — do real transfer seller → buyer
-        const tx = new Transaction();
-        tx.add(
-          createAssociatedTokenAccountIdempotentInstruction(
-            auth.publicKey, buyerAta, buyer, mint, TOKEN_2022_PROGRAM_ID
-          )
-        );
-        tx.add(
-          createTransferCheckedInstruction(
-            sellerAta,
-            mint,
-            buyerAta,
-            auth.publicKey, // approved delegate
-            1n,
-            0,
-            [],
-            TOKEN_2022_PROGRAM_ID
-          )
-        );
-        const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
-        tx.recentBlockhash = blockhash; tx.lastValidBlockHeight = lastValidBlockHeight;
-        tx.feePayer = auth.publicKey;
-
-        const sig = await sendAndConfirmTransaction(connection, tx, [auth], { commitment: "confirmed" });
-        console.log(`[mint] Delegate transfer seller→buyer | sig: ${sig.slice(0, 12)}…`);
-        return sig;
-      }
-    } catch (err: any) {
-      console.warn(`[mint] Delegate transfer failed (${err?.message?.slice(0, 60)}) — falling back to mint`);
-    }
-
-    // Fallback: legacy listing without approve → mint new token to buyer.
-    // Seller's token stays but access is revoked via DB listing.sold status
-    // and frontend check-sold endpoint.
-    console.log(`[mint] Fallback: minting new token to buyer (seller had no delegate approval)`);
-    const mintSig = await mintAccessTokenToUser(mintAddress, buyerWallet, connection);
-    return mintSig;
   }
+
+  // ─── Strategy 2: Seller pre-approved backend as delegate ─────────────────
+  try {
+    const sellerAcct = await getAccount(connection, sellerAta, "confirmed", TOKEN_2022_PROGRAM_ID);
+    const delegateMatch =
+      sellerAcct.delegate?.toBase58() === auth.publicKey.toBase58() &&
+      sellerAcct.delegatedAmount >= 1n;
+
+    if (delegateMatch) {
+      console.log(`[mint] Strategy 2 — delegate-approved transfer ${mintAddress.slice(0, 8)}`);
+      const tx = new Transaction();
+      tx.add(
+        createAssociatedTokenAccountIdempotentInstruction(
+          auth.publicKey, buyerAta, buyer, mint, TOKEN_2022_PROGRAM_ID
+        )
+      );
+      tx.add(
+        createTransferCheckedInstruction(
+          sellerAta, mint, buyerAta, auth.publicKey, 1n, 0, [], TOKEN_2022_PROGRAM_ID
+        )
+      );
+      const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
+      tx.recentBlockhash = blockhash;
+      tx.lastValidBlockHeight = lastValidBlockHeight;
+      tx.feePayer = auth.publicKey;
+      const sig = await sendAndConfirmTransaction(connection, tx, [auth], { commitment: "confirmed" });
+      console.log(`[mint] Strategy 2 done — seller→buyer | sig: ${sig.slice(0, 12)}…`);
+      return sig;
+    }
+  } catch (err: any) {
+    console.warn(`[mint] Strategy 2 failed (${err?.message?.slice(0, 60)}) — continuing to fallback`);
+  }
+
+  // ─── Strategy 3: Fallback — mint new token to buyer + burn seller's ───────
+  // Used when the mint was created with a different backend keypair (PD mismatch)
+  // or when the seller never approved the backend as delegate.
+  // CRITICAL: seller's token MUST be burned so they cannot retain access after selling.
+  console.log(`[mint] Strategy 3 — fallback: mint to buyer + burn seller ${mintAddress.slice(0, 8)}`);
+  const mintSig = await mintAccessTokenToUser(mintAddress, buyerWallet, connection);
+  console.log(`[mint] Minted new token to buyer | sig: ${mintSig.slice(0, 12)}…`);
+
+  // Burn seller's token immediately after buyer receives theirs
+  await burnSellerToken();
+
+  return mintSig;
 }

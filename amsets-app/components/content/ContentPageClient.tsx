@@ -170,17 +170,29 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
     if (!publicKey) return;
 
     const checkAccess = async () => {
-      // Step 1: check SPL token balance (primary proof, enables resale revocation)
+      const walletStr = publicKey.toBase58();
+
+      // When a mint exists, token balance is the ONLY source of truth.
+      // PDA fallback is intentionally skipped — if someone burned or sold their
+      // token, the PDA still exists on-chain but must NOT grant access.
       if (content.mintAddress) {
         const bal = await checkTokenBalance(connection, content.mintAddress, publicKey).catch(() => 0);
-        // Token balance is the source of truth: if you hold a token, you have access.
-        // With the approve-based listing flow, the token is transferred on sale so the
-        // seller's balance drops to 0 automatically — no extra DB check needed.
-        if (bal > 0) { setPurchased(true); return; }
+
+        if (bal > 0) {
+          // Also check if they have a SOLD listing — backend burn may have failed
+          const soldRes = await fetch(
+            `${API_URL}/api/v1/listings/check-sold/${content.contentId}?wallet=${walletStr}`
+          ).catch(() => null);
+          const { sold } = soldRes?.ok ? await soldRes.json() : { sold: false };
+          setPurchased(!sold);
+        } else {
+          // Token balance is 0 — no access regardless of PDA
+          setPurchased(false);
+        }
+        return;
       }
 
-      // Step 2: fallback to AccessReceipt PDA (covers buyers before token was minted,
-      // or when mint authority had no SOL to execute the mint)
+      // No mint address (legacy content) — fall back to AccessReceipt PDA
       try {
         let pdaPubkey: PublicKey;
         if (content.onChainPda && content.onChainPda !== "pending") {
