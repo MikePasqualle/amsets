@@ -7,6 +7,7 @@ import { db } from "../db/index";
 import { purchases, content as contentTable } from "../db/schema";
 import { verifyUserJwt } from "../services/jwt.service";
 import { mintAccessTokenToUser } from "../services/mint.service";
+import { cacheDel } from "../db/redis";
 
 const solanaConnection = new Connection(
   `https://devnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY}`,
@@ -96,6 +97,9 @@ purchasesRouter.post(
       .update(contentTable)
       .set({ soldCount: sql`${contentTable.soldCount} + 1` })
       .where(eq(contentTable.contentId, body.content_id));
+
+    // Invalidate Redis cache so next page load shows updated soldCount
+    await cacheDel(`content:${body.content_id}`).catch(() => null);
 
     // Auto-mint 1 SPL Token-2022 access token to the buyer.
     // Non-fatal: the AccessReceipt PDA already proves purchase on-chain.
