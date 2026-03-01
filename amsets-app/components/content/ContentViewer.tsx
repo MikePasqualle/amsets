@@ -101,10 +101,13 @@ export function ContentViewer({
         return;
       }
 
-      // Use the HLS URL returned by the backend (access already verified server-side)
-      const url = hlsUrlRaw ?? `https://playback.livepeer.studio/asset/hls/${pid}/index.m3u8`;
+      if (!hlsUrlRaw) {
+        setErrorText("Video is not available yet — please try again shortly.");
+        setViewerState("error");
+        return;
+      }
 
-      setHlsUrl(url);
+      setHlsUrl(hlsUrlRaw);
       setViewerState("ready");
       setStatusText("");
     } catch (err: any) {
@@ -134,6 +137,18 @@ export function ContentViewer({
       if (hlsRef.current) {
         hlsRef.current.destroy();
         hlsRef.current = null;
+      }
+
+      // Direct MP4 link (Livepeer fallback for very short clips) — play natively
+      if (hlsUrl.endsWith(".mp4") || hlsUrl.includes(".mp4?")) {
+        const video = videoRef.current!;
+        video.src = hlsUrl;
+        video.load();
+        video.addEventListener("error", () => {
+          setErrorText("Could not load video — try refreshing");
+          setViewerState("error");
+        }, { once: true });
+        return;
       }
 
       import("hls.js").then((mod) => {

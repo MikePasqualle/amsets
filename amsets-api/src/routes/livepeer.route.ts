@@ -25,7 +25,7 @@ import { content as contentTable, purchases } from "../db/schema";
 import { verifyUserJwt } from "../services/jwt.service";
 import {
   createLivepeerAsset,
-  getPlaybackUrl,
+  resolvePlaybackUrl,
   getAssetStatus,
 } from "../services/livepeer.service";
 
@@ -124,28 +124,9 @@ livepeerRouter.get("/playback-jwt/:contentId", async (c) => {
     }
   }
 
-  // Verify the Livepeer asset status via Studio API
-  let assetStatus: "ready" | "transcoding" | "not_found" = "ready";
-  try {
-    const apiKey = process.env.LIVEPEER_API_KEY;
-    if (apiKey) {
-      const assetRes = await fetch(
-        `https://livepeer.studio/api/asset?playbackId=${playbackId}`,
-        { headers: { Authorization: `Bearer ${apiKey}` } }
-      );
-      const assets = await assetRes.json() as any[];
-      if (!Array.isArray(assets) || assets.length === 0) {
-        assetStatus = "not_found";
-      } else {
-        const phase = assets[0]?.status?.phase;
-        assetStatus = phase === "ready" ? "ready" : "transcoding";
-      }
-    }
-  } catch {
-    // Non-fatal — proceed optimistically
-  }
-
-  const hlsUrl = assetStatus === "ready" ? getPlaybackUrl(playbackId) : null;
+  // Resolve the real CDN HLS URL from Livepeer's playback info endpoint
+  const { hlsUrl, assetStatus } = await resolvePlaybackUrl(playbackId);
+  console.log(`[livepeer] playback resolved: pid=${playbackId} status=${assetStatus} url=${hlsUrl?.slice(0, 60)}`);
   return c.json({ hlsUrl, playbackId, assetStatus });
 });
 

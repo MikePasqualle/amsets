@@ -83,12 +83,56 @@ export async function getAssetStatus(assetId: string): Promise<{ status: string;
 }
 
 /**
- * Builds the HLS playback URL for a Livepeer asset.
- * The URL is only returned to callers who have passed our application-level
- * auth check (see livepeer.route.ts GET /playback-jwt/:contentId).
+ * Fetches the real HLS playback URL for an asset from the Livepeer /api/playback
+ * endpoint. The URL domain changes per asset (e.g. vod-cdn.lp-playback.studio)
+ * so we must NOT hardcode it — always resolve it through this endpoint.
+ *
+ * Returns the HLS URL and the asset status ("ready" | "transcoding" | "not_found").
  */
-export function getPlaybackUrl(playbackId: string): string {
-  return `https://playback.livepeer.studio/asset/hls/${playbackId}/index.m3u8`;
+export async function resolvePlaybackUrl(playbackId: string): Promise<{
+  hlsUrl:      string | null;
+  assetStatus: "ready" | "transcoding" | "not_found";
+}> {
+  try {
+    // Step 1: confirm the asset is ready via Studio API
+    const assetRes = await fetch(
+      `${LIVEPEER_API_BASE}/asset?playbackId=${playbackId}`,
+      { headers: { Authorization: `Bearer ${getApiKey()}` } }
+    );
+    const assets = assetRes.ok ? (await assetRes.json() as any[]) : [];
+    if (!Array.isArray(assets) || assets.length === 0) {
+      return { hlsUrl: null, assetStatus: "not_found" };
+    }
+    const phase = assets[0]?.status?.phase as string | undefined;
+    if (phase !== "ready") {
+      return { hlsUrl: null, assetStatus: "transcoding" };
+    }
+
+    // Step 2: get the actual CDN URL from the playback info endpoint
+    const playbackRes = await fetch(
+      `${LIVEPEER_API_BASE}/playback/${playbackId}`,
+      { headers: { Authorization: `Bearer ${getApiKey()}` } }
+    );
+    if (!playbackRes.ok) {
+      return { hlsUrl: null, assetStatus: "not_found" };
+    }
+    const playbackData = await playbackRes.json() as Record<string, any>;
+    const sources: any[] = playbackData?.meta?.source ?? [];
+    const hlsSource = sources.find(
+      (s: any) => s.type === "html5/application/vnd.apple.mpegurl" || s.hrn === "HLS (TS)"
+    );
+
+    if (!hlsSource?.url) {
+      // Fallback: Livepeer sometimes only has MP4 for very short clips
+      const mp4Source = sources.find((s: any) => s.type?.includes("mp4"));
+      return { hlsUrl: mp4Source?.url ?? null, assetStatus: mp4Source ? "ready" : "not_found" };
+    }
+
+    return { hlsUrl: hlsSource.url, assetStatus: "ready" };
+  } catch (err) {
+    console.error("[livepeer] resolvePlaybackUrl error:", err);
+    return { hlsUrl: null, assetStatus: "not_found" };
+  }
 }
 
 /**
