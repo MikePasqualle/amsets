@@ -358,14 +358,14 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
 
     try {
       // ── Pre-flight SOL balance check ────────────────────────────────────────
-      // Reject early if the buyer clearly cannot afford the listing.
-      // 5000 lamports = typical tx fee; add small buffer for rent.
-      const TX_FEE_BUFFER = 10_000; // lamports
-      const buyerBalance = await connection.getBalance(publicKey);
-      const required = listing.price_lamports + TX_FEE_BUFFER;
+      // price_lamports comes from API as a string — always parse to number first.
+      const TX_FEE_BUFFER  = 10_000; // lamports (~tx fee)
+      const priceLam       = Number(listing.price_lamports);
+      const buyerBalance   = await connection.getBalance(publicKey);
+      const required       = priceLam + TX_FEE_BUFFER;
       if (buyerBalance < required) {
         const have = (buyerBalance / 1e9).toFixed(4);
-        const need = (listing.price_lamports / 1e9).toFixed(4);
+        const need = (priceLam / 1e9).toFixed(4);
         throw new Error(
           `Insufficient SOL balance. You have ${have} SOL but the listing costs ${need} SOL. ` +
           `Please top up your wallet and try again.`
@@ -404,7 +404,7 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
         body: JSON.stringify({
           buyer_wallet:  publicKey.toBase58(),
           tx_signature:  saleSignature,
-          amount_paid:   listing.price_lamports,
+          amount_paid:   Number(listing.price_lamports),
         }),
       });
 

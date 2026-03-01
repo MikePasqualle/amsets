@@ -869,4 +869,86 @@ pub mod amsets_registry {
 
         Ok(())
     }
+
+    /// Withdraw accumulated SOL fees from the FeeVault PDA to a designated recipient.
+    ///
+    /// Security: only the `authority` signer can call this instruction.
+    /// The authority is stored in the FeeVaultAuthority PDA — whoever initialised
+    /// it (i.e. the program upgrade authority) is the permanent withdraw authority.
+    ///
+    /// `amount = 0` withdraws all available SOL (keeps rent-exempt minimum).
+    pub fn withdraw_fees(ctx: Context<WithdrawFees>, amount: u64) -> Result<()> {
+        let fee_vault      = &ctx.accounts.fee_vault;
+        let recipient_info = ctx.accounts.recipient.to_account_info();
+
+        // Rent-exempt minimum for a zero-data account (~890880 lamports)
+        let rent_exempt_min = Rent::get()?.minimum_balance(0);
+        let vault_lamports  = fee_vault.to_account_info().lamports();
+
+        require!(vault_lamports > rent_exempt_min, AmsetsError::InsufficientPayment);
+
+        let withdraw_amount = if amount == 0 {
+            // Withdraw everything above rent-exempt minimum
+            vault_lamports.checked_sub(rent_exempt_min)
+                .ok_or(AmsetsError::Overflow)?
+        } else {
+            require!(
+                vault_lamports.checked_sub(rent_exempt_min).unwrap_or(0) >= amount,
+                AmsetsError::InsufficientPayment
+            );
+            amount
+        };
+
+        require!(withdraw_amount > 0, AmsetsError::InsufficientPayment);
+
+        // Transfer SOL from FeeVault PDA → recipient using invoke_signed
+        let bump = ctx.bumps.fee_vault;
+        let seeds: &[&[u8]] = &[b"fee_vault", &[bump]];
+        let signer_seeds    = &[seeds];
+
+        system_program::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.system_program.to_account_info(),
+                Transfer {
+                    from: fee_vault.to_account_info(),
+                    to:   recipient_info,
+                },
+                signer_seeds,
+            ),
+            withdraw_amount,
+        )?;
+
+        msg!(
+            "[withdraw_fees] Withdrew {} lamports from FeeVault to {}",
+            withdraw_amount,
+            ctx.accounts.recipient.key()
+        );
+
+        Ok(())
+    }
+}
+
+// ─── Withdraw Fees Accounts ───────────────────────────────────────────────────
+
+#[derive(Accounts)]
+pub struct WithdrawFees<'info> {
+    /// The platform upgrade authority — must sign to authorise withdrawal.
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    /// FeeVault PDA — source of accumulated protocol fees.
+    /// CHECK: This is a PDA that only holds SOL; Anchor verifies seeds/bump.
+    #[account(
+        mut,
+        seeds = [b"fee_vault"],
+        bump,
+    )]
+    pub fee_vault: UncheckedAccount<'info>,
+
+    /// Destination wallet — must match the platform_fee_wallet setting.
+    /// CHECK: Checked off-chain; any writable account is valid as recipient.
+    #[account(mut)]
+    pub recipient: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
 }
