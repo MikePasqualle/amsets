@@ -84,6 +84,8 @@ export function MarketplaceClient({
       if (q)    params.set("search", q);
 
       const res = await fetch(`${API_URL}/api/v1/marketplace?${params}`);
+      if (!res.ok) throw new Error(`Server error (${res.status})`);
+
       const data = await res.json();
       const newItems: ContentItem[] = data.items ?? [];
 
@@ -94,7 +96,9 @@ export function MarketplaceClient({
       }
       setHasMore(newItems.length === 20);
       setPage(p);
-    } catch {
+    } catch (err: any) {
+      console.error("[marketplace] fetch error:", err?.message);
+      if (!append) setItems([]);
       setHasMore(false);
     } finally {
       setIsLoading(false);
@@ -124,11 +128,11 @@ export function MarketplaceClient({
     router.replace(`${pathname}${qs ? `?${qs}` : ""}`, { scroll: false });
   };
 
-  // Infinite scroll
+  // Infinite scroll — guard against firing during active filter/search fetch
   const loadMore = useCallback(() => {
-    if (isLoading || !hasMore) return;
+    if (isLoading || isFetching || !hasMore) return;
     fetchItems({ cat: category, q: search, p: page + 1, append: true });
-  }, [isLoading, hasMore, fetchItems, category, search, page]);
+  }, [isLoading, isFetching, hasMore, fetchItems, category, search, page]);
 
   useEffect(() => {
     const el = loaderRef.current;

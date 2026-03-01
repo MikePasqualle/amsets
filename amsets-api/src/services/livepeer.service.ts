@@ -1,20 +1,17 @@
 /**
- * Livepeer Studio service — video upload and JWT-gated playback.
+ * Livepeer Studio service — video upload and application-gated playback.
  *
  * ENV required:
- *   LIVEPEER_API_KEY        — Studio API key (server-side only)
- *   LIVEPEER_SIGNING_KEY_ID — ID of the signing key created in Studio
- *   LIVEPEER_PRIVATE_KEY    — Base64-encoded PEM private key for ES256 JWT signing
+ *   LIVEPEER_API_KEY — Studio API key (server-side only)
  *
- * Flow:
- *   1. createAsset()        → backend requests TUS upload URL from Livepeer Studio
- *   2. Frontend uploads video directly to TUS URL (no API key exposed)
- *   3. storageUri stored as "livepeer://{playbackId}"
- *   4. signPlaybackJwt()    → backend signs ES256 JWT for authorized viewers
- *   5. Frontend passes JWT to Livepeer Player
+ * Security model:
+ *   - Livepeer assets use "public" playback policy (no CDN-level JWT)
+ *   - Access control is enforced at our API layer:
+ *       GET /livepeer/playback-jwt/:contentId checks wallet auth + purchase records
+ *       and returns the HLS URL only to authorized callers
+ *   - The playback ID is never exposed in the frontend bundle or HTML;
+ *     it is served only via authenticated API responses
  */
-
-import jwt from "jsonwebtoken";
 
 const LIVEPEER_API_BASE = "https://livepeer.studio/api";
 
@@ -43,8 +40,8 @@ export async function createLivepeerAsset(name: string): Promise<LivepeerAsset> 
     },
     body: JSON.stringify({
       name,
-      // Gate playback with signed JWTs — only authorized viewers can watch
-      playbackPolicy: { type: "jwt" },
+      // Public Livepeer policy — access is enforced at our API layer, not CDN layer
+      playbackPolicy: { type: "public" },
     }),
   });
 
@@ -86,42 +83,56 @@ export async function getAssetStatus(assetId: string): Promise<{ status: string;
 }
 
 /**
- * Signs an ES256 JWT that allows an authorized viewer to play the gated asset.
- * The JWT is valid for 1 hour and is passed to the Livepeer Player component.
+ * Fetches the real HLS playback URL for an asset from the Livepeer /api/playback
+ * endpoint. The URL domain changes per asset (e.g. vod-cdn.lp-playback.studio)
+ * so we must NOT hardcode it — always resolve it through this endpoint.
  *
- * JWT claims required by Livepeer Studio:
- *   sub    — playback ID of the asset
- *   action — "pull"
- *   pub    — signing key ID from Studio
- *   iss    — "Livepeer"
- *   exp    — Unix timestamp (1 hour from now)
+ * Returns the HLS URL and the asset status ("ready" | "transcoding" | "not_found").
  */
-export function signPlaybackJwt(playbackId: string): string {
-  const signingKeyId  = process.env.LIVEPEER_SIGNING_KEY_ID;
-  const privateKeyB64 = process.env.LIVEPEER_PRIVATE_KEY;
-
-  if (!signingKeyId || !privateKeyB64) {
-    throw new Error("LIVEPEER_SIGNING_KEY_ID or LIVEPEER_PRIVATE_KEY is not set");
-  }
-
-  // Decode base64-encoded PEM private key stored in env
-  const privateKey = Buffer.from(privateKeyB64, "base64").toString("utf-8");
-
-  const token = jwt.sign(
-    {
-      sub:    playbackId,
-      action: "pull",
-      pub:    signingKeyId,
-      iss:    "Livepeer",
-    },
-    privateKey,
-    {
-      algorithm: "ES256",
-      expiresIn: "1h",
+export async function resolvePlaybackUrl(playbackId: string): Promise<{
+  hlsUrl:      string | null;
+  assetStatus: "ready" | "transcoding" | "not_found";
+}> {
+  try {
+    // Step 1: confirm the asset is ready via Studio API
+    const assetRes = await fetch(
+      `${LIVEPEER_API_BASE}/asset?playbackId=${playbackId}`,
+      { headers: { Authorization: `Bearer ${getApiKey()}` } }
+    );
+    const assets = assetRes.ok ? (await assetRes.json() as any[]) : [];
+    if (!Array.isArray(assets) || assets.length === 0) {
+      return { hlsUrl: null, assetStatus: "not_found" };
     }
-  );
+    const phase = assets[0]?.status?.phase as string | undefined;
+    if (phase !== "ready") {
+      return { hlsUrl: null, assetStatus: "transcoding" };
+    }
 
-  return token;
+    // Step 2: get the actual CDN URL from the playback info endpoint
+    const playbackRes = await fetch(
+      `${LIVEPEER_API_BASE}/playback/${playbackId}`,
+      { headers: { Authorization: `Bearer ${getApiKey()}` } }
+    );
+    if (!playbackRes.ok) {
+      return { hlsUrl: null, assetStatus: "not_found" };
+    }
+    const playbackData = await playbackRes.json() as Record<string, any>;
+    const sources: any[] = playbackData?.meta?.source ?? [];
+    const hlsSource = sources.find(
+      (s: any) => s.type === "html5/application/vnd.apple.mpegurl" || s.hrn === "HLS (TS)"
+    );
+
+    if (!hlsSource?.url) {
+      // Fallback: Livepeer sometimes only has MP4 for very short clips
+      const mp4Source = sources.find((s: any) => s.type?.includes("mp4"));
+      return { hlsUrl: mp4Source?.url ?? null, assetStatus: mp4Source ? "ready" : "not_found" };
+    }
+
+    return { hlsUrl: hlsSource.url, assetStatus: "ready" };
+  } catch (err) {
+    console.error("[livepeer] resolvePlaybackUrl error:", err);
+    return { hlsUrl: null, assetStatus: "not_found" };
+  }
 }
 
 /**

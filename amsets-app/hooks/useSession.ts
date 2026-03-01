@@ -64,14 +64,32 @@ export function useSession(): SessionState {
     };
   }
 
+  // Validate token expiry — treat expired tokens as absent
+  const validToken = (() => {
+    const t = token;
+    if (!t) return null;
+    try {
+      const payload = JSON.parse(atob(t.split(".")[1]));
+      if ((payload.exp ?? 0) * 1000 < Date.now()) {
+        localStorage.removeItem("amsets_token");
+        window.dispatchEvent(new Event("amsets_session_changed"));
+        return null;
+      }
+    } catch {
+      return null;
+    }
+    return t;
+  })();
+
   const walletAddress = publicKey?.toBase58() ?? web3authAddress;
-  const isAuthenticated = connected || !!web3authAddress;
+  // isAuthenticated requires a valid non-expired token, not just a connected wallet
+  const isAuthenticated = (connected || !!web3authAddress) && !!validToken;
 
   return {
     isAuthenticated,
     walletAddress,
     publicKey: publicKey ?? null,
-    token: token ?? localStorage.getItem("amsets_token"),
+    token: validToken,
     mounted: true,
   };
 }

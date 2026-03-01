@@ -232,6 +232,9 @@ export function UploadSteps() {
 
         const uploadData = await uploadRes.json();
         const { tusUploadUrl, assetId, playbackId } = uploadData;
+        if (!tusUploadUrl || !assetId || !playbackId) {
+          throw new Error(`Livepeer upload init returned incomplete data: ${JSON.stringify(uploadData)}`);
+        }
         livepeerAssetId = assetId;
 
         // 1b. TUS resumable upload directly to Livepeer CDN
