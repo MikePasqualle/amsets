@@ -8,7 +8,13 @@ import { content as contentTable, purchases } from "../db/schema";
 import { cacheGet, cacheSet, cacheDel } from "../db/redis";
 import { verifyUserJwt, verifyContentJwt } from "../services/jwt.service";
 import { validateArweaveUri } from "../services/storage.service";
-import { mintAuthorToken, createMintForExistingContent } from "../services/mint.service";
+import {
+  mintAuthorToken,
+  mintAuthorNft,
+  createMintForExistingContent,
+  createAuthorNftMint,
+  resolveAuthorNftHolder,
+} from "../services/mint.service";
 import { v4 as uuidv4 } from "uuid";
 
 const solanaConnection = new Connection(
@@ -83,11 +89,10 @@ contentRouter.post(
     const wallet = extractWallet(c.req.header("Authorization"));
     if (!wallet) return c.json({ error: "Unauthorized" }, 401);
 
-    const body = c.req.valid("json");
-    const contentId = uuidv4().replace(/-/g, "");
+  const body = c.req.valid("json");
+  const contentId = uuidv4().replace(/-/g, "");
 
     // Build the preview URI from the IPFS CID provided by the client.
-    // Metadata upload to Pinata is done client-side — backend is just a cache layer.
     const previewUri = body.preview_cid !== "bafyplaceholder"
       ? `ipfs://${body.preview_cid}`
       : "ipfs://bafyplaceholder";
@@ -261,6 +266,7 @@ contentRouter.get("/:id", async (c) => {
       license: contentTable.license,
       accessMint: contentTable.accessMint,
       mintAddress: contentTable.mintAddress,
+      authorNftMint: contentTable.authorNftMint,
       onChainPda: contentTable.onChainPda,
       status: contentTable.status,
       totalSupply: contentTable.totalSupply,
@@ -303,8 +309,9 @@ contentRouter.patch("/:id/publish", async (c) => {
     status: "active",
     updatedAt: new Date(),
   };
-  if (body.on_chain_pda) updateFields.onChainPda = body.on_chain_pda;
-  if (body.mint_address)  updateFields.mintAddress = body.mint_address;
+  if (body.on_chain_pda)    updateFields.onChainPda    = body.on_chain_pda;
+  if (body.mint_address)    updateFields.mintAddress    = body.mint_address;
+  if (body.author_nft_mint) updateFields.authorNftMint = body.author_nft_mint;
 
   await db
     .update(contentTable)
@@ -313,8 +320,8 @@ contentRouter.patch("/:id/publish", async (c) => {
 
   await cacheDel(`content:${contentId}`);
 
-  // Auto-mint 1 author access token if this publish includes a mint address.
-  // Non-fatal — author can still access their own content without the SPL token.
+  // Auto-mint 1 author token to the access token mint (if provided).
+  // Non-fatal — author can still access their own content without it.
   const mintAddress = (updateFields.mintAddress as string | undefined) ?? null;
   if (mintAddress) {
     mintAuthorToken(mintAddress, wallet, solanaConnection).catch((err) => {
@@ -463,6 +470,133 @@ contentRouter.post("/:id/create-mint", async (c) => {
     console.error("[create-mint] error:", err?.message);
     return c.json({ error: `Failed to create mint: ${err?.message ?? "unknown"}` }, 500);
   }
+});
+
+// ─── GET /api/v1/content/:id/royalty-holder — resolve current Author NFT holder ─
+// Public endpoint. Returns the wallet address of the current Author NFT holder.
+// Result is cached for 30 seconds (NFT transfers are rare but can happen).
+
+contentRouter.get("/:id/royalty-holder", async (c) => {
+  const contentId = c.req.param("id");
+  const cacheKey  = `royalty-holder:${contentId}`;
+
+  const cached = await cacheGet<{ royalty_holder: string; author_nft_mint: string }>(cacheKey);
+  if (cached) return c.json(cached);
+
+  const [row] = await db
+    .select({ authorNftMint: contentTable.authorNftMint, authorWallet: contentTable.authorWallet })
+    .from(contentTable)
+    .where(eq(contentTable.contentId, contentId))
+    .limit(1);
+
+  if (!row) return c.json({ error: "Content not found" }, 404);
+
+  // If no Author NFT mint exists yet, fall back to the original author wallet
+  if (!row.authorNftMint) {
+    const result = { royalty_holder: row.authorWallet, author_nft_mint: null };
+    await cacheSet(cacheKey, result, 30);
+    return c.json(result);
+  }
+
+  const holder = await resolveAuthorNftHolder(row.authorNftMint, solanaConnection);
+  const royaltyHolder = holder ?? row.authorWallet; // fallback to original author
+
+  const result = { royalty_holder: royaltyHolder, author_nft_mint: row.authorNftMint };
+  await cacheSet(cacheKey, result, 30);
+  return c.json(result);
+});
+
+// ─── POST /api/v1/mint/author-token — mint Author NFT to author ───────────────
+// JWT auth — only the content author can call.
+// Called by the frontend during the publish flow after creating the Author NFT mint.
+
+contentRouter.post("/mint/author-token", async (c) => {
+  const wallet = extractWallet(c.req.header("Authorization"));
+  if (!wallet) return c.json({ error: "Unauthorized" }, 401);
+
+  const body = await c.req.json().catch(() => ({}));
+  const { content_id } = body;
+
+  if (!content_id) return c.json({ error: "content_id is required" }, 400);
+
+  const [row] = await db
+    .select({
+      authorWallet:  contentTable.authorWallet,
+      authorNftMint: contentTable.authorNftMint,
+      title:         contentTable.title,
+      previewUri:    contentTable.previewUri,
+    })
+    .from(contentTable)
+    .where(eq(contentTable.contentId, content_id))
+    .limit(1);
+
+  if (!row) return c.json({ error: "Content not found" }, 404);
+  if (row.authorWallet !== wallet) return c.json({ error: "Only the author can trigger Author NFT minting" }, 403);
+
+  let authorNftMint = row.authorNftMint;
+
+  // Create the Author NFT mint if it doesn't exist yet
+  if (!authorNftMint) {
+    const metadata = {
+      name:   `${(row.title ?? "AMSETS").slice(0, 28)} — Author`,
+      symbol: "AUT",
+      uri:    (row.previewUri ?? "").replace("ipfs://", "https://gateway.pinata.cloud/ipfs/"),
+    };
+    authorNftMint = await createAuthorNftMint(metadata, solanaConnection);
+
+    await db
+      .update(contentTable)
+      .set({ authorNftMint, updatedAt: new Date() })
+      .where(eq(contentTable.contentId, content_id));
+
+    await cacheDel(`content:${content_id}`);
+    await cacheDel(`royalty-holder:${content_id}`);
+
+    console.log(`[author-nft] Created Author NFT mint ${authorNftMint} for content ${content_id}`);
+  }
+
+  // Mint 1 Author NFT to the author
+  const sig = await mintAuthorNft(authorNftMint, wallet, solanaConnection);
+
+  return c.json({
+    success:        true,
+    author_nft_mint: authorNftMint,
+    signature:      sig,
+  });
+});
+
+// ─── POST /api/v1/content/resolve-mints ──────────────────────────────────────
+// Given a list of SPL mint addresses, returns which ones are registered in the DB
+// (access tokens, author NFTs) — used by WalletCleanupClient to categorize tokens.
+// Public for access mints, also includes private content if user is the author.
+
+contentRouter.post("/resolve-mints", async (c) => {
+  const body = await c.req.json().catch(() => ({}));
+  const mints: string[] = Array.isArray(body.mints) ? body.mints.slice(0, 200) : [];
+  if (!mints.length) return c.json({ mints: [] });
+
+  const wallet = extractWallet(c.req.header("authorization"));
+
+  const rows = await db
+    .select({
+      mintAddress:   contentTable.mintAddress,
+      authorNftMint: contentTable.authorNftMint,
+      title:         contentTable.title,
+      contentId:     contentTable.contentId,
+    })
+    .from(contentTable);
+
+  const map: Record<string, { kind: "access" | "author_nft"; title: string }> = {};
+  for (const row of rows) {
+    if (row.mintAddress && mints.includes(row.mintAddress)) {
+      map[row.mintAddress] = { kind: "access", title: row.title ?? "" };
+    }
+    if (row.authorNftMint && mints.includes(row.authorNftMint)) {
+      map[row.authorNftMint] = { kind: "author_nft", title: row.title ?? "" };
+    }
+  }
+
+  return c.json({ mints: map });
 });
 
 export { contentRouter };

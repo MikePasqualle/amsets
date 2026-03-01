@@ -95,7 +95,8 @@ export const content = pgTable(
     // Token system fields (Phase 2)
     totalSupply:  integer("total_supply").notNull().default(1),   // tokens available for sale
     royaltyBps:   integer("royalty_bps").notNull().default(1000), // 1000 = 10%
-    mintAddress:  text("mint_address"),   // SPL Token-2022 mint pubkey (set after mint creation)
+    mintAddress:    text("mint_address"),     // SPL access token mint pubkey (set after mint creation)
+    authorNftMint:  text("author_nft_mint"), // 1-of-1 Author NFT mint pubkey (royalty rights)
     soldCount:    integer("sold_count").notNull().default(0),
     mimeType:     text("mime_type"),      // original file MIME type
     isPrivate:    boolean("is_private").notNull().default(false), // hidden from public marketplace
@@ -149,8 +150,10 @@ export const listings = pgTable(
     sellerWallet:  text("seller_wallet").notNull(),     // seller's Solana pubkey
     priceLamports: bigint("price_lamports", { mode: "bigint" }).notNull(),
     status:        text("status").notNull().default("active"), // active | sold | cancelled
-    mintAddress:   text("mint_address"),                // SPL Token-2022 mint (optional — access may be via AccessReceipt PDA only)
-    tokenAccount:  text("token_account"),               // seller's ATA holding the token
+    mintAddress:       text("mint_address"),          // SPL Token-2022 mint (access token)
+    tokenAccount:      text("token_account"),          // seller's original ATA (pre-escrow)
+    onChainListingPda: text("on_chain_listing_pda"),  // ListingRecord PDA address on Solana
+    escrowAta:         text("escrow_ata"),             // backend escrow ATA holding the token
     createdAt:     timestamp("created_at").notNull().defaultNow(),
     updatedAt:     timestamp("updated_at").notNull().defaultNow(),
   },

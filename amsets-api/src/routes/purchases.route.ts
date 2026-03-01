@@ -6,7 +6,7 @@ import { Connection } from "@solana/web3.js";
 import { db } from "../db/index";
 import { purchases, content as contentTable } from "../db/schema";
 import { verifyUserJwt } from "../services/jwt.service";
-import { mintAccessTokenToUser } from "../services/mint.service";
+import { mintAccessTokenToUser, resolveAuthorNftHolder } from "../services/mint.service";
 import { cacheDel } from "../db/redis";
 
 const solanaConnection = new Connection(
@@ -59,12 +59,13 @@ purchasesRouter.post(
 
     if (existing) return c.json({ success: true, purchase_id: existing.id, cached: true });
 
-    // Fetch content to get author + accessMint
+    // Fetch content to get author + accessMint + authorNftMint
     const [contentRow] = await db
       .select({
-        authorWallet: contentTable.authorWallet,
-        accessMint:   contentTable.accessMint,
-        paymentToken: contentTable.paymentToken,
+        authorWallet:  contentTable.authorWallet,
+        accessMint:    contentTable.accessMint,
+        paymentToken:  contentTable.paymentToken,
+        authorNftMint: contentTable.authorNftMint,
       })
       .from(contentTable)
       .where(eq(contentTable.contentId, body.content_id))
@@ -78,6 +79,16 @@ purchasesRouter.post(
         : BigInt(Math.round(Number(body.amount_paid)));
 
     const effectiveMint = body.access_mint ?? contentRow.accessMint ?? null;
+
+    // Resolve current Author NFT holder for audit trail (non-blocking)
+    // The actual SOL royalty is handled on-chain in purchase_access_sol.
+    if (contentRow.authorNftMint) {
+      resolveAuthorNftHolder(contentRow.authorNftMint, solanaConnection)
+        .then((holder) => {
+          if (holder) console.log(`[purchase] Royalty recipient for ${body.content_id}: ${holder.slice(0, 8)}…`);
+        })
+        .catch(() => null);
+    }
 
     const [record] = await db
       .insert(purchases)

@@ -12,6 +12,8 @@ import { GlowButton } from "@/components/ui/GlowButton";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3001";
 
+type TokenKind = "access" | "author_nft" | "unknown";
+
 interface TokenInfo {
   mint: string;
   account: string;
@@ -19,6 +21,8 @@ interface TokenInfo {
   decimals: number;
   uiAmount: string;
   inDatabase: boolean;
+  kind: TokenKind;
+  contentTitle?: string;
   status: "idle" | "burning" | "closing" | "done" | "error";
   error?: string;
 }
@@ -54,11 +58,21 @@ export default function WalletCleanupClient() {
         programId: TOKEN_2022_PROGRAM_ID,
       });
 
-      const dbRes   = await fetch(`${API_URL}/api/v1/marketplace?limit=200`).catch(() => null);
-      const dbData  = dbRes?.ok ? await dbRes.json() : {};
-      const dbMints = new Set<string>(
-        (dbData.items ?? []).map((item: any) => item.mintAddress).filter(Boolean)
-      );
+      // Get all mint addresses from the wallet
+      const walletMints = accounts.value.map(({ account }) => account.data.parsed.info.mint as string);
+
+      // Resolve mints via backend (covers all content including private)
+      const token = localStorage.getItem("amsets_token");
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (token) headers["Authorization"] = `Bearer ${token}`;
+
+      const resolveRes = await fetch(`${API_URL}/api/v1/content/resolve-mints`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ mints: walletMints }),
+      }).catch(() => null);
+      const mintMap: Record<string, { kind: TokenKind; title?: string }> =
+        resolveRes?.ok ? (await resolveRes.json()).mints ?? {} : {};
 
       const result: TokenInfo[] = accounts.value.map(({ pubkey, account }) => {
         const parsed   = account.data.parsed.info;
@@ -66,13 +80,16 @@ export default function WalletCleanupClient() {
         const amount   = BigInt(parsed.tokenAmount.amount as string);
         const decimals = parsed.tokenAmount.decimals as number;
         const uiAmount = parsed.tokenAmount.uiAmountString as string;
+        const entry    = mintMap[mint];
         return {
           mint,
           account: pubkey.toBase58(),
           amount,
           decimals,
           uiAmount,
-          inDatabase: dbMints.has(mint),
+          inDatabase: !!entry,
+          kind: (entry?.kind as TokenKind) ?? "unknown",
+          contentTitle: entry?.title,
           status: "idle",
         };
       });
@@ -183,7 +200,9 @@ export default function WalletCleanupClient() {
     }
   }, [publicKey, sendTransaction, connection]);
 
-  const unknownTokens  = tokens.filter(t => !t.inDatabase && t.status !== "done");
+  const unknownTokens   = tokens.filter(t => t.kind === "unknown" && t.status !== "done");
+  const accessTokens    = tokens.filter(t => t.kind === "access" && t.status !== "done");
+  const authorNftTokens = tokens.filter(t => t.kind === "author_nft" && t.status !== "done");
   const emptyOrphans    = unknownTokens.filter(t => t.amount === BigInt(0));
   const nonEmptyOrphans = unknownTokens.filter(t => t.amount > BigInt(0));
 
@@ -208,13 +227,21 @@ export default function WalletCleanupClient() {
 
             {scanned && (
               <>
-                <div className="grid grid-cols-2 gap-4 mb-8">
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-8">
                   <div className="rounded-xl border border-[#3D2F5A] bg-[#130D20] p-4">
-                    <p className="text-[#7A6E8E] text-xs uppercase tracking-wider mb-1">Total token accounts</p>
+                    <p className="text-[#7A6E8E] text-xs uppercase tracking-wider mb-1">Total accounts</p>
                     <p className="text-[#EDE8F5] text-2xl font-bold">{tokens.length}</p>
                   </div>
+                  <div className="rounded-xl border border-[#F7FF88]/20 bg-[#131300] p-4">
+                    <p className="text-[#F7FF88] text-xs uppercase tracking-wider mb-1">Author NFTs</p>
+                    <p className="text-[#F7FF88] text-2xl font-bold">{authorNftTokens.length}</p>
+                  </div>
+                  <div className="rounded-xl border border-[#81D0B5]/20 bg-[#081A15] p-4">
+                    <p className="text-[#81D0B5] text-xs uppercase tracking-wider mb-1">Access Tokens</p>
+                    <p className="text-[#81D0B5] text-2xl font-bold">{accessTokens.length}</p>
+                  </div>
                   <div className="rounded-xl border border-[#3D2F5A] bg-[#130D20] p-4">
-                    <p className="text-[#7A6E8E] text-xs uppercase tracking-wider mb-1">Unknown / orphaned</p>
+                    <p className="text-[#7A6E8E] text-xs uppercase tracking-wider mb-1">Unknown</p>
                     <p className="text-2xl font-bold" style={{ color: unknownTokens.length > 0 ? "#FF6B6B" : "#81D0B5" }}>
                       {unknownTokens.length}
                     </p>
@@ -281,14 +308,48 @@ export default function WalletCleanupClient() {
                   </div>
                 )}
 
-                {tokens.filter(t => t.inDatabase && t.status !== "done").length > 0 && (
+                {/* Author NFT tokens */}
+                {authorNftTokens.length > 0 && (
                   <div className="mt-8">
-                    <h2 className="text-[#EDE8F5] font-semibold text-lg mb-4">AMSETS Access Tokens</h2>
+                    <h2 className="text-[#EDE8F5] font-semibold text-lg mb-1">Author NFTs</h2>
+                    <p className="text-[#7A6E8E] text-xs mb-4">
+                      1-of-1 authorship tokens. Holding this means you receive royalties for the associated work.
+                    </p>
                     <div className="flex flex-col gap-3">
-                      {tokens.filter(t => t.inDatabase && t.status !== "done").map(token => (
+                      {authorNftTokens.map(token => (
+                        <div key={token.mint} className="rounded-xl border border-[#F7FF88]/30 bg-[#131300] p-4">
+                          <div className="flex items-center gap-2 mb-1">
+                            <p className="text-[#F7FF88] text-xs font-semibold uppercase tracking-wider">✦ Author NFT</p>
+                            <span className="inline-flex items-center px-1.5 py-0.5 rounded-full text-[9px] font-bold bg-[#F7FF88]/10 text-[#F7FF88] border border-[#F7FF88]/20">
+                              1-of-1
+                            </span>
+                          </div>
+                          {token.contentTitle && (
+                            <p className="text-[#EDE8F5] text-sm font-medium mb-1">{token.contentTitle}</p>
+                          )}
+                          <p className="text-[#7A6E8E] font-mono text-xs break-all">{token.mint}</p>
+                          <p className="text-[#7A6E8E] text-xs mt-1">Balance: {token.uiAmount} (non-transferable — burn/mint model)</p>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Access tokens */}
+                {accessTokens.length > 0 && (
+                  <div className="mt-8">
+                    <h2 className="text-[#EDE8F5] font-semibold text-lg mb-1">AMSETS Access Tokens</h2>
+                    <p className="text-[#7A6E8E] text-xs mb-4">
+                      Access tokens grant you access to the content you've purchased.
+                    </p>
+                    <div className="flex flex-col gap-3">
+                      {accessTokens.map(token => (
                         <div key={token.mint} className="rounded-xl border border-[#3D2F5A] bg-[#130D20] p-4">
-                          <p className="text-[#81D0B5] text-xs font-semibold uppercase tracking-wider mb-1">AMSETS Token</p>
-                          <p className="text-[#EDE8F5] font-mono text-xs break-all">{token.mint}</p>
+                          <p className="text-[#81D0B5] text-xs font-semibold uppercase tracking-wider mb-1">Access Token</p>
+                          {token.contentTitle && (
+                            <p className="text-[#EDE8F5] text-sm font-medium mb-1">{token.contentTitle}</p>
+                          )}
+                          <p className="text-[#7A6E8E] font-mono text-xs break-all">{token.mint}</p>
                           <p className="text-[#7A6E8E] text-xs mt-1">Balance: {token.uiAmount}</p>
                         </div>
                       ))}

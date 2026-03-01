@@ -104,6 +104,7 @@ async function sendAndConfirm(
 }
 
 // ─── Instruction discriminators ───────────────────────────────────────────────
+// All computed via sha256("global:<instruction_name>")[0..8]
 
 const REGISTER_DISCRIMINATOR = new Uint8Array([
   170, 55, 41, 115, 252, 248, 38, 144,
@@ -115,6 +116,22 @@ const PURCHASE_DISCRIMINATOR = new Uint8Array([
 
 const SET_ACCESS_MINT_DISCRIMINATOR = new Uint8Array([
   144, 141, 222, 179, 112, 54, 142, 71,
+]);
+
+const SET_AUTHOR_NFT_MINT_DISCRIMINATOR = new Uint8Array([
+  153, 124, 92, 77, 209, 115, 101, 174,
+]);
+
+const CREATE_LISTING_DISCRIMINATOR = new Uint8Array([
+  18, 168, 45, 24, 191, 31, 117, 54,
+]);
+
+const CANCEL_LISTING_DISCRIMINATOR = new Uint8Array([
+  41, 183, 50, 232, 230, 233, 157, 70,
+]);
+
+const EXECUTE_SALE_DISCRIMINATOR = new Uint8Array([
+  37, 74, 217, 157, 79, 49, 35, 6,
 ]);
 
 // ─── Encoding helpers ────────────────────────────────────────────────────────
@@ -433,8 +450,12 @@ export async function publishOnChain(
 export interface PurchaseAccessParams {
   /** ContentRecord PDA address (as returned by publishOnChain) */
   contentRecordPda: string;
-  /** Author's wallet address (must match content_record.primary_author) */
-  authorWallet: string;
+  /**
+   * Royalty recipient — current holder of the Author NFT.
+   * 97.5% of the payment goes here. Resolve via GET /api/v1/content/:id/royalty-holder.
+   * Falls back to the original author wallet if unknown.
+   */
+  royaltyRecipientWallet: string;
 }
 
 export interface PurchaseAccessResult {
@@ -444,8 +465,8 @@ export interface PurchaseAccessResult {
 
 /**
  * Builds, signs and sends the `purchase_access_sol` transaction.
- * Creates an AccessReceipt PDA and distributes payment:
- *   97.5% → author, 2.5% → fee vault.
+ * Creates an AccessReceipt PDA and distributes payment on-chain:
+ *   2.5% → fee_vault (protocol), 97.5% → royalty_recipient (current Author NFT holder).
  */
 export async function purchaseAccess(
   params: PurchaseAccessParams,
@@ -453,21 +474,21 @@ export async function purchaseAccess(
   sendTransaction: (tx: Transaction, conn: Connection) => Promise<string>,
   connection: Connection
 ): Promise<PurchaseAccessResult> {
-  const contentRecordPda = new PublicKey(params.contentRecordPda);
-  const authorWallet     = new PublicKey(params.authorWallet);
-  const feeVaultPda      = deriveFeeVaultPda();
-  const receiptPda       = deriveAccessReceiptPda(contentRecordPda, buyerPublicKey);
+  const contentRecordPda    = new PublicKey(params.contentRecordPda);
+  const royaltyRecipientKey = new PublicKey(params.royaltyRecipientWallet);
+  const feeVaultPda         = deriveFeeVaultPda();
+  const receiptPda          = deriveAccessReceiptPda(contentRecordPda, buyerPublicKey);
 
   const ixData = buildPurchaseAccessSolData();
 
   const ix = new TransactionInstruction({
     programId: AMSETS_PROGRAM_ID,
     keys: [
-      { pubkey: buyerPublicKey,          isSigner: true,  isWritable: true },
-      { pubkey: contentRecordPda,        isSigner: false, isWritable: true },
-      { pubkey: receiptPda,              isSigner: false, isWritable: true },
-      { pubkey: authorWallet,            isSigner: false, isWritable: true },
-      { pubkey: feeVaultPda,             isSigner: false, isWritable: true },
+      { pubkey: buyerPublicKey,       isSigner: true,  isWritable: true  },
+      { pubkey: contentRecordPda,     isSigner: false, isWritable: true  },
+      { pubkey: receiptPda,           isSigner: false, isWritable: true  },
+      { pubkey: royaltyRecipientKey,  isSigner: false, isWritable: true  }, // NEW: current NFT holder
+      { pubkey: feeVaultPda,          isSigner: false, isWritable: true  },
       { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
     ],
     data: Buffer.from(ixData),
@@ -508,6 +529,186 @@ export async function setAccessMint(
   tx.feePayer = authorPublicKey;
 
   return await sendAndConfirm(tx, sendTransaction, connection, "set_access_mint");
+}
+
+/**
+ * Links the 1-of-1 Author NFT mint to an existing ContentRecord on-chain.
+ * Whoever holds this NFT token receives royalties on all future sales.
+ */
+export async function setAuthorNftMint(
+  contentRecordPda: PublicKey,
+  authorNftMintPubkey: PublicKey,
+  authorPublicKey: PublicKey,
+  sendTransaction: (tx: Transaction, conn: Connection) => Promise<string>,
+  connection: Connection
+): Promise<string> {
+  const ix = new TransactionInstruction({
+    programId: AMSETS_PROGRAM_ID,
+    keys: [
+      { pubkey: authorPublicKey,       isSigner: true,  isWritable: true  },
+      { pubkey: contentRecordPda,      isSigner: false, isWritable: true  },
+      { pubkey: authorNftMintPubkey,   isSigner: false, isWritable: false },
+      { pubkey: authorPublicKey,       isSigner: false, isWritable: false }, // primary_author
+    ],
+    data: Buffer.from(SET_AUTHOR_NFT_MINT_DISCRIMINATOR),
+  });
+
+  const tx = new Transaction().add(ix);
+  tx.feePayer = authorPublicKey;
+
+  return await sendAndConfirm(tx, sendTransaction, connection, "set_author_nft_mint");
+}
+
+// ─── ListingRecord PDA helpers ────────────────────────────────────────────────
+
+/**
+ * Derives the ListingRecord PDA.
+ * Seeds: [b"listing", &listing_id_bytes]
+ */
+export function deriveListingRecordPda(listingIdBytes: Uint8Array): PublicKey {
+  const [pda] = PublicKey.findProgramAddressSync(
+    [Buffer.from("listing"), Buffer.from(listingIdBytes)],
+    AMSETS_PROGRAM_ID
+  );
+  return pda;
+}
+
+export interface CreateListingResult {
+  signature: string;
+  pdaAddress: string;
+  listingIdBytes: Uint8Array;
+}
+
+/**
+ * Creates a ListingRecord on-chain for a secondary market sale.
+ * Seller signs. After this tx, backend moves the access token to escrow.
+ *
+ * @param listingUuid    UUID that will be used as the listing ID (from DB)
+ * @param contentUuid    UUID of the content item
+ * @param priceLamports  Listing price in lamports
+ * @param tokenMintStr   Access token mint address
+ */
+export async function createListingOnChain(
+  listingUuid: string,
+  contentUuid: string,
+  priceLamports: bigint,
+  tokenMintStr: string,
+  sellerPublicKey: PublicKey,
+  sendTransaction: (tx: Transaction, conn: Connection) => Promise<string>,
+  connection: Connection
+): Promise<CreateListingResult> {
+  const listingIdBytes = uuidToBytes32(listingUuid);
+  const contentIdBytes = uuidToBytes32(contentUuid);
+  const tokenMintKey   = new PublicKey(tokenMintStr);
+  const listingPda     = deriveListingRecordPda(listingIdBytes);
+
+  // Encode: discriminator(8) + listing_id(32) + content_id(32) + price_lamports(8) + token_mint(32)
+  const priceBytes = encodeU64(priceLamports);
+  const data = new Uint8Array(8 + 32 + 32 + 8 + 32);
+  let off = 0;
+  data.set(CREATE_LISTING_DISCRIMINATOR, off); off += 8;
+  data.set(listingIdBytes, off);               off += 32;
+  data.set(contentIdBytes, off);               off += 32;
+  data.set(priceBytes, off);                   off += 8;
+  data.set(tokenMintKey.toBytes(), off);
+
+  const ix = new TransactionInstruction({
+    programId: AMSETS_PROGRAM_ID,
+    keys: [
+      { pubkey: sellerPublicKey,         isSigner: true,  isWritable: true  },
+      { pubkey: listingPda,              isSigner: false, isWritable: true  },
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+    ],
+    data: Buffer.from(data),
+  });
+
+  const tx = new Transaction().add(ix);
+  tx.feePayer = sellerPublicKey;
+
+  const signature = await sendAndConfirm(tx, sendTransaction, connection, "create_listing");
+  return { signature, pdaAddress: listingPda.toBase58(), listingIdBytes };
+}
+
+/**
+ * Cancels a listing on-chain. Only the original seller can call this.
+ * After this tx, backend returns the escrowed token to the seller.
+ *
+ * @param listingUuid  UUID of the listing (same as used in createListingOnChain)
+ */
+export async function cancelListingOnChain(
+  listingUuid: string,
+  sellerPublicKey: PublicKey,
+  sendTransaction: (tx: Transaction, conn: Connection) => Promise<string>,
+  connection: Connection
+): Promise<string> {
+  const listingIdBytes = uuidToBytes32(listingUuid);
+  const listingPda     = deriveListingRecordPda(listingIdBytes);
+
+  const ix = new TransactionInstruction({
+    programId: AMSETS_PROGRAM_ID,
+    keys: [
+      { pubkey: sellerPublicKey, isSigner: true,  isWritable: true },
+      { pubkey: listingPda,      isSigner: false, isWritable: true },
+    ],
+    data: Buffer.from(CANCEL_LISTING_DISCRIMINATOR),
+  });
+
+  const tx = new Transaction().add(ix);
+  tx.feePayer = sellerPublicKey;
+
+  return await sendAndConfirm(tx, sendTransaction, connection, "cancel_listing");
+}
+
+export interface ExecuteSaleResult {
+  signature: string;
+}
+
+/**
+ * Executes a secondary market sale on-chain.
+ * Buyer signs and pays. SOL is distributed:
+ *   2.5% → fee_vault, royalty_bps% → royalty_recipient, remainder → seller.
+ * After this tx, backend delivers access token from escrow to buyer.
+ *
+ * @param listingUuid              UUID of the listing
+ * @param contentRecordPdaStr      ContentRecord PDA (from content.onChainPda)
+ * @param royaltyRecipientWallet   Current Author NFT holder
+ * @param sellerWallet             Listing seller
+ */
+export async function executeSaleOnChain(
+  listingUuid: string,
+  contentRecordPdaStr: string,
+  royaltyRecipientWallet: string,
+  sellerWallet: string,
+  buyerPublicKey: PublicKey,
+  sendTransaction: (tx: Transaction, conn: Connection) => Promise<string>,
+  connection: Connection
+): Promise<ExecuteSaleResult> {
+  const listingIdBytes       = uuidToBytes32(listingUuid);
+  const listingPda           = deriveListingRecordPda(listingIdBytes);
+  const contentRecordPda     = new PublicKey(contentRecordPdaStr);
+  const royaltyRecipientKey  = new PublicKey(royaltyRecipientWallet);
+  const sellerKey            = new PublicKey(sellerWallet);
+  const feeVaultPda          = deriveFeeVaultPda();
+
+  const ix = new TransactionInstruction({
+    programId: AMSETS_PROGRAM_ID,
+    keys: [
+      { pubkey: buyerPublicKey,          isSigner: true,  isWritable: true  },
+      { pubkey: listingPda,              isSigner: false, isWritable: true  },
+      { pubkey: contentRecordPda,        isSigner: false, isWritable: false },
+      { pubkey: feeVaultPda,             isSigner: false, isWritable: true  },
+      { pubkey: royaltyRecipientKey,     isSigner: false, isWritable: true  },
+      { pubkey: sellerKey,               isSigner: false, isWritable: true  },
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+    ],
+    data: Buffer.from(EXECUTE_SALE_DISCRIMINATOR),
+  });
+
+  const tx = new Transaction().add(ix);
+  tx.feePayer = buyerPublicKey;
+
+  const signature = await sendAndConfirm(tx, sendTransaction, connection, "execute_sale");
+  return { signature };
 }
 
 /**
