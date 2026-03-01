@@ -712,15 +712,18 @@ export async function createListingOnChain(
 
   // Encode: disc(8) + listing_id(32) + content_id(32) + price_lamports(8) + token_mint(32)
   //         + royalty_bps(u16 LE, 2) + min_royalty_lamports(u64 LE, 8) = 122 bytes total
-  const data = Buffer.alloc(122);
+  // Uses DataView for cross-platform compatibility (browser Buffer polyfill lacks writeBigUInt64LE)
+  const bytes = new Uint8Array(122);
+  const view  = new DataView(bytes.buffer);
   let off = 0;
-  Buffer.from(CREATE_LISTING_DISCRIMINATOR).copy(data, off); off += 8;
-  data.set(listingIdBytes, off);                             off += 32;
-  data.set(contentIdBytes, off);                             off += 32;
-  data.set(encodeU64(priceLamports), off);                   off += 8;
-  data.set(tokenMintKey.toBytes(), off);                     off += 32;
-  data.writeUInt16LE(royaltyBps, off);                       off += 2;
-  data.writeBigUInt64LE(BigInt(minRoyaltyLamports), off);
+  bytes.set(CREATE_LISTING_DISCRIMINATOR, off);              off += 8;
+  bytes.set(listingIdBytes, off);                            off += 32;
+  bytes.set(contentIdBytes, off);                            off += 32;
+  bytes.set(encodeU64(priceLamports), off);                  off += 8;
+  bytes.set(tokenMintKey.toBytes(), off);                    off += 32;
+  view.setUint16(off, royaltyBps, true);                     off += 2;
+  view.setBigUint64(off, BigInt(minRoyaltyLamports), true);
+  const data = Buffer.from(bytes);
 
   const ix = new TransactionInstruction({
     programId: AMSETS_PROGRAM_ID,
@@ -783,14 +786,14 @@ export interface ExecuteSaleResult {
  * legacy ContentRecord PDAs that have different account layouts and cannot be safely
  * deserialized by the current Anchor struct.
  *
- * @param listingUuid              UUID of the listing
+ * @param listingOnChainPda        The ListingRecord PDA address (stored in DB as onChainListingPda)
  * @param royaltyBps               Royalty in basis points (0–5000, i.e. 0%–50%)
  * @param minRoyaltyLamports       Minimum absolute royalty floor (0 = percentage-only)
  * @param royaltyRecipientWallet   Current Author NFT holder
  * @param sellerWallet             Listing seller
  */
 export async function executeSaleOnChain(
-  listingUuid: string,
+  listingOnChainPda: string,
   royaltyBps: number,
   minRoyaltyLamports: number,
   royaltyRecipientWallet: string,
@@ -799,18 +802,22 @@ export async function executeSaleOnChain(
   sendTransaction: (tx: Transaction, conn: Connection) => Promise<string>,
   connection: Connection
 ): Promise<ExecuteSaleResult> {
-  const listingIdBytes      = uuidToBytes32(listingUuid);
-  const listingPda          = deriveListingRecordPda(listingIdBytes);
+  // Use the PDA address directly — the on-chain listing UUID used to derive it is stored
+  // inside the ListingRecord account, and Anchor validates seeds from account data.
+  const listingPda          = new PublicKey(listingOnChainPda);
   const royaltyRecipientKey = new PublicKey(royaltyRecipientWallet);
   const sellerKey           = new PublicKey(sellerWallet);
   const feeVaultPda         = deriveFeeVaultPda();
   const registryPda         = deriveRegistryStatePda();
 
   // Instruction data: discriminator(8) + royalty_bps(u16 LE, 2) + min_royalty_lamports(u64 LE, 8)
-  const data = Buffer.alloc(18);
-  Buffer.from(EXECUTE_SALE_DISCRIMINATOR).copy(data, 0);
-  data.writeUInt16LE(royaltyBps, 8);
-  data.writeBigUInt64LE(BigInt(minRoyaltyLamports), 10);
+  // Uses DataView for cross-platform compatibility (browser Buffer polyfill lacks writeBigUInt64LE)
+  const bytes = new Uint8Array(18);
+  const view  = new DataView(bytes.buffer);
+  bytes.set(EXECUTE_SALE_DISCRIMINATOR, 0);
+  view.setUint16(8, royaltyBps, true);
+  view.setBigUint64(10, BigInt(minRoyaltyLamports), true);
+  const data = Buffer.from(bytes);
 
   const ix = new TransactionInstruction({
     programId: AMSETS_PROGRAM_ID,
