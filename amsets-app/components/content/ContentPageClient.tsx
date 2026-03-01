@@ -172,27 +172,49 @@ export function ContentPageClient({ content }: ContentPageClientProps) {
     const checkAccess = async () => {
       const walletStr = publicKey.toBase58();
 
-      // When a mint exists, token balance is the ONLY source of truth.
-      // PDA fallback is intentionally skipped — if someone burned or sold their
-      // token, the PDA still exists on-chain but must NOT grant access.
       if (content.mintAddress) {
         const bal = await checkTokenBalance(connection, content.mintAddress, publicKey).catch(() => 0);
 
         if (bal > 0) {
-          // Also check if they have a SOLD listing — backend burn may have failed
+          // Has token — check if they sold it (burn may have failed on-chain)
           const soldRes = await fetch(
             `${API_URL}/api/v1/listings/check-sold/${content.contentId}?wallet=${walletStr}`
           ).catch(() => null);
           const { sold } = soldRes?.ok ? await soldRes.json() : { sold: false };
           setPurchased(!sold);
-        } else {
-          // Token balance is 0 — no access regardless of PDA
-          setPurchased(false);
+          return;
         }
+
+        // Token balance = 0. Check if user SOLD their token — if yes, deny access.
+        const soldRes = await fetch(
+          `${API_URL}/api/v1/listings/check-sold/${content.contentId}?wallet=${walletStr}`
+        ).catch(() => null);
+        const { sold } = soldRes?.ok ? await soldRes.json() : { sold: false };
+        if (sold) {
+          // Sold → no access even if PDA exists
+          setPurchased(false);
+          return;
+        }
+
+        // Not sold, 0 tokens — check PDA as fallback for cases where:
+        // • backend mint failed after user paid (they have PDA proof of payment)
+        // • legacy purchase before SPL token was added
+        try {
+          let pdaPubkey: PublicKey;
+          if (content.onChainPda && content.onChainPda !== "pending") {
+            pdaPubkey = new PublicKey(content.onChainPda);
+          } else {
+            const authorPubkey   = new PublicKey(content.authorWallet);
+            const contentIdBytes = uuidToBytes32(content.contentId);
+            pdaPubkey            = deriveContentRecordPda(authorPubkey, contentIdBytes);
+          }
+          const has = await checkHasPurchased(connection, pdaPubkey, publicKey).catch(() => false);
+          setPurchased(has);
+        } catch { setPurchased(false); }
         return;
       }
 
-      // No mint address (legacy content) — fall back to AccessReceipt PDA
+      // No mint address (legacy content without SPL token) — PDA is the only check
       try {
         let pdaPubkey: PublicKey;
         if (content.onChainPda && content.onChainPda !== "pending") {
