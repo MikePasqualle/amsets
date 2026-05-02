@@ -10,7 +10,7 @@ import { mintAccessTokenToUser, resolveAuthorNftHolder } from "../services/mint.
 import { cacheDel } from "../db/redis";
 
 const solanaConnection = new Connection(
-  `https://devnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY}`,
+  process.env.SOLANA_RPC_URL ?? `https://devnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY}`,
   "confirmed"
 );
 

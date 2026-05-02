@@ -19,7 +19,7 @@ import { v4 as uuidv4 } from "uuid";
 import { fetchContentRecord } from "../services/helius.service";
 
 const solanaConnection = new Connection(
-  `https://devnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY}`,
+  process.env.SOLANA_RPC_URL ?? `https://devnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY}`,
   "confirmed"
 );
 
