@@ -4,6 +4,8 @@
 .env.*.local
 .env.production
 *.env
+!.env.example
+!*.env.example
 
 # ─── Solana Keypairs (NEVER commit) ────────────────────────────────────────
 *-keypair.json
