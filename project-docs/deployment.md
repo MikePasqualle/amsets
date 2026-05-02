@@ -18,6 +18,32 @@
 
 ---
 
+## 0. Швидкий старт (env + секрети)
+
+Перед будь-яким деплоєм спочатку заповніть env-шаблони:
+
+```bash
+# Backend
+cp amsets-api/.env.example amsets-api/.env
+
+# Frontend
+cp amsets-app/.env.example amsets-app/.env.local
+```
+
+Потім замініть усі `CHANGE_ME_*` значення.
+
+Мінімальний набір критичних секретів:
+- `HELIUS_API_KEY` (mainnet)
+- `PROGRAM_ID` (mainnet program id)
+- `MINT_AUTHORITY_SECRET` (server private key, base58)
+- `WITHDRAW_AUTHORITY_KEYPAIR` (path to upgrade authority keypair)
+- `ADMIN_SECRET`
+- `PINATA_JWT`
+- `LIVEPEER_API_KEY` + `LIVEPEER_SIGNING_KEY_ID` + `LIVEPEER_PRIVATE_KEY`
+- `NEXT_PUBLIC_WEB3AUTH_CLIENT_ID`
+
+---
+
 ## 1. Підготовка
 
 ### 1.1 Облікові записи (зареєструйтесь заздалегідь)

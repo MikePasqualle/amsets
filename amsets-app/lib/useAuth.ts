@@ -122,12 +122,13 @@ export function useAuth() {
         const { SolanaPrivateKeyProvider } = await import("@web3auth/solana-provider");
         const { WALLET_ADAPTERS } = await import("@web3auth/base");
 
+        const isMainnet = (process.env.NEXT_PUBLIC_IRYS_NETWORK ?? "devnet") === "mainnet";
         const chainConfig = {
           chainNamespace: "solana" as const,
-          chainId: "0x3", // devnet
+          chainId: isMainnet ? "0x1" : "0x3",
           rpcTarget:
             process.env.NEXT_PUBLIC_SOLANA_RPC_URL ?? "https://api.devnet.solana.com",
-          displayName: "Solana Devnet",
+          displayName: isMainnet ? "Solana Mainnet" : "Solana Devnet",
           ticker: "SOL",
           tickerName: "Solana",
         };
@@ -138,7 +139,7 @@ export function useAuth() {
 
         const web3auth = new Web3Auth({
           clientId: process.env.NEXT_PUBLIC_WEB3AUTH_CLIENT_ID ?? "",
-          web3AuthNetwork: "sapphire_devnet",
+          web3AuthNetwork: isMainnet ? "sapphire_mainnet" : "sapphire_devnet",
           privateKeyProvider,
         });
 
