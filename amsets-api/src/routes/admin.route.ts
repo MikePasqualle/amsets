@@ -25,7 +25,7 @@ const adminRouter = new Hono();
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
 const solanaConnection = new Connection(
-  `https://devnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY}`,
+  process.env.SOLANA_RPC_URL ?? `https://devnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY}`,
   "confirmed"
 );
 
@@ -326,7 +326,9 @@ adminRouter.post("/withdraw-fees", async (c) => {
       withdrawnLam: withdrawable,
       withdrawnSol,
       recipient:    recipientAddress,
-      explorerUrl:  `https://solscan.io/tx/${signature}?cluster=devnet`,
+      explorerUrl:  (process.env.SOLANA_CLUSTER ?? "devnet") === "mainnet-beta"
+        ? `https://solscan.io/tx/${signature}`
+        : `https://solscan.io/tx/${signature}?cluster=devnet`,
     });
   } catch (err: any) {
     console.error("[admin] withdraw-fees error:", err?.message);
